@@ -4,13 +4,9 @@ Juego 2D hecho con **Godot 4.6 (C# / .NET)** sobre la relación entre las decisi
 
 ## Cómo ejecutar el juego
 
-**Desde el código fuente**
 1. Instala [Godot 4.6.x con soporte .NET (mono)](https://godotengine.org/download) y el SDK de .NET compatible.
 2. Abre `project.godot` con Godot.
 3. Pulsa *Ejecutar proyecto* (F5). La escena principal es el menú.
-
-**Desde un ejecutable**
-Los ejecutables no se guardan en el repositorio: se publican como *Release* en GitHub (carpeta con `TwoSides.exe`, `TwoSides.pck` y `data_TwoSides_windows_x86_64`; comprueba `SHA256SUMS.txt`). Esa versión no envía estadísticas.
 
 El progreso se guarda en local, en una base SQLite de la cuenta de Windows que ejecuta el juego.
 

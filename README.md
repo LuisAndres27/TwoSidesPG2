@@ -31,7 +31,3 @@ Las estadísticas están **desactivadas por defecto**: solo se activan en una co
 - `scripts/`, `scenes/`, `assets/` — juego (Godot).
 - `local-persistence/`, `integration/` — persistencia SQLite y sus comprobaciones.
 - `backend/` — Express, herramientas de estadísticas, pruebas y documentación.
-
-## Créditos
-
-Agradecimiento a Nayelhi Flores por su apoyo en una versión inicial.

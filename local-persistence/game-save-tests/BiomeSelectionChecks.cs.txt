@@ -1,0 +1,242 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class BiomeSelectionChecks
+{
+    private static int _passed;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok,string message){if(!ok)throw new Exception(message);}
+    private static void Passed(string message){_passed++;Console.WriteLine("PASS "+message);}
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly RuntimeMenuChecks.Failure Failure=new();
+        internal readonly RuntimeMenuChecks.Store Store;
+        internal readonly string Owner=Id(),Game=Id();
+        internal readonly LocalBiomeSelection Selection;
+        internal int Navigations;
+        internal string? Scene;
+        internal F(bool start=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Store=new(Db,Failure);
+            Store.Service.CreateLocalProfile(Id(),Owner,"Selección local");
+            if(start)Store.Service.CreateNewGame(new(Id(),Owner,Game));
+            Selection=new(Store,Owner,Game);
+        }
+        internal GameAggregate State()=>Store.Service.LoadGame(Owner,Game);
+        internal Task<bool> Navigate(LocalBiomeLaunch plan)
+        {
+            Check(Selection.IsCurrent(plan),"invalid plan");
+            Check(State().Game.Revision==plan.Revision&&State().Game.CurrentBiomeId==plan.BiomeId,"navigation before persistence");
+            Navigations++;Scene=plan.Scene;return Task.FromResult(true);
+        }
+        internal void Decision(string biome="ocean")
+        {
+            var key=biome=="ocean"?"ocean_waste_disposal":"jungle_transport_route";
+            Store.Service.RecordDecision(new(Id(),Id(),Owner,Game,State().Game.Revision,biome,key,"reject","healthy","{\"stateKind\":\"healthy\"}"));
+        }
+        internal void CompleteOcean(){Decision();Store.Service.CompleteBiome(new(Id(),Owner,Game,State().Game.Revision,"ocean","good"));}
+        public void Dispose(){Selection.Invalidate();Sandbox.Dispose();}
+    }
+    private static async Task Case(string name,Func<F,Task> work,bool start=true)
+    {using var f=new F(start);await work(f);Passed(name);}
+    private static bool Exists(string scene)=>File.Exists(Path.Combine(Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!,scene.Substring("res://".Length)));
+    private static string Error(Action call){try{call();return "OK";}catch(SaveException e){return e.Code;}}
+    private sealed class DelayedStore:ILocalBiomeStore
+    {
+        private readonly ILocalBiomeStore _inner;
+        internal readonly TaskCompletionSource<bool> Started=new(),Release=new();
+        internal DelayedStore(ILocalBiomeStore inner){_inner=inner;}
+        public async Task<LocalSaveResult<GameAggregate>> GetActiveGameAsync(string owner)
+        {Started.TrySetResult(true);await Release.Task;return await _inner.GetActiveGameAsync(owner);}
+        public Task<LocalSaveResult<IReadOnlyList<BiomeAccess>>> GetGameProgressAsync(string owner,string game)=>_inner.GetGameProgressAsync(owner,game);
+        public Task<LocalSaveResult<BiomeAccess>> GetBiomeAccessAsync(string owner,string game,string biome)=>_inner.GetBiomeAccessAsync(owner,game,biome);
+        public Task<LocalSaveResult<SaveReceipt>> EnterBiomeAsync(EnterBiomeCommand command)=>_inner.EnterBiomeAsync(command);
+    }
+    public static async Task<int> Probe(string path,string owner,string game)
+    {
+        var store=new RuntimeMenuChecks.Store(new RuntimeMenuChecks.ReadOnlyFixture(path),new());
+        var selection=new LocalBiomeSelection(store,owner,game);
+        return await selection.RefreshAsync()&&selection.Describe("ocean") is {Activity:"in_progress",CanEnter:true}
+            &&await selection.EnterAsync("ocean",Exists,_=>Task.FromResult(true))&&store.EntryCalls==0?0:14;
+    }
+    public static async Task<int> Run()
+    {
+        var ids=new[]{"ocean","jungle","desert","forest","tundra"};
+        var scenes=new[]{"DesicionDelfin","DesicionMono","DesicionRataCanguro","DesicionZorro","DesicionNieve"};
+        for(int i=0;i<ids.Length;i++)
+        {
+            int index=i;
+            await Case("canonical card enters "+ids[i]+" first without prerequisites",async f=>
+            {
+                Check(await f.Selection.RefreshAsync(),"refresh");
+                Check(await f.Selection.EnterAsync(ids[index],Exists,f.Navigate),f.Selection.Code);
+                var state=f.State();
+                Check(f.Navigations==1&&f.Store.EntryCalls==1&&f.Scene=="res://scenes/levels/"+scenes[index]+".tscn","mapping");
+                Check(state.Game.ResumeKind=="human_decision"&&state.Biomes.All(b=>b.Status=="human_pending")&&state.Decisions.Count==0,"entry changed gameplay");
+                Check(f.Store.Service.GetGameHistory(f.Owner).Count==1&&f.Store.Service.GetLocalProfile()!.LocalPlayerId==f.Owner,"new identity/game");
+            });
+        }
+        await Case("actual scene exports match all five canonical card identifiers and destinations",f=>
+        {
+            string text=File.ReadAllText(Path.Combine(Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!,"scenes","levels","menu_niveles.tscn"));
+            var cards=new[]{"TarjetaOceano","TarjetaSelva","TarjetaDesierto","TarjetaBosque","TarjetaTundra"};
+            for(int i=0;i<cards.Length;i++)
+            {
+                string body=Regex.Match(text,"(?s)\\[node name=\""+cards[i]+"\"[^\\]]*\\](.*?)(?=\\[node|$)").Groups[1].Value;
+                var level=Regex.Match(body,@"Nivel = (\d+)");int ordinal=level.Success?int.Parse(level.Groups[1].Value):0;
+                string resource=Regex.Match(body,"EscenaNivel = ExtResource\\(\"([^\"]+)\"\\)").Groups[1].Value;
+                string path=Regex.Match(text,"\\[ext_resource type=\"PackedScene\"[^\\r\\n]*path=\"([^\"]+)\"[^\\r\\n]*id=\""+Regex.Escape(resource)+"\"\\]").Groups[1].Value;
+                Check(LocalBiomeSelection.BiomeFor(ordinal)==ids[i]&&path==LocalBiomeSelection.HumanSceneFor(ids[i])&&Exists(path),"scene mapping mismatch");
+            }
+            return Task.CompletedTask;
+        });
+        await Case("free order permits changing human biome without completing either",async f=>
+        {
+            foreach(string id in ids.Reverse())Check(await f.Selection.EnterAsync(id,Exists,f.Navigate),f.Selection.Code);
+            Check(f.Navigations==5&&f.State().Biomes.All(b=>b.Status=="human_pending")&&f.State().Decisions.Count==0,"not free order");
+        });
+        await Case("unknown biome rejects before writing or navigating",async f=>
+        {
+            Check(!await f.Selection.EnterAsync("invented",Exists,f.Navigate)&&f.Selection.Code=="UNKNOWN_BIOME"&&f.State().Game.Revision==0&&f.Navigations==0,"unknown accepted");
+        });
+        await Case("no active game does not create a replacement",async f=>
+        {
+            Check(!await f.Selection.RefreshAsync()&&!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Navigations==0&&f.Store.Service.GetGameHistory(f.Owner).Count==0,"missing game accepted");
+        },false);
+        await Case("archived game cannot select any perspective",async f=>
+        {
+            using(var c=f.Db.Open())using(var q=c.CreateCommand()){q.CommandText="UPDATE saved_games SET is_current=0,status='archived';";q.ExecuteNonQuery();}
+            Check(!await f.Selection.RefreshAsync()&&!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Selection.Code=="GAME_NOT_ACTIVE"&&f.Navigations==0,"archive accepted");
+        });
+        await Case("completed historical game cannot be selected",async f=>
+        {
+            RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);
+            Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Navigations==0,"finished game accepted");
+        });
+        await Case("completed biome displays completed and rejects human and animal re-entry",async f=>
+        {
+            f.CompleteOcean();Check(await f.Selection.RefreshAsync(),"refresh");
+            Check(f.Selection.Describe("ocean") is {Activity:"completed",Result:"good",CanEnter:false},"card state");
+            Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Selection.Code=="BIOME_COMPLETED"&&f.Navigations==0,"completed navigation");
+            foreach(string perspective in new[]{"human","animal"})
+                Check(Error(()=>f.Store.Service.EnterBiome(new(Id(),f.Owner,f.Game,f.State().Game.Revision,"ocean",perspective)))=="BIOME_COMPLETED","perspective bypass");
+        });
+        await Case("other incomplete biomes stay available after one completes",async f=>
+        {
+            f.CompleteOcean();Check(await f.Selection.RefreshAsync(),"refresh");
+            Check(ids.Skip(1).All(id=>f.Selection.Describe(id).CanEnter),"other biomes locked");
+            Check(await f.Selection.EnterAsync("jungle",Exists,f.Navigate)&&f.State().Biomes.Single(b=>b.BiomeId=="ocean").Status=="completed","completed regression");
+        });
+        await Case("confirmed human boundary reopens with no duplicate EnterBiome or snapshot write",async f=>
+        {
+            Check(await f.Selection.EnterAsync("ocean",Exists,f.Navigate),"entry");var before=f.State();
+            var reopened=new LocalBiomeSelection(f.Store,f.Owner,f.Game);Check(await reopened.RefreshAsync(),"refresh");
+            Check(reopened.Describe("ocean") is {Activity:"in_progress",CanEnter:true},"in progress missing");
+            Check(await reopened.EnterAsync("ocean",Exists,_=>Task.FromResult(true))&&f.Store.EntryCalls==1&&f.State().Snapshot==before.Snapshot,"duplicate entry");
+        });
+        await Case("authorized animal original entry is read-only and never replays a stored decision",async f=>
+        {
+            f.Decision();var before=f.State();Check(await f.Selection.RefreshAsync(),"refresh");
+            Check(f.Selection.Describe("ocean") is {CanEnter:true,Reason:"ANIMAL_FROM_START"},"animal original entry missing");
+            Check(await f.Selection.EnterAsync("ocean",Exists,plan=>
+                Task.FromResult(plan.Scene==LocalBiomeSelection.AnimalSceneFor("ocean")&&plan.Environment=="healthy"&&plan.DecisionOperationId==before.Decisions.Single().OperationId))
+                &&f.State().Snapshot==before.Snapshot&&f.State().Decisions.SequenceEqual(before.Decisions)&&f.Store.EntryCalls==0,"decision replayed");
+            Check(await f.Selection.EnterAsync("jungle",Exists,f.Navigate)&&f.State().Decisions.SequenceEqual(before.Decisions),"other entry changed decisions");
+        });
+        await Case("double click cannot duplicate navigation or entry",async f=>
+        {
+            var gate=new TaskCompletionSource<bool>();int calls=0;
+            var first=f.Selection.EnterAsync("ocean",Exists,_=>{calls++;return gate.Task;});
+            Check(!await f.Selection.EnterAsync("ocean",Exists,_=>{calls++;return Task.FromResult(true);}),"duplicate accepted");
+            gate.SetResult(true);Check(await first&&calls==1&&f.Store.EntryCalls==1&&f.State().Game.Revision==1,"duplicate commit");
+        });
+        await Case("concurrent different cards share one transition lock",async f=>
+        {
+            var gate=new TaskCompletionSource<bool>();int calls=0;
+            var first=f.Selection.EnterAsync("forest",Exists,_=>{calls++;return gate.Task;});
+            Check(!await Task.Run(()=>f.Selection.EnterAsync("tundra",Exists,_=>{calls++;return Task.FromResult(true);})),"second transition accepted");
+            gate.SetResult(true);Check(await first&&calls==1&&f.Store.EntryCalls==1,"multiple transitions");
+        });
+        await Case("SQLite rollback prevents navigation and same command can retry",async f=>
+        {
+            f.Failure.Enabled=true;Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Navigations==0&&f.State().Game.Revision==0,"failed write navigated");
+            string operation=f.Store.LastEntry!.OperationId;f.Failure.Enabled=false;
+            Check(await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Store.LastEntry!.OperationId==operation&&f.State().Game.Revision==1,"retry changed intent");
+        });
+        await Case("lost storage response retries same receipt without extra revision",async f=>
+        {
+            f.Store.LostEntryResponse=true;Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Navigations==0&&f.State().Game.Revision==1,"uncertain outcome shown as success");
+            string operation=f.Store.LastEntry!.OperationId;
+            Check(await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Store.LastEntry!.OperationId==operation&&f.State().Game.Revision==1&&f.Navigations==1,"retry duplicated");
+        });
+        await Case("missing scene is rejected before writing",async f=>
+        {
+            var before=f.State().Snapshot;
+            Check(!await f.Selection.EnterAsync("ocean",_=>false,f.Navigate)&&f.Selection.Code=="SCENE_UNAVAILABLE"&&f.Store.EntryCalls==0&&f.State().Snapshot==before&&f.Navigations==0,"missing scene mutated data");
+        });
+        await Case("failed navigation preserves confirmed entry and retry only changes scene",async f=>
+        {
+            Check(!await f.Selection.EnterAsync("ocean",Exists,_=>Task.FromResult(false))&&f.Selection.Code=="NAVIGATION_FAILED","navigation result");
+            var snapshot=f.State().Snapshot;
+            Check(await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Store.EntryCalls==1&&f.State().Snapshot==snapshot,"navigation retry rewrote snapshot");
+        });
+        await Case("navigation exception cannot become completion or rollback",async f=>
+        {
+            Check(!await f.Selection.EnterAsync("ocean",Exists,_=>throw new InvalidOperationException())&&f.Selection.Code=="NAVIGATION_FAILED"&&f.State().Game.Revision==1&&f.State().Biomes.All(b=>b.Status=="human_pending"),"navigation exception corrupted progress");
+        });
+        await Case("read failure blocks entry without remote fallback",async f=>
+        {
+            f.Store.ReadFailure=true;Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Selection.Code=="IO_ERROR"&&f.Navigations==0&&f.Store.EntryCalls==0,"read failure navigated");
+        });
+        await Case("stale postcommit revision does not navigate",async f=>
+        {
+            f.Store.AfterEntry=()=>{var g=f.State().Game;f.Store.Service.SaveCurrentGame(new(Id(),f.Owner,f.Game,g.Revision,g.CurrentBiomeId,g.ResumeKind,g.CheckpointKey,GameSaveService.BoundarySnapshot));};
+            Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Selection.Code=="REVISION_CONFLICT"&&f.Navigations==0&&f.State().Game.Revision==2,"stale revision navigated");
+        });
+        await Case("invalidated selection never writes or navigates",async f=>
+        {
+            f.Selection.Invalidate();Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Store.EntryCalls==0&&f.Navigations==0,"dead scene accepted");
+        });
+        await Case("scene invalidation during asynchronous read prevents subsequent write or navigation",async f=>
+        {
+            var store=new DelayedStore(f.Store);var selection=new LocalBiomeSelection(store,f.Owner,f.Game);
+            var task=selection.EnterAsync("ocean",Exists,_=>{f.Navigations++;return Task.FromResult(true);});
+            await store.Started.Task;selection.Invalidate();store.Release.SetResult(true);
+            Check(!await task&&f.Store.EntryCalls==0&&f.Navigations==0&&f.State().Game.Revision==0,"late read changed abandoned scene");
+        });
+        await Case("unsupported saved payload is rejected without altering its bytes",async f=>
+        {
+            using(var c=f.Db.Open())using(var q=c.CreateCommand()){q.CommandText="UPDATE continuation_snapshots SET payload_version=2;";q.ExecuteNonQuery();}
+            string before=Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Db.Path)));
+            Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Store.EntryCalls==0&&f.Navigations==0
+                &&before==Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Db.Path))),"unsupported snapshot overwritten");
+        });
+        await Case("new process reads human progress without writing or opening protected stores",async f=>
+        {
+            Check(await f.Selection.EnterAsync("ocean",Exists,f.Navigate),"entry");var snapshot=f.State().Snapshot;
+            var probe=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true};
+            foreach(string arg in new[]{"--biome-selection-probe",f.Db.Path,f.Owner,f.Game})probe.ArgumentList.Add(arg);
+            using var child=Process.Start(probe);child!.WaitForExit();Check(child.ExitCode==0&&f.State().Snapshot==snapshot,"process restore mismatch");
+        });
+        await Case("selection cannot switch to another active game or mix historical progress",async f=>
+        {
+            RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);string next=Id();f.Store.Service.CreateNewGame(new(Id(),f.Owner,next));
+            Check(!await f.Selection.EnterAsync("ocean",Exists,f.Navigate)&&f.Navigations==0&&f.Selection.Code=="GAME_NOT_ACTIVE","implicit game replacement");
+            var current=new LocalBiomeSelection(f.Store,f.Owner,next);Check(await current.RefreshAsync()&&ids.All(id=>current.Describe(id).CanEnter)&&f.Store.Service.GetGameHistory(f.Owner).Count==2,"history contamination");
+        });
+        Check(typeof(LocalBiomeSelection).Assembly.GetReferencedAssemblies().All(x=>x.Name is not "GodotSharp" and not "System.Net.Http" && !(x.Name??"").Contains("Mongo")),"network/motor dependency");
+        Passed("selection coordinator has no HTTP MongoDB or Godot runtime dependency");
+        Console.WriteLine($"Biome selection: {_passed} passed, 0 failed; synthetic SQLite, navigation callbacks, no Godot scenes executed.");
+        return 0;
+    }
+}

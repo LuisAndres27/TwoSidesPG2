@@ -1,0 +1,147 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+namespace TwoSides.LocalPersistence;
+
+public static class SaveValidation
+{
+    public static void Classification(EnvironmentalClassification value)
+    {
+        Require(value.Kind is "favorable" or "perjudicial");
+        Require(value.Version is not null && Regex.IsMatch(value.Version,"\\A[A-Za-z0-9._-]{1,64}\\z"));
+    }
+    public static string DecisionState(string json, int version)
+    {
+        using var data=JsonDocument.Parse(JsonObject(json,16384));
+        Require(version is 1 or 2,"UNKNOWN_CONTENT");
+        var root=data.RootElement;
+        Require(root.TryGetProperty("stateKind",out var state) && state.ValueKind==JsonValueKind.String
+            && state.GetString() is "healthy" or "degraded","INVALID_SNAPSHOT");
+        if(version==1) Require(root.EnumerateObject().Count()==1,"INVALID_SNAPSHOT");
+        else
+        {
+            Require(root.EnumerateObject().Count()==2 && root.TryGetProperty("classification",out _),"INVALID_SNAPSHOT");
+            _=DecisionClassification(json,version);
+        }
+        return state.GetString()!;
+    }
+    public static EnvironmentalClassification? DecisionClassification(string json,int version)
+    {
+        if(version==1)return null;
+        Require(version==2,"UNKNOWN_CONTENT");
+        using var data=JsonDocument.Parse(JsonObject(json,16384));
+        Require(data.RootElement.TryGetProperty("classification",out var c) && c.ValueKind==JsonValueKind.Object,"INVALID_SNAPSHOT");
+        Require(c.EnumerateObject().Count()==2 && c.TryGetProperty("kind",out var kind) && kind.ValueKind==JsonValueKind.String,"INVALID_SNAPSHOT");
+        Require(c.TryGetProperty("version",out var v) && v.ValueKind==JsonValueKind.String,"INVALID_SNAPSHOT");
+        var value=new EnvironmentalClassification(c.GetProperty("kind").GetString()!,v.GetString()!);
+        Classification(value);return value;
+    }
+    public static void Require(bool condition, string code = "INVALID_DATA") { if (!condition) throw new SaveException(code); }
+    public static void Id(string? value) => Require(value is not null && Guid.TryParseExact(value, "D", out var id)
+        && id.ToString("D") == value && value[14] == '4' && "89ab".Contains(value[19]));
+    public static string Name(string value)
+    {
+        Require(value is not null && value.Length <= 1024, "INVALID_NAME");
+        try
+        {
+            var strict = new UTF8Encoding(false, true);
+            strict.GetByteCount(value!);
+            Require(!Regex.IsMatch(value!, "[\\p{Cc}\\p{Zl}\\p{Zp}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]"), "INVALID_NAME");
+            var result = value!.Trim().Normalize(NormalizationForm.FormC);
+            var length = new StringInfo(result).LengthInTextElements;
+            var visible = result.EnumerateRunes().Any(r => Rune.GetUnicodeCategory(r) is
+                UnicodeCategory.UppercaseLetter or UnicodeCategory.LowercaseLetter or UnicodeCategory.TitlecaseLetter
+                or UnicodeCategory.ModifierLetter or UnicodeCategory.OtherLetter or UnicodeCategory.DecimalDigitNumber
+                or UnicodeCategory.LetterNumber or UnicodeCategory.OtherNumber or UnicodeCategory.ConnectorPunctuation
+                or UnicodeCategory.DashPunctuation or UnicodeCategory.OpenPunctuation or UnicodeCategory.ClosePunctuation
+                or UnicodeCategory.InitialQuotePunctuation or UnicodeCategory.FinalQuotePunctuation or UnicodeCategory.OtherPunctuation
+                or UnicodeCategory.MathSymbol or UnicodeCategory.CurrencySymbol or UnicodeCategory.ModifierSymbol or UnicodeCategory.OtherSymbol);
+            Require(length is >= 1 and <= 32 && strict.GetByteCount(result) <= 256
+                && visible, "INVALID_NAME");
+            return result;
+        }
+        catch (ArgumentException) { throw new SaveException("INVALID_NAME"); }
+    }
+
+    public static string JsonObject(string value, int maxBytes)
+    {
+        Require(value is not null && Encoding.UTF8.GetByteCount(value) <= maxBytes);
+        try
+        {
+            using var json = JsonDocument.Parse(value!, new JsonDocumentOptions { MaxDepth = 8 });
+            Require(json.RootElement.ValueKind == JsonValueKind.Object);
+            ValidateKeys(json.RootElement);
+            return Canonical(json.RootElement);
+        }
+        catch (JsonException) { throw new SaveException("INVALID_DATA"); }
+    }
+
+    private static void ValidateKeys(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            var keys = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in value.EnumerateObject())
+            {
+                Require(keys.Add(property.Name));
+                Require(!new[] { "password", "credential", "credentialVerifier", "token", "accessToken", "authorization", "connectionString", "secret" }
+                    .Contains(property.Name, StringComparer.OrdinalIgnoreCase));
+                ValidateKeys(property.Value);
+            }
+        }
+        else if (value.ValueKind == JsonValueKind.Array) foreach (var item in value.EnumerateArray()) ValidateKeys(item);
+    }
+
+    public static string Canonical(JsonElement value) => value.ValueKind switch
+    {
+        JsonValueKind.Object => "{" + string.Join(",", value.EnumerateObject().OrderBy(p => p.Name, StringComparer.Ordinal)
+            .Select(p => JsonSerializer.Serialize(p.Name) + ":" + Canonical(p.Value))) + "}",
+        JsonValueKind.Array => "[" + string.Join(",", value.EnumerateArray().Select(Canonical)) + "]",
+        _ => value.GetRawText()
+    };
+
+    public static string Digest(object value)
+    {
+        var json = JsonSerializer.SerializeToElement(value);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Canonical(json)))).ToLowerInvariant();
+    }
+
+    public static string Timestamp(DateTimeOffset now) => now.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+}
+
+public sealed class SaveCatalog
+{
+    private readonly Dictionary<string, string> _decisions;
+    public string RulesVersion { get; }
+    public string ContentVersion { get; }
+    public IReadOnlyList<string> Biomes => _decisions.Keys.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+    public SaveCatalog(string rulesVersion, string contentVersion, IReadOnlyDictionary<string, string> decisions)
+    {
+        SaveValidation.Require(!string.IsNullOrWhiteSpace(rulesVersion) && !string.IsNullOrWhiteSpace(contentVersion) && decisions.Count > 0);
+        _decisions = new Dictionary<string, string>(decisions, StringComparer.Ordinal);
+        RulesVersion = rulesVersion; ContentVersion = contentVersion;
+    }
+    public void Biome(string biome) => SaveValidation.Require(biome is not null && _decisions.ContainsKey(biome), "UNKNOWN_BIOME");
+    public void Decision(string biome, string key, string option)
+    {
+        Biome(biome);
+        SaveValidation.Require(_decisions[biome] == key && option is "approve" or "reject");
+    }
+    public void Resume(string? biome, string kind, string? checkpoint, string snapshot)
+    {
+        if (biome is not null) Biome(biome);
+        SaveValidation.Require(kind is "menu" or "human_decision" or "decision_info" or "animal_start" or "ending", "UNSUPPORTED_CHECKPOINT");
+        SaveValidation.Require(kind is "menu" or "ending" || biome is not null);
+        SaveValidation.Require(kind!="ending" || biome is null,"INVALID_SNAPSHOT");
+        SaveValidation.Require(kind != "animal_start" || checkpoint == "segment-start", "UNSUPPORTED_CHECKPOINT");
+        SaveValidation.Require(kind == "animal_start" || checkpoint is null);
+        var canonical = SaveValidation.JsonObject(snapshot, 65536);
+        SaveValidation.Require(canonical == "{\"mode\":\"segment_boundary\"}", "UNSUPPORTED_CHECKPOINT");
+    }
+}

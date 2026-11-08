@@ -1,0 +1,111 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class StatisticsScreenChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Names={"Océano","Selva","Desierto","Bosque","Tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static void Check(bool ok){if(!ok)throw new Exception("Statistics screen assertion failed");}
+    private sealed class Reader:ILocalStatisticsReader
+    {
+        private readonly StatisticsService _queries;
+        internal int Calls;
+        internal bool Fail;
+        internal TaskCompletionSource<bool>? Gate;
+        internal Reader(ISaveDatabase db)=>_queries=new(db,RealGameCatalog.InitialState());
+        public async Task<LocalSaveResult<StatisticsResult<PlayerStatistics>>> GetLocalStatisticsAsync()
+        {
+            Calls++;if(Gate is not null)await Gate.Task;
+            if(Fail)return new(false,"IO_ERROR");
+            return await Task.Run(()=>new LocalSaveResult<StatisticsResult<PlayerStatistics>>(true,"STATISTICS",_queries.GetLocalStatistics()));
+        }
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly GameSaveService Save;
+        internal readonly Reader Reader;
+        internal readonly LocalStatisticsScreenState State;
+        internal readonly string Owner=Id();
+        internal string Game="";
+        internal F(bool profile=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState());
+            if(profile)Save.CreateLocalProfile(Id(),Owner,"Pantalla sintética");
+            Reader=new(new RuntimeMenuChecks.ReadOnlyFixture(Db.Path));State=new(Reader);
+        }
+        internal void NewGame(){Game=Id();Save.CreateNewGame(new(Id(),Owner,Game));}
+        internal void Decide(int i,bool good)
+        {
+            var g=Save.LoadGame(Owner,Game).Game;Save.EnterBiome(new(Id(),Owner,Game,g.Revision,Biomes[i],"human"));
+            g=Save.LoadGame(Owner,Game).Game;Save.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,Biomes[i],Keys[i],good?"reject":"approve",good?"healthy":"degraded",good?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));
+        }
+        internal void Terminal()
+        {using var c=Db.Open();using var q=c.CreateCommand();q.CommandText="UPDATE saved_games SET is_current=0,status='completed',ending='medium',ending_rules_version=rules_version,completed_at=saved_at;";q.ExecuteNonQuery();}
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        public void Dispose(){State.Close();Sandbox.Dispose();}
+    }
+    private static async Task Case(string name,Func<F,Task> work,bool profile=true)
+    {using var f=new F(profile);await work(f);_count++;Console.WriteLine("PASS "+name);}
+    public static async Task<int> Probe(string path,string owner)
+    {
+        var state=new LocalStatisticsScreenState(new Reader(new RuntimeMenuChecks.ReadOnlyFixture(path)));
+        return await state.LoadAsync() && state.Result?.Data?.LocalPlayerId==owner && state.Result.Data.AllDecisions.Total==1?0:61;
+    }
+    public static async Task<int> Run()
+    {
+        await Case("absent profile opens explicit empty state without writes",async f=>
+        {string h=f.Hash();Check(await f.State.LoadAsync() && f.State.Text.Contains("Sin datos de perfil local") && f.State.Result?.State==StatisticsAvailability.NoData && f.Hash()==h);},false);
+        await Case("profile without active game can inspect statistics",async f=>
+        {Check(await f.State.LoadAsync());Check(f.State.Text.Contains("Jugador: Pantalla sintética") && f.State.Text.Contains("Partidas registradas: 0") && f.State.Text.Contains("Sin partidas históricas") && f.State.Text.Contains("Sin partida actual"));});
+        for(int i=0;i<5;i++)foreach(bool healthy in new[]{true,false})
+        {
+            int index=i;
+            await Case("display active "+Biomes[i]+" "+(healthy?"reject":"approve"),async f=>
+            {
+                f.NewGame();f.Decide(index,healthy);string h=f.Hash();Check(await f.State.LoadAsync());string text=f.State.Text;
+                Check(text.Contains(Names[index]) && text.Contains(healthy?"Saludable":"Degradado") && text.Contains("PARTIDA ACTUAL") && text.Contains("Biomas completados: 0 | Pendientes: 5"));
+                Check(f.State.Result?.Data?.AllDecisions.Total==1 && f.State.Result.Data.ActiveGame?.Decisions.Reject==(healthy?1:0) && f.Hash()==h);
+            });
+        }
+        await Case("history without active game shows only recorded historical ending",async f=>
+        {f.NewGame();f.Decide(0,true);f.Terminal();string h=f.Hash();Check(await f.State.LoadAsync());Check(f.State.Text.Contains("Partida histórica 1") && f.State.Text.Contains("Final histórico registrado: Medio") && f.State.Text.Contains("Sin partida actual") && f.Hash()==h);});
+        await Case("active and historical choices have distinct scopes",async f=>
+        {f.NewGame();f.Decide(0,true);f.Terminal();f.NewGame();f.Decide(1,false);Check(await f.State.LoadAsync());var p=f.State.Result!.Data!;Check(p.AllDecisions.Total==2 && p.HistoricalDecisions.Reject==1 && p.ActiveGame?.Decisions.Approve==1 && f.State.Text.Contains("HISTORIAL — sin incluir la partida actual"));});
+        await Case("stored completed biome differs from a saved decision",async f=>
+        {f.NewGame();f.Decide(0,true);var g=f.Save.LoadGame(f.Owner,f.Game).Game;f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,g.Revision,"ocean","good"));Check(await f.State.LoadAsync() && f.State.Text.Contains("Biomas completados: 1 | Pendientes: 4"));});
+        await Case("uncollected metrics show No disponible rather than zero",async f=>
+        {Check(await f.State.LoadAsync());foreach(string field in new[]{"Tiempo jugado","Sesiones","Muertes","Reinicios","Reintentos"})Check(f.State.Text.Contains(field+": No disponible"));Check(LocalStatisticsText.Count(new(StatisticsAvailability.Unknown,null))=="Desconocido" && LocalStatisticsText.Count(new(StatisticsAvailability.Available,0))=="0" && LocalStatisticsText.Count(new(StatisticsAvailability.NoData,null))=="Sin datos");});
+        await Case("double click has one outstanding read and responsive loading state",async f=>
+        {f.Reader.Gate=new();var first=f.State.LoadAsync();Check(f.State.Busy && !first.IsCompleted && f.State.Text.Contains("Consultando"));Check(!await f.State.LoadAsync() && f.Reader.Calls==1);f.Reader.Gate.SetResult(true);Check(await first && f.Reader.Calls==1);});
+        await Case("SQLite error is local and retry does not create data",async f=>
+        {f.NewGame();string h=f.Hash();f.Reader.Fail=true;Check(!await f.State.LoadAsync() && f.State.Code=="IO_ERROR" && f.State.Text.Contains("Tu progreso se conserva"));f.Reader.Fail=false;Check(await f.State.LoadAsync() && f.Hash()==h);});
+        await Case("return during pending load discards response and prevents reopening",async f=>
+        {f.Reader.Gate=new();var first=f.State.LoadAsync();f.State.Close();f.Reader.Gate.SetResult(true);Check(!await first && f.State.Result is null && !await f.State.LoadAsync() && f.Reader.Calls==1);});
+        await Case("new opening refreshes data once without polling",async f=>
+        {f.NewGame();Check(await f.State.LoadAsync());for(int i=0;i<20;i++)_ = f.State.Text;Check(f.Reader.Calls==1);f.State.Close();f.Decide(0,true);var next=new LocalStatisticsScreenState(f.Reader);Check(await next.LoadAsync() && next.Result?.Data?.AllDecisions.Total==1 && f.Reader.Calls==2);next.Close();});
+        await Case("persisted data survives a new readonly process",async f=>
+        {f.NewGame();f.Decide(0,true);string h=f.Hash();var start=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false};foreach(string arg in new[]{"--statistics-screen-probe",f.Db.Path,f.Owner})start.ArgumentList.Add(arg);using var child=Process.Start(start)!;await child.WaitForExitAsync();Check(child.ExitCode==0 && f.Hash()==h);});
+        await Case("markup-looking name remains plain text and IDs are omitted",async f=>
+        {var p=f.Save.GetLocalProfile()!;f.Save.UpdateDisplayName(Id(),f.Owner,p.Revision,"[b]Nombre[/b]");f.NewGame();Check(await f.State.LoadAsync());Check(f.State.Text.Contains("Jugador: [b]Nombre[/b]") && !f.State.Text.Contains(f.Owner) && !f.State.Text.Contains(f.Game));});
+        await Case("closed real runtime adapter does not open protected databases",async f=>
+        {await using var adapter=new GamePersistenceAdapter(runtime:true);var r=await adapter.GetLocalStatisticsAsync();Check(!r.Success && r.Code=="STORAGE_CLOSED");await adapter.DisposeAsync();r=await adapter.GetLocalStatisticsAsync();Check(!r.Success && r.Code=="STORAGE_CLOSED");});
+        string root=Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!;
+        string menu=File.ReadAllText(Path.Combine(root,"scripts/MenuPrincipal.cs"));string screen=File.ReadAllText(Path.Combine(root,"scripts/LocalStatisticsScreen.cs"));
+        Check(menu.Contains("new LocalStatisticsScreenState(_context.Statistics)") && !menu.Contains("EscenaEstadisticas is null"));
+        Check(screen.Contains("Label _body") && !screen.Contains("RichTextLabel") && !screen.Contains("ChangeSceneTo"));
+        Check(typeof(ILocalStatisticsReader).GetMethods().Length==1 && typeof(LocalStatisticsScreenState).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "GodotSharp" and not "System.Net.Http" && !(a.Name??"").Contains("Mongo")));
+        _count++;Console.WriteLine("PASS source bindings use plain labels and one local read capability without remote dependency");
+        Console.WriteLine($"Statistics screen: {_count} passed, 0 failed; readonly synthetic SQLite, state/formatting/source checks, not Godot runtime.");return 0;
+    }
+}

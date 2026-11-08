@@ -1,0 +1,116 @@
+[gd_scene format=3 uid="uid://ddbjf57wpxxoq"]
+
+[ext_resource type="Script" uid="uid://c2t1qr2k2nqou" path="res://scripts/MenuPrincipal.cs" id="1_nywfc"]
+[ext_resource type="Texture2D" uid="uid://j0jlb3vx824s" path="res://assets/sprites/ui/menu.jpg" id="2_gw8u6"]
+[ext_resource type="PackedScene" uid="uid://bxw8mxlhurrf8" path="res://scenes/levels/menu_niveles.tscn" id="2_uqaae"]
+[ext_resource type="Texture2D" uid="uid://c4fthwoyrm7e" path="res://assets/sprites/ui/TABLERO1.png" id="2_y0hfs"]
+[ext_resource type="Texture2D" uid="uid://dk0dnj3yr5h8u" path="res://assets/sprites/ui/EMPEZAR BOTON.png" id="4_rtxm5"]
+[ext_resource type="Texture2D" uid="uid://ckk517igmt55x" path="res://assets/sprites/ui/BOTONES 1_0003.png" id="5_tebqv"]
+[ext_resource type="Script" uid="uid://d27kpos4abex5" path="res://scripts/EfectoBoton.cs" id="6_8trqb"]
+[ext_resource type="Texture2D" uid="uid://ccn18lvllhm87" path="res://assets/sprites/ui/BOTONES 1_0005.png" id="6_uqaae"]
+[ext_resource type="Script" uid="uid://c7mqg7asc8bxd" path="res://scripts/MusicaFondo.cs" id="8_0e71n"]
+[ext_resource type="AudioStream" uid="uid://c3ayi2ms7jlsf" path="res://assets/sprites/fondos/Music/Menu y finales/Nature Recovering Theme (Take 2).wav" id="9_8trqb"]
+
+[sub_resource type="StyleBoxTexture" id="StyleBoxTexture_gw8u6"]
+texture = ExtResource("2_y0hfs")
+
+[node name="MenuPrincipal" type="Control" unique_id=603846125]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_nywfc")
+EscenaNiveles = ExtResource("2_uqaae")
+metadata/_edit_vertical_guides_ = [324.0]
+
+[node name="Fondo" type="TextureRect" parent="." unique_id=836850680]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -12.0
+offset_top = -8.0
+offset_right = 21.666626
+offset_bottom = 8.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+texture = ExtResource("2_gw8u6")
+expand_mode = 1
+
+[node name="Centro" type="CenterContainer" parent="." unique_id=957310784]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 8.0
+offset_top = 72.0
+offset_right = -8.0
+offset_bottom = -8.0
+grow_horizontal = 2
+grow_vertical = 2
+[node name="Tablero" type="PanelContainer" parent="Centro" unique_id=1583125124]
+custom_minimum_size = Vector2(300, 100)
+layout_mode = 2
+theme_override_styles/panel = SubResource("StyleBoxTexture_gw8u6")
+
+[node name="Margen" type="MarginContainer" parent="Centro/Tablero" unique_id=1574409748]
+layout_mode = 2
+theme_override_constants/margin_left = 12
+theme_override_constants/margin_top = 8
+theme_override_constants/margin_right = 12
+theme_override_constants/margin_bottom = 8
+
+[node name="Contenido" type="VBoxContainer" parent="Centro/Tablero/Margen" unique_id=2045571188]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="Titulo" type="Label" parent="Centro/Tablero/Margen/Contenido" unique_id=330347594]
+layout_mode = 2
+text = "!Bienvenido!"
+horizontal_alignment = 1
+
+[node name="BotonJugar" type="TextureButton" parent="Centro/Tablero/Margen/Contenido" unique_id=1577702598]
+custom_minimum_size = Vector2(50, 40)
+layout_mode = 2
+texture_normal = ExtResource("4_rtxm5")
+stretch_mode = 5
+
+[node name="Efecto" type="Node" parent="Centro/Tablero/Margen/Contenido/BotonJugar" unique_id=1119592820]
+script = ExtResource("6_8trqb")
+
+[node name="BotonesInferiores" type="HBoxContainer" parent="Centro/Tablero/Margen/Contenido" unique_id=63726546]
+layout_mode = 2
+size_flags_horizontal = 4
+size_flags_vertical = 4
+theme_override_constants/separation = 38
+
+[node name="BotonEstadisticas" type="Button" parent="Centro/Tablero/Margen/Contenido/BotonesInferiores" unique_id=1595377837]
+layout_mode = 2
+icon = ExtResource("5_tebqv")
+flat = true
+icon_alignment = 1
+
+[node name="Efecto" type="Node" parent="Centro/Tablero/Margen/Contenido/BotonesInferiores/BotonEstadisticas" unique_id=1248580542]
+script = ExtResource("6_8trqb")
+
+[node name="BotonSalir" type="Button" parent="Centro/Tablero/Margen/Contenido/BotonesInferiores" unique_id=955545263]
+layout_mode = 2
+icon = ExtResource("6_uqaae")
+flat = true
+icon_alignment = 1
+
+[node name="Efecto" type="Node" parent="Centro/Tablero/Margen/Contenido/BotonesInferiores/BotonSalir" unique_id=1157641657]
+script = ExtResource("6_8trqb")
+
+[node name="MusicaFondo" type="AudioStreamPlayer" parent="." unique_id=492019016]
+script = ExtResource("8_0e71n")
+MusicaBuena = ExtResource("9_8trqb")
+MusicaMala = ExtResource("9_8trqb")
+
+[node name="MusicaFondo2" type="AudioStreamPlayer" parent="." unique_id=870785581]
+script = ExtResource("8_0e71n")
+MusicaBuena = ExtResource("9_8trqb")
+MusicaMala = ExtResource("9_8trqb")

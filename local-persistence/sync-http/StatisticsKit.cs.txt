@@ -1,0 +1,82 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+
+namespace TwoSides.Integration.SyncHttp;
+
+// B87 — hand-over of ONE technical credential between a local Express (tools/b87/express-atlas.mjs) and the authorized test game, through a kit folder:
+//   installation.json  written by the game  {"schema":1,"installationId":"<uuid>"}                          (not a secret)
+//   kit.json           written by the server {"schema":1,"audience":"http://127.0.0.1:PORT","token":"<43>","expiresAtMs":N,"installationId":"<uuid>"}
+// Nothing here activates anything by itself: the statistics transport stays OFF unless every condition of StatisticsKitGate holds AND a valid kit.json exists.
+
+public sealed record StatisticsKitOptions(string ExpectedUser,string KitDirectory);
+
+public static class StatisticsKitGate
+{
+    public const string Flag="--stats-demo",ExpectedUserPrefix="--stats-expected-user=",KitDirectoryPrefix="--stats-kit-dir=";
+    // Accounts that own real player data: the kit never activates there, whatever the arguments say.
+    private static readonly string[] ForbiddenUsers={"luis2","TwoSidesTest","TwoSidesStatsTest"};
+    private static string? Value(IReadOnlyList<string> args,string prefix)=>args.Where(a=>a.StartsWith(prefix,StringComparison.Ordinal)).Select(a=>a.Substring(prefix.Length)).FirstOrDefault();
+    // Fixed codes only; the arguments themselves are never echoed.
+    public static StatisticsKitOptions? Evaluate(IReadOnlyList<string> args,string currentUser,out string code)
+    {
+        if(!args.Contains(Flag)){code="STATS_KIT_OFF";return null;}
+        string? expected=Value(args,ExpectedUserPrefix),directory=Value(args,KitDirectoryPrefix);
+        if(string.IsNullOrWhiteSpace(expected)||string.IsNullOrWhiteSpace(directory)||string.IsNullOrWhiteSpace(currentUser)){code="STATS_KIT_ARGUMENTS";return null;}
+        if(!string.Equals(expected,currentUser,StringComparison.OrdinalIgnoreCase)){code="STATS_KIT_USER_MISMATCH";return null;}
+        if(ForbiddenUsers.Contains(currentUser,StringComparer.OrdinalIgnoreCase)){code="STATS_KIT_USER_FORBIDDEN";return null;}
+        if(!Path.IsPathRooted(directory)||directory.IndexOfAny(Path.GetInvalidPathChars())>=0){code="STATS_KIT_DIRECTORY";return null;}
+        code="STATS_KIT_ENABLED";return new StatisticsKitOptions(expected,Path.GetFullPath(directory));
+    }
+}
+
+public sealed record StatisticsKit(string Audience,string Token,long ExpiresAtMs,string InstallationId);
+
+public static class StatisticsKitFiles
+{
+    public const string InstallationFile="installation.json",CredentialFile="kit.json";
+    private static readonly Regex Loopback=new(@"^http://127\.0\.0\.1:[1-9][0-9]{3,4}$",RegexOptions.CultureInvariant);
+    public static void WriteInstallation(string directory,string installationId)
+    {
+        SaveValidation.Id(installationId);Directory.CreateDirectory(directory);
+        string file=Path.Combine(directory,InstallationFile),text=JsonSerializer.Serialize(new{schema=1,installationId});
+        try{if(File.Exists(file)&&File.ReadAllText(file)==text)return;}catch(IOException){/* rewritten below */}
+        string temp=file+"."+Guid.NewGuid().ToString("N")+".tmp";
+        File.WriteAllText(temp,text,new UTF8Encoding(false));File.Move(temp,file,true);
+    }
+    // Null for anything that is not a complete, current, loopback kit for THIS installation. Never throws; never exposes content.
+    public static StatisticsKit? TryRead(string directory,long nowMs,string installationId)
+    {
+        try{
+            var info=new FileInfo(Path.Combine(directory,CredentialFile));
+            if(!info.Exists||info.Length>1024)return null;
+            using var document=JsonDocument.Parse(File.ReadAllBytes(info.FullName));var root=document.RootElement;
+            if(root.ValueKind!=JsonValueKind.Object||root.GetProperty("schema").GetInt32()!=1)return null;
+            string audience=root.GetProperty("audience").GetString()??"",token=root.GetProperty("token").GetString()??"",id=root.GetProperty("installationId").GetString()??"";
+            long expires=root.GetProperty("expiresAtMs").GetInt64();
+            if(!Loopback.IsMatch(audience)||id!=installationId||expires<=nowMs)return null;
+            _=new StatisticsCredential(installationId,token,audience,expires);   // validates the token shape (43 URL-safe characters)
+            return new StatisticsKit(audience,token,expires,id);
+        }catch(Exception){return null;}
+    }
+}
+
+// Re-reads kit.json on every call, so a renewed token is used without restarting the game. Null (=> the transport pauses) when there is no valid kit.
+public sealed class KitStatisticsCredentials : IStatisticsCredentials
+{
+    private readonly string _directory,_installationId;private readonly Func<long> _now;
+    public KitStatisticsCredentials(string directory,string installationId,Func<long>? now=null)
+    {SaveValidation.Id(installationId);_directory=directory;_installationId=installationId;_now=now??(()=>DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());}
+    public Task<StatisticsCredential?> GetAsync(CancellationToken cancel)
+    {
+        var kit=StatisticsKitFiles.TryRead(_directory,_now(),_installationId);
+        return Task.FromResult<StatisticsCredential?>(kit is null?null:new StatisticsCredential(kit.InstallationId,kit.Token,kit.Audience,kit.ExpiresAtMs));
+    }
+}

@@ -1,0 +1,120 @@
+[gd_scene format=3 uid="uid://djv7h4apd40ge"]
+
+[ext_resource type="Script" path="res://scripts/EnvironmentalDecisionNivel.cs" id="1_d5set"]
+[ext_resource type="Texture2D" uid="uid://6kv1akh6rimh" path="res://assets/sprites/fondos/selva/FONDO DESICIONES_0004.png" id="2_d5set"]
+[ext_resource type="Texture2D" uid="uid://d13i6gnjfmtoh" path="res://assets/sprites/fondos/nieve/HUMANO.png" id="3_466ws"]
+[ext_resource type="Texture2D" uid="uid://bcw8xcp5qn5" path="res://assets/sprites/fondos/props/TABLERO1.png" id="4_bj2oe"]
+[ext_resource type="Script" uid="uid://c7mqg7asc8bxd" path="res://scripts/MusicaFondo.cs" id="5_466ws"]
+[ext_resource type="AudioStream" uid="uid://038lj14r1503" path="res://assets/sprites/fondos/Music/Menu y finales/Pixel Nature Main Theme (Take 2).wav" id="6_bj2oe"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_3meqi"]
+atlas = ExtResource("3_466ws")
+region = Rect2(0, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_faf3x"]
+atlas = ExtResource("3_466ws")
+region = Rect2(32, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_jxsir"]
+atlas = ExtResource("3_466ws")
+region = Rect2(64, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_s780p"]
+atlas = ExtResource("3_466ws")
+region = Rect2(96, 0, 32, 64)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_36e4i"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_3meqi")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_faf3x")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_jxsir")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_s780p")
+}],
+"loop": true,
+"name": &"default",
+"speed": 5.0
+}]
+
+[node name="DesicionZorro" type="Node2D" unique_id=1938246463]
+script = ExtResource("1_d5set")
+BiomeId = "jungle"
+Dialogo = PackedStringArray("Se ha propuesto construir una nueva vía férrea para acelerar el transporte de mercancías. La ruta más barata y rápida atraviesa directamente el corazón de la selva. [Presiona espacio para continuar]", "Pero construirla requeriría talar árboles a ras de suelo. Esto fragmentaría el ecosistema, dejando a los animales sin alimento y sin refugio ante depredadores. [Presiona espacio para continuar]", "Tienes que decidir: ahorrar presupuesto atravesando la selva o gastar más dinero rodeando el ecosistema para proteger su integridad. [Presiona espacio para continuar]")
+Pregunta = "¿Autorizas la construcción de la vía a través de la selva para ahorrar presupuesto?"
+EscenaInfoBuena = "uid://dka8dg2wbaqqq"
+EscenaInfoMala = "uid://dc7qjn0ttcpdt"
+
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=987870958]
+position = Vector2(371, 170)
+scale = Vector2(2.7875, 2.7875)
+texture = ExtResource("2_d5set")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=158215570]
+position = Vector2(368, 264)
+scale = Vector2(1.90625, 1.90625)
+sprite_frames = SubResource("SpriteFrames_36e4i")
+autoplay = "default"
+frame_progress = 0.47553754
+
+[node name="BotonBuena" type="Button" parent="." unique_id=727000606]
+offset_left = 88.0
+offset_top = 138.0
+offset_right = 335.0
+offset_bottom = 169.0
+text = "No"
+
+[node name="BotonMala" type="Button" parent="." unique_id=2017679930]
+offset_left = 339.0
+offset_top = 138.0
+offset_right = 576.0
+offset_bottom = 169.0
+text = "Si"
+
+[node name="Dialogo" type="CanvasLayer" parent="." unique_id=573020373]
+
+[node name="Panel" type="NinePatchRect" parent="Dialogo" unique_id=935949914]
+custom_minimum_size = Vector2(0, 90)
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 83.0
+offset_top = 15.0
+offset_right = -63.0
+offset_bottom = -229.0
+grow_horizontal = 2
+grow_vertical = 2
+texture = ExtResource("4_bj2oe")
+patch_margin_left = 16
+patch_margin_top = 16
+patch_margin_right = 16
+patch_margin_bottom = 16
+
+[node name="Texto" type="RichTextLabel" parent="Dialogo/Panel" unique_id=1544121469]
+layout_mode = 0
+offset_left = 9.0
+offset_top = 19.0
+offset_right = 485.0
+offset_bottom = 108.0
+scroll_active = false
+
+[node name="Indicador" type="Label" parent="Dialogo/Panel" unique_id=2067019670]
+layout_mode = 0
+offset_left = 5.0
+offset_top = 1.0
+offset_right = 20.0
+offset_bottom = 24.0
+text = "▼"
+
+[node name="MusicaFondo" type="AudioStreamPlayer" parent="." unique_id=1321969446]
+script = ExtResource("5_466ws")
+MusicaBuena = ExtResource("6_bj2oe")
+
+[connection signal="pressed" from="BotonBuena" to="." method="OnBotonBuenaPressed"]
+[connection signal="pressed" from="BotonMala" to="." method="OnBotonMalaPressed"]

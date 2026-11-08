@@ -1,0 +1,22 @@
+namespace TwoSides.LocalPersistence;
+
+// A trusted, pure composition policy, not a flag accepted from player input.
+// The user-approved free selection policy supersedes the former RF-021 sequence.
+public enum BiomeAvailability { Unknown, Unavailable, Available }
+public interface IBiomeAvailabilityPolicy
+{
+    BiomeAvailability Evaluate(GameAggregate game, string biomeId);
+}
+public sealed class FreeBiomeAvailabilityPolicy : IBiomeAvailabilityPolicy
+{
+    public static System.Collections.Generic.IReadOnlyList<string> CanonicalBiomes { get; } =
+        System.Array.AsReadOnly(new[] {"ocean","jungle","desert","forest","tundra"});
+    public BiomeAvailability Evaluate(GameAggregate game,string biomeId)
+    {
+        if(!System.Linq.Enumerable.Contains(CanonicalBiomes,biomeId))return BiomeAvailability.Unavailable;
+        if(!game.Game.IsCurrent || game.Game.Status!="in_progress")return BiomeAvailability.Unavailable;
+        var biome=System.Linq.Enumerable.SingleOrDefault(game.Biomes,b=>b.BiomeId==biomeId);
+        return biome is not null && biome.Status is "human_pending" or "animal_pending"
+            ? BiomeAvailability.Available : BiomeAvailability.Unavailable;
+    }
+}

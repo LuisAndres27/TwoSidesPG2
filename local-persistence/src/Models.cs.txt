@@ -1,0 +1,59 @@
+using System;
+using System.Collections.Generic;
+
+namespace TwoSides.LocalPersistence;
+
+public sealed class SaveException : Exception
+{
+    public string Code { get; }
+    public SaveException(string code) : base(code) { Code = code; }
+}
+
+public sealed record LocalProfile(string LocalPlayerId, string DisplayName, long Revision,
+    string RegistrationStatus, string CreatedAt, string UpdatedAt, string? RegistrationId = null,
+    string? TechnicalAccountId = null, string? InternalEmail = null, string? CredentialRef = null);
+
+public sealed record SavedGame(string GameId, string LocalPlayerId, bool IsCurrent, string Status,
+    long Revision, int SaveFormatVersion, string RulesVersion, string ContentVersion,
+    string? CurrentBiomeId, string ResumeKind, string? CheckpointKey, string CreatedAt, string SavedAt,
+    string? Ending = null, string? EndingRulesVersion = null, string? CompletedAt = null, string? ArchivedAt = null);
+
+public sealed record BiomeProgress(string GameId, string BiomeId, string Status, string? Result,
+    int AttemptNumber, string? HumanCompletedAt, string? AnimalCompletedAt, string UpdatedAt);
+public sealed record BiomeObjective(string GameId, string BiomeId, string ObjectiveKey, string Status,
+    string? CompletedAt, string UpdatedAt);
+public sealed record EnvironmentalState(string GameId, string BiomeId, string? StateKind,
+    string? LastDecisionId, int PayloadVersion, string ExtensionsJson, string UpdatedAt);
+public sealed record EnvironmentalDecision(string DecisionId, string GameId, string BiomeId,
+    string DecisionKey, string OptionId, long DecisionOrder, string ConsequencesJson, int ConsequencesVersion,
+    string RulesVersion, string OperationId, string OccurredAt)
+{
+    public EnvironmentalClassification? Classification => SaveValidation.DecisionClassification(ConsequencesJson, ConsequencesVersion);
+}
+public sealed record ContinuationSnapshot(string GameId, long CapturedRevision, int PayloadVersion,
+    string SnapshotJson, string CapturedAt);
+public sealed record LocalSetting(string LocalPlayerId, string SettingKey, string ValueJson, int ValueVersion, string UpdatedAt);
+public sealed record SaveReceipt(string OperationId, string LocalPlayerId, string? GameId,
+    string OperationKind, string PayloadDigest, long? ResultRevision, string CommittedAt);
+public sealed record SchemaMigration(int Version, string MigrationKey, string Checksum, string AppliedAt);
+public sealed record GameAggregate(SavedGame Game, IReadOnlyList<BiomeProgress> Biomes,
+    IReadOnlyList<EnvironmentalState> Environments, IReadOnlyList<EnvironmentalDecision> Decisions,
+    ContinuationSnapshot Snapshot, IReadOnlyList<BiomeObjective> Objectives);
+public sealed record ResumePlan(string GameId, long Revision, string ResumeKind, string? BiomeId, string? CheckpointKey);
+public sealed record NewGameCommand(string OperationId, string LocalPlayerId, string GameId,
+    string? ExpectedCurrentGameId = null, long? ExpectedCurrentRevision = null);
+public sealed record SaveGameCommand(string OperationId, string LocalPlayerId, string GameId, long ExpectedRevision,
+    string? BiomeId, string ResumeKind, string? CheckpointKey, string SnapshotJson);
+// Consequences are supplied by a trusted, versioned caller, not a gameplay rule invented here.
+public sealed record RecordDecisionCommand(string OperationId, string DecisionId, string LocalPlayerId,
+    string GameId, long ExpectedRevision, string BiomeId, string DecisionKey, string OptionId,
+    string ResolvedEnvironment, string ConsequencesJson, EnvironmentalClassification? Classification = null);
+public sealed record EnvironmentalClassification(string Kind, string Version);
+public sealed record EnterBiomeCommand(string OperationId, string LocalPlayerId, string GameId,
+    long ExpectedRevision, string BiomeId, string Perspective);
+public sealed record CompleteBiomeCommand(string OperationId, string LocalPlayerId, string GameId,
+    long ExpectedRevision, string BiomeId, string ConfirmedResult);
+public sealed record PrepareFinalCommand(string OperationId,string LocalPlayerId,string GameId,long ExpectedRevision);
+public sealed record CloseGameCommand(string OperationId,string LocalPlayerId,string GameId,long ExpectedRevision,string ConfirmedEnding);
+public sealed record BiomeAccess(BiomeProgress Progress, string Availability, bool CanEnterHuman,
+    bool CanEnterAnimal, bool CanReplay, string Reason, string Activity);

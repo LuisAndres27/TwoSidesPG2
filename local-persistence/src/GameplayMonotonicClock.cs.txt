@@ -1,0 +1,21 @@
+using System;
+using System.Diagnostics;
+
+namespace TwoSides.LocalPersistence;
+
+// No timer or scene hook. One origin per process-local session, never persisted as a recoverable clock.
+public sealed class GameplayMonotonicClock
+{
+    private readonly Func<long> _ticks;private readonly long _frequency,_origin;private long _last;
+    public GameplayMonotonicClock(Func<long>? ticks=null,long? frequency=null)
+    {_ticks=ticks??Stopwatch.GetTimestamp;_frequency=frequency??Stopwatch.Frequency;SaveValidation.Require(_frequency>0);_origin=_ticks();}
+    public long ElapsedMilliseconds
+    {
+        get
+        {
+            decimal elapsed=((decimal)_ticks()-_origin)*1000/_frequency;
+            SaveValidation.Require(elapsed>=_last && elapsed<=long.MaxValue,"INVALID_MONOTONIC_CLOCK");
+            return _last=(long)decimal.Floor(elapsed);
+        }
+    }
+}

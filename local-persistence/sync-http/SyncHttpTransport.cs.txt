@@ -1,0 +1,127 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+using TwoSides.LocalPersistence;
+
+namespace TwoSides.Integration.SyncHttp;
+
+public enum SyncHttpFailure { None, NetworkUnavailable, Timeout, Unauthorized, Forbidden, RateLimited, ServerUnavailable, Rejected, InvalidResponse, Canceled, CredentialUnavailable }
+
+// Loopback HTTP is allowed only when explicitly requested (development); otherwise HTTPS is required. No credentials in the URL.
+public sealed class SyncHttpOptions
+{
+    // F3.1 (B47/B48). The server answers one batch within 10 s (fixed cap) after a short authentication step; 15 s leaves the client a margin so it normally reads
+    // the answer instead of abandoning it. A batch never exceeds 8 operations (about 0.7-1.5 s each on the server) and starts at 5.
+    public static readonly TimeSpan DefaultRequestTimeout=TimeSpan.FromSeconds(15);
+    public const int InitialBatchOperations=5;
+    public const int MaxBatchOperationsLimit=8;
+    public Uri BaseUri { get; }
+    public TimeSpan RequestTimeout { get; }
+    public int MaxBatchOperations { get; }
+    public long MaxResponseBytes { get; }
+    public SyncHttpOptions(Uri baseUri,TimeSpan? requestTimeout=null,int maxBatchOperations=MaxBatchOperationsLimit,long maxResponseBytes=1_048_576,bool allowLoopbackHttp=false)
+    {
+        var timeout=requestTimeout??DefaultRequestTimeout;
+        SaveValidation.Require(baseUri is not null && baseUri.IsAbsoluteUri && string.IsNullOrEmpty(baseUri.UserInfo) && string.IsNullOrEmpty(baseUri.Query) &&
+            string.IsNullOrEmpty(baseUri.Fragment) && baseUri.AbsolutePath=="/" &&
+            (baseUri.Scheme==Uri.UriSchemeHttps || (allowLoopbackHttp && baseUri.Scheme==Uri.UriSchemeHttp && baseUri.IsLoopback)),"INVALID_SYNC_HTTP_OPTIONS");
+        SaveValidation.Require(timeout>=TimeSpan.FromMilliseconds(100) && timeout<=TimeSpan.FromSeconds(60) && maxBatchOperations is >=1 and <=MaxBatchOperationsLimit &&
+            maxResponseBytes is >=1024 and <=4*1024*1024,"INVALID_SYNC_HTTP_OPTIONS");
+        BaseUri=baseUri!;RequestTimeout=timeout;MaxBatchOperations=maxBatchOperations;MaxResponseBytes=maxResponseBytes;
+    }
+    public static SyncHttpOptions LoopbackDevelopment(int port,TimeSpan? requestTimeout=null)
+    {
+        SaveValidation.Require(port is >=1 and <=65535,"INVALID_SYNC_HTTP_OPTIONS");
+        return new(new Uri($"http://127.0.0.1:{port}/"),requestTimeout,allowLoopbackHttp:true);
+    }
+}
+
+// Body is detached from the response (cloned). Failure is None for any 2xx; an HTTP status that carries a JSON body is still returned.
+public sealed record SyncHttpResponse(int Status,SyncHttpFailure Failure,JsonElement? Body,TimeSpan? RetryAfter)
+{
+    public bool Ok=>Failure==SyncHttpFailure.None;
+    public static SyncHttpResponse Failed(SyncHttpFailure failure)=>new(0,failure,null,null);
+}
+
+// Why System.Net.Http.HttpClient and not Godot HttpRequest: HttpRequest is a Node that must live in the scene tree and be driven from the
+// main thread, which would tie synchronization to scene state and cannot be exercised without the engine. HttpClient is async, cancellable,
+// has exact timeouts, runs entirely off the main thread (the SQLite outbox APIs are synchronous and must also stay off the frame thread)
+// and is testable headless. No Godot types, no logging, no secret ever leaves this class except as the Authorization header.
+public sealed class SyncHttpTransport:IDisposable
+{
+    private static readonly JsonSerializerOptions Wire=new(JsonSerializerDefaults.Web){WriteIndented=false};
+    private readonly HttpClient _client;
+    private readonly SyncHttpOptions _options;
+    public SyncHttpTransport(SyncHttpOptions options,HttpMessageHandler? handler=null)
+    {
+        _options=options;
+        _client=new HttpClient(handler??new SocketsHttpHandler{AllowAutoRedirect=false,UseProxy=false,UseCookies=false,ConnectTimeout=TimeSpan.FromSeconds(3),
+            PooledConnectionLifetime=TimeSpan.FromMinutes(2),AutomaticDecompression=DecompressionMethods.None},true)
+        {Timeout=System.Threading.Timeout.InfiniteTimeSpan,BaseAddress=options.BaseUri};
+    }
+    public static byte[] Json(object value)=>JsonSerializer.SerializeToUtf8Bytes(value,Wire);
+    public void Dispose()=>_client.Dispose();
+
+    public async Task<SyncHttpResponse> SendAsync(HttpMethod method,string path,byte[]? body,string? bearer,CancellationToken cancellation)
+    {
+        SaveValidation.Require(path.StartsWith("/api/",StringComparison.Ordinal) && path.IndexOfAny(new[]{'?','#','\\','\r','\n'})<0,"INVALID_SYNC_HTTP_PATH");
+        using var timeout=CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        timeout.CancelAfter(_options.RequestTimeout);
+        try
+        {
+            using var request=new HttpRequestMessage(method,path);
+            request.Headers.Accept.ParseAdd("application/json");
+            if(bearer is not null)request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",bearer);
+            if(body is not null)
+            {
+                request.Content=new ByteArrayContent(body);
+                request.Content.Headers.ContentType=new MediaTypeHeaderValue("application/json"){CharSet="utf-8"};
+            }
+            using var response=await _client.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,timeout.Token).ConfigureAwait(false);
+            int status=(int)response.StatusCode;
+            byte[] bytes=await ReadLimitedAsync(response.Content,timeout.Token).ConfigureAwait(false);
+            TimeSpan? retryAfter=response.Headers.RetryAfter?.Delta;
+            JsonElement? json=null;
+            if(bytes.Length>0)
+            {
+                try{using var doc=JsonDocument.Parse(bytes,new JsonDocumentOptions{MaxDepth=32});json=doc.RootElement.Clone();}
+                catch(JsonException){json=null;}
+            }
+            SyncHttpFailure failure=status switch
+            {
+                >=200 and <300=>json is null?SyncHttpFailure.InvalidResponse:SyncHttpFailure.None,
+                401=>SyncHttpFailure.Unauthorized,403=>SyncHttpFailure.Forbidden,429=>SyncHttpFailure.RateLimited,
+                >=500=>SyncHttpFailure.ServerUnavailable,_=>SyncHttpFailure.Rejected
+            };
+            return new(status,failure,json,retryAfter);
+        }
+        catch(OperationCanceledException)
+        {return SyncHttpResponse.Failed(cancellation.IsCancellationRequested?SyncHttpFailure.Canceled:SyncHttpFailure.Timeout);}
+        catch(Exception error) when(error is HttpRequestException or IOException or SocketException)
+        {return SyncHttpResponse.Failed(SyncHttpFailure.NetworkUnavailable);}
+        catch(InvalidDataException)
+        {return SyncHttpResponse.Failed(SyncHttpFailure.InvalidResponse);}
+    }
+
+    private async Task<byte[]> ReadLimitedAsync(HttpContent content,CancellationToken cancellation)
+    {
+        using var stream=await content.ReadAsStreamAsync(cancellation).ConfigureAwait(false);
+        using var buffer=new MemoryStream();
+        var chunk=new byte[8192];
+        while(true)
+        {
+            int read=await stream.ReadAsync(chunk.AsMemory(),cancellation).ConfigureAwait(false);
+            if(read==0)break;
+            if(buffer.Length+read>_options.MaxResponseBytes)throw new InvalidDataException();
+            buffer.Write(chunk,0,read);
+        }
+        return buffer.ToArray();
+    }
+}

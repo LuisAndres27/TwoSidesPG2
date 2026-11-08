@@ -1,0 +1,25 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <GenerateGlobalUsings>false</GenerateGlobalUsings>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory).work/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(MSBuildThisFileDirectory).work/bin/$(MSBuildProjectName)/</BaseOutputPath>
+    <RestorePackagesPath>$(MSBuildThisFileDirectory).work/packages</RestorePackagesPath>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <NuGetAudit>false</NuGetAudit>
+    <UseSharedCompilation>false</UseSharedCompilation>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'ExportRelease' Or '$(Configuration)' == 'Release'">
+    <PathMap>$(MSBuildThisFileDirectory)..=/_/TwoSides</PathMap>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <DefineConstants>$(DefineConstants);TWOSIDES_DISTRIBUTION</DefineConstants>
+  </PropertyGroup>
+</Project>

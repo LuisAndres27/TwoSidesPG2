@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.IO;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class LocalBiomeCompletionChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static void Check(bool value,string label){if(!value)throw new Exception(label);_count++;Console.WriteLine("PASS "+label);}
+    private sealed class Store:ILocalMenuStore,ILocalCompletionStore,ILocalBiomeStore,IGameplayTelemetryStore
+    {
+        internal readonly RuntimeMenuChecks.Store Menu;
+        internal readonly RuntimeMenuChecks.Failure Failure=new();
+        internal readonly GameplayEventService Events;
+        internal int Calls;
+        internal bool LoseResponse,TelemetryFailure,ReadAfterCommitFailure,FailRefresh;
+        internal TaskCompletionSource<bool>? Gate;
+        internal Store(ISaveDatabase db){Menu=new(db,Failure);Events=new(db);}
+        public Task<LocalSaveResult<LocalProfile>> OpenAsync(string path)=>Menu.OpenAsync(path);
+        public Task<LocalSaveResult<LocalProfile>> GetLocalProfileAsync()=>Menu.GetLocalProfileAsync();
+        public Task<LocalSaveResult<LocalProfile>> CreateLocalProfileAsync(ProfileCreationRequest r)=>Menu.CreateLocalProfileAsync(r);
+        public Task<LocalSaveResult<bool>> HasUnfinishedGamesAsync(string owner)=>FailRefresh?Task.FromResult(new LocalSaveResult<bool>(false,"IO_ERROR")):Menu.HasUnfinishedGamesAsync(owner);
+        public Task<LocalSaveResult<GameAggregate>> GetActiveGameAsync(string owner)=>Menu.GetActiveGameAsync(owner);
+        public Task<LocalSaveResult<GameAggregate>> LoadGameAsync(string o,string g)=>Menu.LoadGameAsync(o,g);
+        public Task<LocalSaveResult<GameAggregate>> CreateNewGameAsync(NewGameCommand c)=>Menu.CreateNewGameAsync(c);
+        public Task<LocalSaveResult<IReadOnlyList<BiomeAccess>>> GetGameProgressAsync(string o,string g)=>Menu.GetGameProgressAsync(o,g);
+        public Task<LocalSaveResult<BiomeAccess>> GetBiomeAccessAsync(string o,string g,string b)=>Menu.GetBiomeAccessAsync(o,g,b);
+        public Task<LocalSaveResult<SaveReceipt>> EnterBiomeAsync(EnterBiomeCommand c)=>Menu.EnterBiomeAsync(c);
+        public async Task<LocalSaveResult<SaveReceipt>> CompleteBiomeAsync(CompleteBiomeCommand c)
+        {
+            Calls++;if(Gate is not null)await Gate.Task;
+            try
+            {
+                var receipt=Menu.Service.CompleteBiome(c);
+                if(ReadAfterCommitFailure)Menu.ReadFailure=true;
+                if(LoseResponse){LoseResponse=false;return new(false,"IO_ERROR");}
+                return new(true,"COMPLETED",receipt,receipt);
+            }
+            catch(SaveException e){return new(false,e.Code);}
+        }
+        public Task<LocalSaveResult<IReadOnlyList<GameplaySession>>> ReadSessionsAsync(string o)=>Task.FromResult(new LocalSaveResult<IReadOnlyList<GameplaySession>>(true,"SESSIONS",Events.GetSessions(o)));
+        public Task<LocalSaveResult<GameplayWriteReceipt>> WriteEventAsync(GameplayEvent e)
+        {try{return Task.FromResult(TelemetryFailure?new LocalSaveResult<GameplayWriteReceipt>(false,"IO_ERROR"):new(true,"EVENT",Events.RecordEvent(e)));}catch(SaveException x){return Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(false,x.Code));}}
+        public Task<LocalSaveResult<GameplayWriteReceipt>> WriteIntervalAsync(GameplayInterval i)
+        {try{return Task.FromResult(TelemetryFailure?new LocalSaveResult<GameplayWriteReceipt>(false,"IO_ERROR"):new(true,"INTERVAL",Events.RecordInterval(i)));}catch(SaveException x){return Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(false,x.Code));}}
+        public Task<LocalSaveResult<GameplayWriteReceipt>> InterruptAsync(string o,string s,string e,DateTimeOffset at)=>Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(true,"INTERRUPTED",Events.InterruptSession(o,s,e,at)));
+        public ValueTask DisposeAsync()=>ValueTask.CompletedTask;
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly Store Store;
+        internal readonly string Owner=Id(),Game=Id();
+        internal GameSaveService Save=>Store.Menu.Service;
+        internal F(bool decision=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);GameplayEventSchema.MigrateSynthetic(Db);Store=new(Db);
+            Save.CreateLocalProfile(Id(),Owner,"Finalización sintética");Save.CreateNewGame(new(Id(),Owner,Game));
+            if(decision)for(int i=0;i<5;i++)Decide(i);
+        }
+        internal void Decide(int i)
+        {
+            Save.EnterBiome(new(Id(),Owner,Game,Save.LoadGame(Owner,Game).Game.Revision,Biomes[i],"human"));
+            string env=i%2==0?"healthy":"degraded";
+            Save.RecordDecision(new(Id(),Id(),Owner,Game,Save.LoadGame(Owner,Game).Game.Revision,Biomes[i],Keys[i],i%2==0?"reject":"approve",env,"{\"stateKind\":\""+env+"\"}"));
+        }
+        internal LocalBiomeCompletion Intent(int i=0)=>new(Store,Owner,Game,Biomes[i]);
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    public static int Probe(string path,string owner,string game)
+    {
+        var save=new GameSaveService(new RuntimeMenuChecks.ReadOnlyFixture(path),RealGameCatalog.InitialState());
+        var g=save.LoadGame(owner,game);return g.Biomes.Count(b=>b.Status=="completed")==1 && g.Decisions.Count==5?0:81;
+    }
+    public static async Task<int> Run()
+    {
+        for(int i=0;i<5;i++)
+        {
+            using var f=new F();var before=f.Save.LoadGame(f.Owner,f.Game);var intent=f.Intent(i);var r=await intent.ConfirmAsync();
+            var after=f.Save.LoadGame(f.Owner,f.Game);
+            Check(r.Success && after.Biomes.Single(b=>b.BiomeId==Biomes[i]).Status=="completed","SQLite completion "+Biomes[i]);
+            Check(before.Decisions.SequenceEqual(after.Decisions)&&before.Environments.SequenceEqual(after.Environments),"decision and environment preserved "+Biomes[i]);
+            var access=f.Save.GetGameProgress(f.Owner,f.Game);
+            Check(!access.Single(b=>b.Progress.BiomeId==Biomes[i]).CanEnterAnimal && access.Count(b=>b.Availability=="available")==4,"completed blocked and four pending available "+Biomes[i]);
+        }
+        using(var f=new F())
+        {
+            var intent=f.Intent();var first=await intent.ConfirmAsync();var revision=f.Save.LoadGame(f.Owner,f.Game).Game.Revision;
+            var again=await intent.ConfirmAsync();
+            Check(first.Success&&again.Data==first.Data&&f.Store.Calls==1,"repeated physical intent retains receipt without second write");
+            var command=intent.Command!;var receipt=f.Save.CompleteBiome(command);
+            Check(receipt==intent.Receipt && f.Save.LoadGame(f.Owner,f.Game).Game.Revision==revision,"same operation replay returns original receipt");
+            try{f.Save.CompleteBiome(command with {ConfirmedResult="bad"});throw new Exception("conflict accepted");}catch(SaveException e){Check(e.Code=="OPERATION_CONFLICT","contradictory payload rejected");}
+            Check((await f.Intent().ConfirmAsync()).Code=="BIOME_COMPLETED","new physical intent cannot replay completed biome");
+            using var child=Process.Start(new ProcessStartInfo(Environment.ProcessPath!,"--completion-probe \""+f.Db.Path+"\" "+f.Owner+" "+f.Game){UseShellExecute=false,CreateNoWindow=true})!;
+            await child.WaitForExitAsync();Check(child.ExitCode==0,"separate process reads durable completed state");
+        }
+        using(var f=new F(false))
+        {
+            Check((await f.Intent().ConfirmAsync()).Code=="DECISION_REQUIRED"&&f.Store.Calls==0,"no decision or animal stage rejects before write");
+            Check((await new LocalBiomeCompletion(f.Store,f.Owner,f.Game,"unknown").ConfirmAsync()).Code=="UNKNOWN_BIOME","unknown biome rejected");
+            RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);
+            Check((await f.Intent().ConfirmAsync()).Code=="GAME_NOT_ACTIVE","no active game rejected without replacement");
+        }
+        using(var f=new F())
+        {
+            var intent=f.Intent();f.Store.Failure.Enabled=true;
+            var failed=await intent.ConfirmAsync();var command=intent.Command;
+            Check(!failed.Success && intent.Pending && f.Save.LoadGame(f.Owner,f.Game).Biomes.All(b=>b.Status!="completed"),"failure before commit leaves no completion");
+            f.Store.Failure.Enabled=false;var retry=await intent.ConfirmAsync();
+            Check(retry.Success&&intent.Command==command&&!intent.Pending,"retry preserves original command after rollback");
+        }
+        using(var f=new F())
+        {
+            f.Store.LoseResponse=true;var intent=f.Intent();var fail=await intent.ConfirmAsync();var cmd=intent.Command;
+            Check(!fail.Success&&f.Save.LoadGame(f.Owner,f.Game).Biomes.Single(b=>b.BiomeId=="ocean").Status=="completed","lost response does not undo commit");
+            Check((await intent.ConfirmAsync()).Success&&intent.Command==cmd&&f.Store.Calls==2,"uncertain commit resolved with identical operation");
+        }
+        using(var f=new F())
+        {
+            f.Store.Gate=new();var intent=f.Intent();var pending=intent.ConfirmAsync();
+            Check((await intent.ConfirmAsync()).Code=="PENDING_OPERATION"&&f.Store.Calls==1,"concurrent duplicate signal coalesces");
+            f.Store.Gate.SetResult(true);Check((await pending).Success,"original concurrent intent confirms once");
+        }
+        using(var f=new F())
+        {
+            await using var state=new LocalGameState(f.Store,"owned-fixture");await state.InitializeAsync();
+            f.Store.ReadAfterCommitFailure=true;var fail=await state.CompleteAnimalAsync("ocean");
+            Check(!fail.Success&&f.Store.Calls==1,"confirmed commit with failed authoritative read remains recoverable");
+            f.Store.Menu.ReadFailure=false;f.Store.ReadAfterCommitFailure=false;
+            Check((await state.CompleteAnimalAsync("ocean")).Success&&f.Store.Calls==1,"recovery after read failure reuses confirmed receipt");
+            bool paused=true;int navigation=0;var menu=new LocalMenuReturn();
+            Check(!await menu.ReturnToSelectionAsync(state,true,p=>paused=p,()=>{navigation++;return Task.FromResult(false);})&&paused,"failed navigation restores paused modal state");
+            Check(await menu.ReturnToSelectionAsync(state,true,p=>paused=p,()=>{navigation++;return Task.FromResult(true);})&&!paused&&navigation==2&&state.CanEnterSelection,"selection retry unpauses without domain replay");
+            Check(f.Store.Calls==1&&!state.CanStartNewGame,"navigation never creates game or second completion");
+        }
+        using(var f=new F())
+        {
+            await using var state=new LocalGameState(f.Store,"owned-fixture");await state.InitializeAsync();f.Store.FailRefresh=true;
+            Check(!(await state.CompleteAnimalAsync("ocean")).Success&&state.ActiveGame is not null,"menu refresh failure retains identity for recovery");
+            f.Store.FailRefresh=false;Check((await state.CompleteAnimalAsync("ocean")).Success&&f.Store.Calls==1,"refresh recovery preserves receipt");
+        }
+        using(var f=new F())
+        {
+            await using var state=new LocalGameState(f.Store,"owned-fixture");await state.InitializeAsync();
+            var order=new[]{3,0,4,1,2};int completed=0;
+            foreach(int i in order)
+            {
+                var r=await state.CompleteAnimalAsync(Biomes[i]);completed++;
+                Check(r.Success&&r.Data!.AllCompleted==(completed==5),"free order completion "+completed);
+            }
+            Check(state.ActiveGame!.Game.Status=="in_progress"&&state.ActiveGame.Game.Ending is null&&!state.CanStartNewGame&&f.Save.GetGameHistory(f.Owner).Count==1,"fifth keeps global final pending without successor or artificial ending");
+            Check(await state.PrepareSelectionAsync()&&state.Progress.All(b=>b.Availability!="available"),"five completed retain recoverable menu ticket and blocked cards");
+        }
+        foreach(bool failTelemetry in new[]{false,true})using(var f=new F())
+        {
+            long now=0;var observer=new LocalGameplayObserver(f.Store,()=>now,()=>DateTimeOffset.UnixEpoch.AddMilliseconds(now));
+            await observer.InitializeAsync(f.Owner);observer.AnimalStarted(f.Game,"ocean","physical");observer.Observe(true,false,false,true);await observer.DrainAsync();
+            now=100;observer.Loading();await observer.DrainAsync();
+            var result=await f.Intent().ConfirmAsync();f.Store.TelemetryFailure=failTelemetry;now=500;
+            observer.CompletionConfirmed(result.Data!.Receipt.OperationId,f.Game,"ocean");observer.CompletionConfirmed(result.Data.Receipt.OperationId,f.Game,"ocean");await observer.DrainAsync();
+            var records=f.Store.Events.GetEvents(f.Owner);var hits=records.Where(e=>e.Kind==GameplayEventKind.ANIMAL_SEGMENT_COMPLETED).ToArray();
+            Check(hits.Length==(failTelemetry?0:1),failTelemetry?"missing statistical completion detectable without false success":"statistical completion emitted once with receipt-derived ID");
+            Check(f.Save.LoadGame(f.Owner,f.Game).Biomes.Single(b=>b.BiomeId=="ocean").Status=="completed","telemetry failure cannot undo main progress "+failTelemetry);
+            Check(f.Store.Events.GetTotals(f.Owner,f.Game).EffectiveMs.Value==100,"confirmation wait excluded from effective time "+failTelemetry);
+            if(failTelemetry)
+            {
+                Check(observer.Incomplete&&observer.Pending>0,"telemetry diagnostic reports incomplete durable coverage");
+                f.Store.TelemetryFailure=false;await observer.DrainAsync();
+                Check(f.Store.Events.GetEvents(f.Owner).Count(e=>e.Kind==GameplayEventKind.ANIMAL_SEGMENT_COMPLETED)==1,"existing FIFO retries same event without duplicates");
+            }
+            else
+            {
+                var original=hits.Single();f.Store.Events.RecordEvent(original);
+                Check(original.EventId==result.Data.Receipt.OperationId&&f.Store.Events.GetEvents(f.Owner).Count(e=>e.Kind==GameplayEventKind.ANIMAL_SEGMENT_COMPLETED)==1,"event replay retains exact persisted payload");
+            }
+            observer.Leave();await observer.CloseAsync();
+            Check(f.Store.Events.GetEvents(f.Owner).Count(e=>e.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED)==1,"existing session and start statistics preserved");
+        }
+        Console.WriteLine(_count+" local completion checks passed; Godot physics/UI require manual validation.");return 0;
+    }
+}

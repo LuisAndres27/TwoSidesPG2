@@ -1,0 +1,29 @@
+using System;
+using System.Collections.Generic;
+
+namespace TwoSides.LocalPersistence;
+
+public enum SyncFactKind { GameReport, SessionReport, GameplayEvent, GameplayInterval }
+public enum OutboxDeliveryState { Pending, InFlight, Confirmed, RetryableFailure, PermanentFailure }
+public sealed record SyncBinding(string LocalPlayerId,string InstallationId,long BindingGeneration);
+public sealed record SyncFact(SyncFactKind Kind,string SourceId,long? Revision=null,string? Phase=null,string Origin="live_capture");
+public sealed record OutboxCapture(string OperationId,SyncBinding Binding,SyncFact Fact,IReadOnlyList<string>? Dependencies=null);
+public sealed record OutboxOperation(string OperationId,string LocalPlayerId,string InstallationId,long BindingGeneration,
+    string? GameId,string SourceId,string SourceKey,string Type,int ContractVersion,string CreatedAtUtc,string Origin,
+    string CanonicalEnvelope,string PayloadHash,OutboxDeliveryState State,long Attempts,long NextAttemptUnixMs,
+    string? LeaseId,long? LeaseUntilUnixMs,string? ReceiptJson,string? LastErrorCode);
+public sealed record SimulatedSyncReceipt(string OperationId,string LocalPlayerId,string InstallationId,long BindingGeneration,
+    string PayloadHash,string LeaseId,long Attempt,string ReceiptId,string CommittedAtUtc,string Status="committed");
+public sealed record OutboxEnqueueResult(OutboxOperation Operation,bool Inserted);
+
+public static class OutboxRetryPolicy
+{
+    // Equal jitter; minimum 500 ms, maximum 15 min. No automatic permanent rejection for network failure.
+    public static long DelayMilliseconds(long attempts,double sample)
+    {
+        SaveValidation.Require(attempts>=1 && double.IsFinite(sample) && sample>=0 && sample<1,"INVALID_RETRY");
+        double ceiling=Math.Min(900000,1000*Math.Pow(2,Math.Min(20,attempts-1)));
+        return (long)Math.Ceiling(ceiling*(0.5+sample*0.5));
+    }
+}
+

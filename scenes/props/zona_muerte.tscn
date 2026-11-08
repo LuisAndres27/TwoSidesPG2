@@ -1,0 +1,13 @@
+[gd_scene format=3 uid="uid://skt6cqph34e1"]
+
+[ext_resource type="Script" uid="uid://ba0jhqujfc3as" path="res://scripts/ZonaMuerte.cs" id="1_yora3"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_5fehe"]
+size = Vector2(4604, 20)
+
+[node name="ZonaMuerte" type="Area2D" unique_id=1638553872]
+script = ExtResource("1_yora3")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=204794756]
+position = Vector2(2292, 0)
+shape = SubResource("RectangleShape2D_5fehe")

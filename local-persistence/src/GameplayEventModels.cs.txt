@@ -1,0 +1,21 @@
+using System;
+using System.Collections.Generic;
+
+namespace TwoSides.LocalPersistence;
+
+public enum GameplayEventKind { SESSION_STARTED, SESSION_ENDED, ANIMAL_SEGMENT_STARTED, ANIMAL_DIED,
+    ANIMAL_RESTART_REQUESTED, ANIMAL_RETRY_REQUESTED, ANIMAL_SEGMENT_EXITED, ANIMAL_SEGMENT_COMPLETED }
+public enum GameplaySessionEnd { Normal, Interrupted }
+public enum GameplayDeathCause { Unknown, Damage, Fall }
+public enum GameplayTimeState { ActiveHuman, ActiveAnimal, Paused, Menu, GameOver, Loading, Background }
+public sealed record GameplayEvent(string EventId,string LocalPlayerId,string SessionId,GameplayEventKind Kind,
+    DateTimeOffset OccurredAtUtc,long OffsetMs,string? GameId=null,string? BiomeId=null,string? AnimalRunId=null,
+    GameplayDeathCause? DeathCause=null,GameplaySessionEnd? SessionEnd=null,int Version=1);
+public sealed record GameplayInterval(string IntervalId,string LocalPlayerId,string SessionId,
+    long StartMs,long EndMs,GameplayTimeState State,string? GameId=null,string? BiomeId=null,string? AnimalRunId=null,int Version=1);
+public sealed record GameplayWriteReceipt(string Id,bool Inserted);
+public sealed record GameplaySession(string SessionId,string LocalPlayerId,string StartedAtUtc,string Status,
+    string? EndedAtUtc,long? EndOffsetMs);
+public sealed record GameplayTotals(string Scope,string? GameId,StatisticCount Deaths,StatisticCount Restarts,
+    StatisticCount Retries,StatisticCount EffectiveMs,StatisticCount PausedMs,StatisticCount RecordedElapsedMs,
+    StatisticCount SessionDurationMs,bool Incomplete,bool HistoricalCoverageUnknown);

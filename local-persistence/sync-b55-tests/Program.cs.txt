@@ -1,0 +1,110 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+
+// B55 only: real HttpClient -> existing loopback Caddy -> Express offline-test.
+// No certificate validation callback, custom trust, real save, DPAPI secret or Atlas.
+internal static class Program
+{
+    static string Id()=>Guid.NewGuid().ToString("D");
+    static void Check(bool value,string label){if(!value)throw new InvalidOperationException(label);Console.WriteLine("PASS "+label);}
+    static string Project=>Path.GetFullPath(Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".."));
+    static string Proxy=>Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"TwoSidesLocalProxy");
+    static readonly CancellationToken Ct=new CancellationTokenSource(TimeSpan.FromSeconds(90)).Token;
+    static Process Start(string exe,string[] args,string cwd)
+    {
+        var info=new ProcessStartInfo(exe){WorkingDirectory=cwd,UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true};
+        info.Environment.Clear();string win=Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        info.Environment["SystemRoot"]=win;info.Environment["PATH"]=Path.Combine(win,"System32");info.Environment["NODE_ENV"]="test";
+        foreach(string arg in args)info.ArgumentList.Add(arg);
+        return Process.Start(info)??throw new InvalidOperationException("PROCESS_START_FAILED");
+    }
+    static bool Listening(int port){try{using var c=new TcpClient();return c.ConnectAsync(IPAddress.Loopback,port).Wait(100)&&c.Connected;}catch{return false;}}
+    public static async Task<int> Main(string[] args)
+    {
+        Process? express=null,caddy=null;bool clean=true;int result=1;
+        try
+        {
+            Check(args.Length==1 && (args[0]=="--expect-untrusted"||args[0]=="--trusted"),"explicit test mode");
+            bool trusted=args[0]=="--trusted";
+            Check(!Listening(3000)&&!Listening(8443),"test ports initially free");
+            string binary=Path.Combine(Proxy,"bin","caddy.exe");
+            Check(Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(binary)))=="5F93A9BD555F3AAC9D33AF2756BA14B3519D8CCA4FFD55256BDAEAB444C9DB2A","Caddy matches B46 hash");
+            using var leaf=new X509Certificate2(Path.Combine(Proxy,"tls","localhost.crt"));
+            using var ca=new X509Certificate2(Path.Combine(Proxy,"tls","ca.crt"));
+            Check(ca.Thumbprint=="F2BF0E8DC06AC9C4F12F27ECD6841438A5D412A7"&&leaf.Thumbprint=="EA1A91F7DFE59D757B60AD4970217A492ADE0B51","expected test certificates");
+            Check(DateTime.Now>leaf.NotBefore&&DateTime.Now<leaf.NotAfter&&DateTime.Now<ca.NotAfter,"certificates currently valid");
+            using(var chain=new X509Chain())
+            {
+                // No online CRL fetching. Normal OS trust, verification flags None. Leaf has no CRL/AIA, as recorded in B46.
+                chain.ChainPolicy.RevocationMode=X509RevocationMode.NoCheck;
+                chain.ChainPolicy.ExtraStore.Add(ca);
+                bool valid=chain.Build(leaf);
+                Check(valid==trusted,trusted?"OS chain trusted":"OS chain rejects uninstalled CA");
+                if(trusted)Check(chain.ChainElements[^1].Certificate.Thumbprint==ca.Thumbprint,"chain terminates at expected CA");
+            }
+            express=Start(@"C:\Program Files\nodejs\node.exe",new[]{"--import",new Uri(Path.Combine(Project,"local-persistence","sync-b55-tests","loopback-only.mjs")).AbsoluteUri,"scripts/run-offline-backend.js","--port","3000","--exit-on-stdin-close"},Path.Combine(Project,"backend"));
+            string? line=await express.StandardOutput.ReadLineAsync(Ct);
+            Check(line is not null && line.Contains("\"profile\":\"offline-test\"")&&line.Contains("127.0.0.1:3000"),"Express offline-test ready");
+            _=express.StandardOutput.ReadToEndAsync();_=express.StandardError.ReadToEndAsync();
+            caddy=Start(binary,new[]{"run","--config",Path.Combine(Proxy,"Caddyfile")},Proxy);
+            _=caddy.StandardOutput.ReadToEndAsync();_=caddy.StandardError.ReadToEndAsync();
+            for(int n=0;n<50&&!Listening(8443)&&!caddy.HasExited;n++)await Task.Delay(100,Ct);
+            Check(!caddy.HasExited&&Listening(8443),"Caddy loopback ready");
+            using var transport=new SyncHttpTransport(new SyncHttpOptions(new Uri("https://localhost:8443/")));
+            var health=await transport.SendAsync(HttpMethod.Get,"/api/health",null,null,Ct);
+            if(!trusted){Check(health.Status==0&&health.Failure==SyncHttpFailure.NetworkUnavailable,"real HttpClient refuses untrusted certificate");result=0;}
+            else
+            {
+                Check(health.Status==200,"real HttpClient HTTPS health / localhost certificate validation");
+                using var sandbox=new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot);
+                var db=sandbox.CreateDatabase();SchemaManager.Initialize(db);
+                string owner=Id(),game=Id();var binding=new SyncBinding(owner,Id(),1);
+                var save=new GameSaveService(db,RealGameCatalog.InitialState());
+                save.CreateLocalProfile(Id(),owner,"B55 synthetic");save.CreateNewGame(new(Id(),owner,game));
+                GameplayEventSchema.MigrateSynthetic(db);SyncOutboxSchema.MigrateSynthetic(db);
+                var queue=new SyncOutboxService(db);queue.RegisterInstallation(binding);
+                string opId=queue.Capture(new(Id(),binding,new SyncFact(SyncFactKind.GameReport,game,save.LoadGame(owner,game).Game.Revision))).Operation.OperationId;
+                var session=new SyncSessionManager(transport,binding,new InMemorySyncSecretStore());
+                Check((await session.ProbeAsync(Ct)).Ok&&session.HasSession,"synthetic registration and JWT session over HTTPS");
+                var dispatcher=new SyncOutboxDispatcher(queue,session,binding);
+                var pass=await dispatcher.RunPassAsync(Ct);
+                Check(pass.Confirmed==1&&queue.Get(owner,opId)!.State==OutboxDeliveryState.Confirmed,"synthetic SQLite batch confirmed over HTTPS");
+                var op=queue.Get(owner,opId)!;using var receipt=JsonDocument.Parse(op.ReceiptJson!);
+                string receiptId=receipt.RootElement.GetProperty("receiptId").GetString()!;
+                var replay=await session.SendAsync(HttpMethod.Post,"/api/v2/sync/batches",SyncHttpTransport.Json(new{schemaVersion=2,batchId=Id(),operations=new[]{new{operationId=opId,payloadHash=op.PayloadHash,leaseId=Id(),attempt=2,canonicalEnvelope=op.CanonicalEnvelope,dependencies=Array.Empty<string>()}}}),Ct);
+                var r=replay.Body!.Value.GetProperty("results")[0];
+                Check(replay.Status==200&&r.GetProperty("status").GetString()=="duplicate"&&r.GetProperty("receipt").GetProperty("receiptId").GetString()==receiptId,"idempotent resend / identical receipt");
+                var query=await session.SendAsync(HttpMethod.Post,"/api/v2/sync/receipts/query",SyncHttpTransport.Json(new{schemaVersion=2,attempts=new[]{new{operationId=opId,payloadHash=op.PayloadHash,leaseId=Id(),attempt=3}}}),Ct);
+                var qr=query.Body!.Value.GetProperty("results")[0];
+                Check(query.Status==200&&qr.GetProperty("status").GetString()=="found"&&qr.GetProperty("receipt").GetProperty("receiptId").GetString()==receiptId,"receipt lookup over HTTPS");
+                Check((await transport.SendAsync(HttpMethod.Get,"/api/v2/technical/me",null,"synthetic-invalid",Ct)).Status==401,"invalid token remains rejected");
+                Check((await session.SendAsync(HttpMethod.Post,"/api/v2/sync/batches",SyncHttpTransport.Json(new{invalid=true}),Ct)).Status==400,"malformed batch rejected");
+                Check((await transport.SendAsync(HttpMethod.Get,"/api/b55-missing",null,null,Ct)).Status==404,"missing API route rejected");
+                Check(queue.Get(owner,opId)!.ReceiptJson==op.ReceiptJson,"confirmed local receipt remains intact");
+                result=0;
+            }
+        }
+        catch(Exception error){Console.WriteLine("FAIL B55 "+error.GetType().Name);result=1;}
+        finally
+        {
+            if(express is not null){try{if(!express.HasExited){await express.StandardInput.WriteLineAsync("shutdown");express.StandardInput.Close();if(!express.WaitForExit(10000)){express.Kill(true);clean=false;}}Check(express.ExitCode==0,"Express orderly shutdown");}catch{clean=false;}express.Dispose();}
+            // Existing B46 config has admin off. Terminate only the process owned by THIS test; no global Stop-Process.
+            if(caddy is not null){try{if(!caddy.HasExited){caddy.Kill(true);caddy.WaitForExit(5000);}Console.WriteLine("CADDY_STOP=owned-process-termination (admin off)");}catch{clean=false;}caddy.Dispose();}
+            Check(!Listening(3000)&&!Listening(8443),"no test listeners remain");
+        }
+        Console.WriteLine("B55_RESULT="+(result==0&&clean?"PASS":"FAIL"));return clean?result:1;
+    }
+}

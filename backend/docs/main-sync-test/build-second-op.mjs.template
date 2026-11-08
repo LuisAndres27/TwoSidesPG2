@@ -1,0 +1,45 @@
+// build-second-op.mjs.template — OFFLINE builder of the SECOND synthetic operation, only for the OPTIONAL stage F of B39 (controlled loss of the response). B40.
+// STAGE F IS OUT OF SCOPE OF THE CURRENT CAMPAIGN: this builder only prepares files; it connects to nothing, reads no secret, sends nothing and the staged script cannot run stage F.
+// It reuses the installationId/localPlayerId of an existing run (the registration binds one installation) and creates NEW operationId/sessionId/leaseId/batchId, a new `session.report`
+// (phase "open", sourceKey session:<new sessionId>:open), validated with the REAL backend validator before anything is written (same logic as build-synthetic-run.mjs.template).
+// Copy it OUTSIDE the project (e.g. %LOCALAPPDATA%\TwoSidesSyntheticRun\build-second-op.mjs), then:
+//   node build-second-op.mjs <absolute backend folder> <absolute existing run folder> <absolute EMPTY output folder>
+// Output (no secrets): second-op.json (ids), batch.json, receipts-query.json. The operationId and the bytes of batch.json are then FIXED: any retry re-sends exactly these bytes.
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+
+const [backend, runDir, outDir] = process.argv.slice(2);
+const usage = () => { console.error('usage: node build-second-op.mjs <absolute backend dir> <absolute existing run dir> <absolute empty output dir>'); process.exit(1); };
+if (!backend || !runDir || !outDir || process.argv.length !== 5 || ![backend, runDir, outDir].every(p => path.isAbsolute(p))) usage();
+const project = path.resolve(backend, '..').toLowerCase() + path.sep;
+if (path.resolve(outDir).toLowerCase().startsWith(project) || /[\/]onedrive[^\/]*[\/]/i.test(path.resolve(outDir))) { console.error('refused: the output folder must be outside the project and OneDrive'); process.exit(1); }
+if (fs.existsSync(outDir) && fs.readdirSync(outDir).length) { console.error('refused: the output folder must be empty'); process.exit(1); }
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const first = JSON.parse(fs.readFileSync(path.join(runDir, 'run-ids.json'), 'utf8'));
+for (const k of ['runId', 'installationId', 'localPlayerId', 'sessionId', 'operationId']) if (!UUID.test(first[k] ?? '')) { console.error('refused: the existing run has no valid ' + k); process.exit(1); }
+const PRIOR = ['5e05a972-98ef-447a-9579-ba4d0e20a4b8', '44ccac91-ed97-4694-bddf-5a7b70ca1504', '64ad5b53-9df4-4040-b2d0-056eebde3467', '9905e32c-8029-444e-ab69-b198629f41bd', 'c85edd99-fe3f-43cf-9966-ca3443e83c91'];
+const load = rel => import(pathToFileURL(path.join(backend, rel)).href);
+const { validateOperation } = await load('src/modules/sync/schemas.js');
+const { canonical } = await load('src/modules/sync/canonical-envelope.js');
+
+const ids = { sessionId: randomUUID(), operationId: randomUUID(), leaseId: randomUUID(), batchId: randomUUID() };
+const taken = new Set([...Object.values(first).filter(v => typeof v === 'string'), ...PRIOR]);
+if (Object.values(ids).some(v => taken.has(v))) { console.error('refused: a generated id collides with a used one'); process.exit(1); }
+const now = new Date().toISOString();
+const envelope = {
+  schemaVersion: 1, type: 'session.report', installationId: first.installationId, localPlayerId: first.localPlayerId, bindingGeneration: 1, gameId: null,
+  sourceKey: `session:${ids.sessionId}:open`, createdAtUtc: now,
+  payload: { sessionId: ids.sessionId, phase: 'open', status: 'open', startedAtUtc: now, endedAtUtc: null, endOffsetMs: null, coverage: { origin: 'live_capture', historicalCoverageUnknown: true, incomplete: true } },
+};
+const canonicalEnvelope = canonical(envelope);
+const operation = { operationId: ids.operationId, payloadHash: createHash('sha256').update(canonicalEnvelope, 'utf8').digest('hex'), leaseId: ids.leaseId, attempt: 1, canonicalEnvelope, dependencies: [] };
+const checked = validateOperation(operation);                 // throws if the real backend would reject it
+if (checked.envelope.sourceKey !== envelope.sourceKey || checked.sourceId !== ids.sessionId) throw new Error('unexpected validation result');
+fs.mkdirSync(outDir, { recursive: true });
+const write = (name, value) => fs.writeFileSync(path.join(outDir, name), JSON.stringify(value), { flag: 'wx' });
+write('second-op.json', { note: 'Synthetic second operation (optional stage F, out of scope). No secrets.', basedOnRunId: first.runId, installationId: first.installationId, localPlayerId: first.localPlayerId, ...ids, sourceKey: envelope.sourceKey, factDigest: checked.factDigest, createdAtUtc: now });
+write('batch.json', { schemaVersion: 2, batchId: ids.batchId, operations: [operation] });
+write('receipts-query.json', { schemaVersion: 2, attempts: [{ operationId: operation.operationId, payloadHash: operation.payloadHash, leaseId: operation.leaseId, attempt: 1 }] });
+console.log(JSON.stringify({ built: true, validatedByBackendSchema: true, type: envelope.type, sourceKey: envelope.sourceKey, files: ['second-op.json', 'batch.json', 'receipts-query.json'] }));

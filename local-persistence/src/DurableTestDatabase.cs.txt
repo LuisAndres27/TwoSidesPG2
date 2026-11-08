@@ -1,0 +1,19 @@
+using System;
+
+namespace TwoSides.LocalPersistence;
+
+// Existing synthetic capability; its identity, destination and on-disk contract are unchanged.
+public sealed class DurableTestDatabase : ISaveDatabase, IDisposable
+{
+    public const string CopyId = OwnedCopyDatabase.CopyId;
+    public static string AuthorizedDirectory => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "TwoSides", "ReconstructionTests", "copy-" + CopyId, "persistence");
+    public static string AuthorizedPath => System.IO.Path.Combine(AuthorizedDirectory, "save.sqlite3");
+    private readonly OwnedCopyDatabase _store;
+    private DurableTestDatabase(OwnedCopyDatabase store) { _store = store; }
+    public string Path => _store.Path;
+    public static DurableTestDatabase OpenOrCreate(string absolutePath) => new(OwnedCopyDatabase.OpenOrCreate(absolutePath, false));
+    public Microsoft.Data.Sqlite.SqliteConnection Open() => _store.Open();
+    public void Dispose() => _store.Dispose();
+}

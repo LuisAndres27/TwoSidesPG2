@@ -1,0 +1,147 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using F=ReconciliationChecks.F;
+
+internal static class OutboxBoundedCloseChecks
+{
+    private static int _count;
+    private static readonly TimeSpan Budget=TimeSpan.FromSeconds(2);
+    private static readonly DateTimeOffset Time=DateTimeOffset.Parse("2026-10-28T00:00:00Z");
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok){if(!ok)throw new Exception("Bounded close assertion failed");}
+    private static async Task Case(string name,Func<F,Task> action)
+    {using var f=new F(events:true);await action(f);_count++;Console.WriteLine("PASS "+name);}
+    private static LocalOutboxScheduler Scheduler(F f)=>new((cursor,ct)=>{
+        ct.ThrowIfCancellationRequested();return Task.FromResult(new LocalOutboxPump(f.Db).Step(cursor,1));
+    },coalesce:TimeSpan.FromHours(1));
+    private static void Missing(F f)
+    {
+        f.Session=Id();f.Interval=Id();var e=new GameplayEventService(f.Db);
+        e.RecordEvent(new(Id(),f.Owner,f.Session,GameplayEventKind.SESSION_STARTED,Time,0));f.Pass();
+        e.RecordInterval(new(f.Interval,f.Owner,f.Session,0,3932,GameplayTimeState.Menu));
+        e.RecordEvent(new(Id(),f.Owner,f.Session,GameplayEventKind.SESSION_ENDED,Time.AddMilliseconds(3932),3932,SessionEnd:GameplaySessionEnd.Normal));
+    }
+    private static async Task Wait(Func<bool> condition)
+    {using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(5));while(!condition())await Task.Delay(5,timeout.Token);}
+    private static async Task<GamePersistenceAdapter> Adapter(F f)
+    {var a=GamePersistenceAdapter.CreateSyntheticOutboxAdapter(f.Db);Check((await a.OpenAsync("owned-outbox-fixture")).Success);return a;}
+    public static async Task<int> Run()
+    {
+        await Case("normal observer close commits terminal before adapter drain",async f=>{
+            await using var a=await Adapter(f);long now=0;var observer=new LocalGameplayObserver(a,()=>now,()=>Time.AddMilliseconds(now));
+            await observer.InitializeAsync(f.Owner);await observer.DrainAsync();now=3932;await observer.CloseAsync();
+            Check(observer.Pending==0 && new GameplayEventService(f.Db).GetSessions(f.Owner).Single().Status=="closed");
+            var result=await a.DrainOutboxAsync(Budget);Check(result.Completed && f.Operations().Count(o=>o.Type=="session.report")==2 && f.Operations().Count(o=>o.Type=="gameplay.interval")==1);
+        });
+        await Case("terminal drain recovers exactly two committed omissions",async f=>{Missing(f);await using var s=Scheduler(f);var r=await s.DrainAsync(Budget);Check(r.Completed && r.Inserted==2);});
+        await Case("coalescing is bypassed by terminal barrier",async f=>{Missing(f);await using var s=Scheduler(f);s.Request();Check((await s.DrainAsync(Budget)).Completed);});
+        await Case("menu milliseconds and category remain exact",async f=>{
+            Missing(f);await using var s=Scheduler(f);await s.DrainAsync(Budget);using var doc=JsonDocument.Parse(f.Operations().Single(o=>o.SourceId==f.Interval).CanonicalEnvelope);
+            var p=doc.RootElement.GetProperty("payload");Check(p.GetProperty("state").GetString()=="Menu" && p.GetProperty("endMs").GetInt64()-p.GetProperty("startMs").GetInt64()==3932);
+        });
+        await Case("menu drain preserves zero effective animal time",async f=>{
+            Missing(f);await using var s=Scheduler(f);await s.DrainAsync(Budget);Check(new GameplayEventService(f.Db).GetTotals(f.Owner).EffectiveMs.Value==0);
+        });
+        await Case("duplicate drain shares a single logical task and result",async f=>{
+            Missing(f);await using var s=Scheduler(f);var a=s.DrainAsync(Budget);var b=s.DrainAsync(Budget);Check(ReferenceEquals(a,b) && (await a)==await b && (await a).Inserted==2);
+        });
+        await Case("requests after drain cannot restart background capture",async f=>{
+            Missing(f);await using var s=Scheduler(f);await s.DrainAsync(Budget);var before=f.Operations();s.Request();await Task.Delay(15);Check(before.SequenceEqual(f.Operations()));
+        });
+        await Case("deadline returns deferred without awaiting an uncooperative page",async f=>{
+            var release=new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var s=new LocalOutboxScheduler(async (_,_)=>{await release.Task;return new("STORAGE_BUSY",false);});
+            var watch=Stopwatch.StartNew();try {var r=await s.DrainAsync(TimeSpan.FromMilliseconds(30));Check(!r.Completed && r.Code=="OUTBOX_CLOSE_DEFERRED" && watch.Elapsed<TimeSpan.FromSeconds(2));}
+            finally {release.TrySetResult(true);await s.DisposeAsync();}
+        });
+        await Case("timed-out page cannot publish a later successful drain",async f=>{
+            var release=new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);var pump=new LocalOutboxPump(f.Db);
+            var s=new LocalOutboxScheduler(async (cursor,_)=>{await release.Task;return pump.Step(cursor);});
+            var result=await s.DrainAsync(TimeSpan.FromMilliseconds(20));release.TrySetResult(true);await s.DisposeAsync();
+            Check(!result.Completed && s.Diagnostic.Code=="OUTBOX_CLOSE_DEFERRED");
+        });
+        await Case("capture exception produces safe diagnostic and later fresh recovery",async f=>{
+            Missing(f);await using(var s=new LocalOutboxScheduler((_,_)=>throw new IOException("private synthetic detail"))){var r=await s.DrainAsync(Budget);Check(!r.Completed && r.Code=="OUTBOX_DRAIN_FAILED");}
+            await using var retry=Scheduler(f);Check((await retry.DrainAsync(Budget)).Completed);
+        });
+        await Case("SQLite busy is diagnosed without changing source history",async f=>{
+            Missing(f);var before=f.DomainDigest();await using var s=Scheduler(f);
+            using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false)){var r=await s.DrainAsync(TimeSpan.FromMilliseconds(30));Check(!r.Completed);}
+            await s.DisposeAsync();Check(before==f.DomainDigest());await using var retry=Scheduler(f);Check((await retry.DrainAsync(Budget)).Completed);
+        });
+        await Case("drain waits for active capture before starting fresh pass",async f=>{
+            Missing(f);int active=0,peak=0;var entered=new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release=new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);int calls=0;
+            await using var s=new LocalOutboxScheduler(async (cursor,_)=>{
+                int n=Interlocked.Increment(ref active);peak=Math.Max(peak,n);
+                try {if(Interlocked.Increment(ref calls)==1){entered.TrySetResult(true);await release.Task;}return new LocalOutboxPump(f.Db).Step(cursor,1);}
+                finally {Interlocked.Decrement(ref active);}
+            },TimeSpan.Zero);
+            s.Request();await entered.Task.WaitAsync(Budget);var drain=s.DrainAsync(Budget);Check(!drain.IsCompleted);release.TrySetResult(true);
+            Check((await drain).Completed && peak==1 && f.Operations().Count(o=>o.SourceKey=="session:"+f.Session+":terminal")==1);
+        });
+        await Case("cancelled scheduler cannot falsely claim drained",async f=>{
+            Missing(f);var s=Scheduler(f);await s.DisposeAsync();var r=await s.DrainAsync(Budget);Check(!r.Completed && r.Code=="OUTBOX_CLOSED");
+            await using var retry=Scheduler(f);Check((await retry.DrainAsync(Budget)).Inserted==2);
+        });
+        await Case("initial adapter reconciliation recovers both omissions",async f=>{
+            Missing(f);int before=f.Operations().Length;await using var a=await Adapter(f);await Wait(()=>a.OutboxDiagnostic.Passes>0);
+            Check(f.Operations().Length==before+2 && a.OutboxDiagnostic.Code=="OUTBOX_LOCAL_READY");
+        });
+        await Case("repeat initial reconciliation preserves UUID hashes states and envelopes",async f=>{
+            Missing(f);await using(var a=await Adapter(f)){Check((await a.DrainOutboxAsync(Budget)).Completed);}var before=f.Operations();
+            await using(var a=await Adapter(f)){Check((await a.DrainOutboxAsync(Budget)).Completed);}Check(before.SequenceEqual(f.Operations()));
+        });
+        await Case("new process rechecks completed drain without duplicates",async f=>{
+            Missing(f);await using(var s=Scheduler(f)){Check((await s.DrainAsync(Budget)).Completed);}var before=f.Operations();
+            Check(await ReconciliationChecks.Child(f,"reconcile")==0 && before.SequenceEqual(f.Operations()));
+        });
+        await Case("crash before recovery commit preserves sources and subsequent drain succeeds",async f=>{
+            Missing(f);var before=f.DomainDigest();Check(await ReconciliationChecks.Child(f,"crash")==74 && before==f.DomainDigest());
+            await using var s=Scheduler(f);Check((await s.DrainAsync(Budget)).Inserted==2);
+        });
+        await Case("drain preserves completed final decisions and environmental states",async f=>{
+            f.Final(true);Missing(f);var before=f.DomainDigest();await using var s=Scheduler(f);Check((await s.DrainAsync(Budget)).Completed && before==f.DomainDigest() && f.Save.LoadGame(f.Owner,f.Game).Game.Status=="completed");
+        });
+        await Case("pause and menu do not increase previously measured effective time",async f=>{
+            f.Telemetry();await using var a=await Adapter(f);long now=0;var o=new LocalGameplayObserver(a,()=>now,()=>Time.AddMilliseconds(now));
+            await o.InitializeAsync(f.Owner);await o.DrainAsync();o.AnimalStarted(f.Game,"ocean","paused-fixture");o.Observe(true,true,false,true);
+            now=1000;o.Leave();now=4932;await o.CloseAsync();Check((await a.DrainOutboxAsync(Budget)).Completed);
+            var totals=new GameplayEventService(f.Db).GetTotals(f.Owner);Check(totals.EffectiveMs.Value==10 && totals.PausedMs.Value==1000);
+        });
+        await Case("barrier refuses subsequent source writes instead of creating untracked facts",async f=>{
+            await using var a=await Adapter(f);Check((await a.DrainOutboxAsync(Budget)).Completed);
+            var r=await a.WriteEventAsync(new(Id(),f.Owner,Id(),GameplayEventKind.SESSION_STARTED,Time,0));Check(!r.Success && r.Code=="STORAGE_CLOSED");
+        });
+        await Case("missing sync remains inactive without automatic migration",async f=>{
+            // Separate fresh capability: never drop tables or touch a protected database.
+            using var sandbox=new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot);var db=sandbox.CreateDatabase();SchemaManager.Initialize(db);
+            await using var a=GamePersistenceAdapter.CreateSyntheticOutboxAdapter(db);Check((await a.OpenAsync("owned-outbox-fixture")).Success);
+            var r=await a.DrainOutboxAsync(Budget);Check(!r.Completed && r.Code=="OUTBOX_NOT_ACTIVATED");
+        });
+        await Case("integrity failure remains distinct from secondary capture warning",async f=>{
+            f.Sql("PRAGMA user_version=99;");await using var s=Scheduler(f);var r=await s.DrainAsync(Budget);Check(!r.Completed && r.IntegrityFailure && r.Code=="UNSUPPORTED_SCHEMA");
+        });
+        await Case("open session cannot acquire fabricated terminal through drain",async f=>{
+            new GameplayEventService(f.Db).RecordEvent(new(Id(),f.Owner,Id(),GameplayEventKind.SESSION_STARTED,Time,0));
+            await using var s=Scheduler(f);Check((await s.DrainAsync(Budget)).Completed && !f.Operations().Any(o=>o.SourceKey.EndsWith(":terminal")));
+        });
+        await Case("source conflict prevents successful drain acknowledgement",async f=>{
+            f.Pass();f.Sql("UPDATE saved_games SET content_version='contradiction';");await using var s=Scheduler(f);var r=await s.DrainAsync(Budget);Check(!r.Completed && r.Code=="OUTBOX_REQUIRES_REVIEW");
+        });
+        await Case("drain retains pending states and never fabricates remote acknowledgement",async f=>{
+            Missing(f);await using var s=Scheduler(f);await s.DrainAsync(Budget);Check(f.Operations().All(o=>o.State==OutboxDeliveryState.Pending && o.Attempts==0 && o.ReceiptJson is null));
+        });
+        await Case("capture assembly has no HTTP Atlas Godot or JWT dependency",f=>{
+            Check(typeof(LocalOutboxScheduler).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "System.Net.Http" and not "GodotSharp" && !(a.Name??"").Contains("Mongo") && !(a.Name??"").Contains("Jwt")));return Task.CompletedTask;
+        });
+        Console.WriteLine(_count+" bounded close checks passed; synthetic only");return 0;
+    }
+}

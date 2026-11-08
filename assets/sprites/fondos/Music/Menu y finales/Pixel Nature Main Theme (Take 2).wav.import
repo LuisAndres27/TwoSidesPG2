@@ -1,0 +1,24 @@
+[remap]
+
+importer="wav"
+type="AudioStreamWAV"
+uid="uid://038lj14r1503"
+path="res://.godot/imported/Pixel Nature Main Theme (Take 2).wav-69499710273975e1138a88f2825aa93d.sample"
+
+[deps]
+
+source_file="res://assets/sprites/fondos/Music/Menu y finales/Pixel Nature Main Theme (Take 2).wav"
+dest_files=["res://.godot/imported/Pixel Nature Main Theme (Take 2).wav-69499710273975e1138a88f2825aa93d.sample"]
+
+[params]
+
+force/8_bit=false
+force/mono=false
+force/max_rate=false
+force/max_rate_hz=44100
+edit/trim=false
+edit/normalize=false
+edit/loop_mode=0
+edit/loop_begin=0
+edit/loop_end=-1
+compress/mode=2

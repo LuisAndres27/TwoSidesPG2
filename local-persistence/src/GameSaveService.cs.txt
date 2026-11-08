@@ -1,0 +1,375 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+
+namespace TwoSides.LocalPersistence;
+
+public sealed class GameSaveService
+{
+    public const string BoundarySnapshot = "{\"mode\":\"segment_boundary\"}";
+    private readonly UnitOfWork _work;
+    private readonly SaveCatalog _catalog;
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly HashSet<string> _settings;
+    private readonly IBiomeAvailabilityPolicy? _availability;
+    public GameSaveService(ISaveDatabase database, SaveCatalog catalog, Func<DateTimeOffset>? clock = null,
+        ITransactionalSaveExtension? extension = null, IEnumerable<string>? allowedSettings = null,
+        IBiomeAvailabilityPolicy? availability = null)
+    {
+        SchemaManager.Verify(database);
+        _catalog=catalog; _clock=clock??(()=>DateTimeOffset.UtcNow);
+        _work=new UnitOfWork(database,_clock,extension);
+        _settings=new HashSet<string>(allowedSettings??Array.Empty<string>(),StringComparer.Ordinal);
+        _availability=availability??new FreeBiomeAvailabilityPolicy();
+    }
+    private string Now() => SaveValidation.Timestamp(_clock());
+    private static LocalProfile Owned(SQLiteRepository repository,string owner)
+    {
+        var profile=repository.Profile();
+        SaveValidation.Require(profile is not null && profile.LocalPlayerId==owner,"NOT_FOUND");
+        return profile!;
+    }
+    public LocalProfile? GetLocalProfile() => _work.Read(r=>{
+        var profile=r.Profile();
+        if(profile is not null)
+        {
+            SaveValidation.Id(profile.LocalPlayerId);
+            SaveValidation.Require(SaveValidation.Name(profile.DisplayName)==profile.DisplayName,"INVALID_SNAPSHOT");
+        }
+        return profile;
+    });
+    public SaveReceipt CreateLocalProfile(string operationId,string localPlayerId,string displayName)
+    {
+        var name=SaveValidation.Name(displayName);
+        return _work.Write(operationId,localPlayerId,"create_profile",new {localPlayerId,name},(r,record)=>{
+            SaveValidation.Require(r.Profile() is null,"PROFILE_ALREADY_EXISTS");
+            var now=Now(); r.InsertProfile(new LocalProfile(localPlayerId,name,0,"LOCAL_ONLY",now,now));
+            return record(null,0);
+        });
+    }
+    public SaveReceipt UpdateDisplayName(string operationId,string owner,long expectedRevision,string displayName)
+    {
+        var name=SaveValidation.Name(displayName);
+        return _work.Write(operationId,owner,"rename",new {owner,expectedRevision,name},(r,record)=>{
+            var p=Owned(r,owner); SaveValidation.Require(p.Revision==expectedRevision,"REVISION_CONFLICT");
+            if(p.DisplayName==name) return record(null,p.Revision);
+            SaveValidation.Require(expectedRevision<long.MaxValue);
+            var receipt=record(null,expectedRevision+1); r.Rename(owner,name,expectedRevision,Now()); return receipt;
+        });
+    }
+    // Archived is not completion. Only a terminal record with its confirmed ending metadata permits replacement.
+    // The actual final-shown/acknowledged transition remains a future, trusted game-flow operation.
+    private static bool HasUnfinished(SQLiteRepository r, string owner) => r.Number("""
+SELECT count(*) FROM saved_games WHERE local_player_id=$p AND NOT (
+ status='completed' AND ending IS NOT NULL AND ending IN ('good','medium','bad')
+ AND ending_rules_version IS NOT NULL AND (ending_rules_version=rules_version OR ending_rules_version=$final) AND completed_at IS NOT NULL);
+""", ("$p",owner),("$final",LocalFinalEvaluator.Version)) > 0;
+    public bool HasUnfinishedGames(string owner)
+    {
+        SaveValidation.Id(owner);
+        return _work.Read(r => { Owned(r,owner); return HasUnfinished(r,owner); });
+    }
+    public SaveReceipt CreateNewGame(NewGameCommand command)
+    {
+        SaveValidation.Id(command.GameId);
+        return _work.Write(command.OperationId,command.LocalPlayerId,"new_game",command,(r,record)=>{
+            Owned(r,command.LocalPlayerId);
+            SaveValidation.Require(!HasUnfinished(r,command.LocalPlayerId),"GAME_IN_PROGRESS");
+            var current=r.CurrentGame(command.LocalPlayerId);
+            SaveValidation.Require(current?.GameId==command.ExpectedCurrentGameId && current?.Revision==command.ExpectedCurrentRevision,"REVISION_CONFLICT");
+            var now=Now();
+
+            var game=new SavedGame(command.GameId,command.LocalPlayerId,true,"in_progress",0,1,_catalog.RulesVersion,_catalog.ContentVersion,null,"menu",null,now,now);
+            r.InsertGame(game); var receipt=record(game.GameId,0);
+            foreach(var biome in _catalog.Biomes)
+            {
+                r.PutBiome(new BiomeProgress(game.GameId,biome,"human_pending",null,0,null,null,now));
+                r.PutEnvironment(new EnvironmentalState(game.GameId,biome,null,null,1,"{}",now));
+            }
+            r.PutSnapshot(new ContinuationSnapshot(game.GameId,0,1,BoundarySnapshot,now));
+            Load(r,game.LocalPlayerId,game.GameId); return receipt;
+        });
+    }
+    public GameAggregate LoadGame(string owner,string game)
+    {
+        SaveValidation.Id(owner); SaveValidation.Id(game); return _work.Read(r=>Load(r,owner,game));
+    }
+    public GameAggregate? GetActiveGame(string owner)
+    {
+        SaveValidation.Id(owner);
+        return _work.Read(r=>{
+            Owned(r,owner);
+            var current=r.CurrentGame(owner);
+            return current is null ? null : Load(r,owner,current.GameId);
+        });
+    }
+    // Includes current and archived games; each result is validated in the same read transaction.
+    public IReadOnlyList<SavedGame> GetGameHistory(string owner, int offset=0, int limit=50)
+    {
+        SaveValidation.Id(owner); SaveValidation.Require(offset>=0 && limit is >=1 and <=100);
+        return _work.Read(r=>{
+            Owned(r,owner);
+            return (IReadOnlyList<SavedGame>)r.Games(owner,offset,limit)
+                .Select(g=>Load(r,owner,g.GameId).Game).ToArray();
+        });
+    }
+    private GameAggregate Load(SQLiteRepository r,string owner,string game)
+    {
+        Owned(r,owner); var g=r.Game(owner,game)??throw new SaveException("NOT_FOUND");
+        SaveValidation.Require(g.RulesVersion==_catalog.RulesVersion && g.ContentVersion==_catalog.ContentVersion,"UNKNOWN_CONTENT");
+        SaveValidation.Require(g.SaveFormatVersion==1,"UNSUPPORTED_SCHEMA");
+        var snapshot=r.Snapshot(game)??throw new SaveException("INVALID_SNAPSHOT");
+        SaveValidation.Require(snapshot.CapturedRevision==g.Revision && snapshot.PayloadVersion==1,"INVALID_SNAPSHOT");
+        var biomes=r.Biomes(game); var environments=r.Environments(game);
+        SaveValidation.Require(biomes.Select(b=>b.BiomeId).SequenceEqual(_catalog.Biomes) && environments.Select(e=>e.BiomeId).SequenceEqual(_catalog.Biomes),"INVALID_SNAPSHOT");
+        SaveValidation.Require(r.Number("SELECT count(*) FROM environmental_decisions WHERE game_id=$g;",("$g",game))<=10000,"INVALID_SNAPSHOT");
+        var decisions=r.Decisions(game,limit:10000);
+        SaveValidation.Require(decisions.GroupBy(d=>(d.BiomeId,d.DecisionKey)).All(group=>group.Count()==1),"INVALID_SNAPSHOT");
+        foreach(var b in biomes)
+        {
+            var e=environments.Single(x=>x.BiomeId==b.BiomeId);
+            SaveValidation.Require(e.PayloadVersion==1 && SaveValidation.JsonObject(e.ExtensionsJson,16384)=="{}","UNSUPPORTED_SCHEMA");
+            var last=decisions.LastOrDefault(d=>d.BiomeId==b.BiomeId);
+            if(b.Status=="human_pending") SaveValidation.Require(last is null && e.StateKind is null && e.LastDecisionId is null,"INVALID_SNAPSHOT");
+            else
+            {
+                SaveValidation.Require(last is not null && e.LastDecisionId==last.DecisionId && e.StateKind is "healthy" or "degraded","INVALID_SNAPSHOT");
+                if(b.Status=="completed") SaveValidation.Require(b.Result==(e.StateKind=="healthy"?"good":"bad"),"INVALID_SNAPSHOT");
+            }
+        }
+        foreach(var d in decisions)
+        {
+            _catalog.Decision(d.BiomeId,d.DecisionKey,d.OptionId);
+            SaveValidation.Require(d.RulesVersion==g.RulesVersion,"UNKNOWN_CONTENT");
+            var state=SaveValidation.DecisionState(d.ConsequencesJson,d.ConsequencesVersion);
+            var latest=environments.Single(x=>x.BiomeId==d.BiomeId);
+            if(latest.LastDecisionId==d.DecisionId) SaveValidation.Require(latest.StateKind==state,"INVALID_SNAPSHOT");
+        }
+        _catalog.Resume(g.CurrentBiomeId,g.ResumeKind,g.CheckpointKey,snapshot.SnapshotJson);
+        if(g.CurrentBiomeId is not null)
+        {
+            var b=biomes.Single(x=>x.BiomeId==g.CurrentBiomeId);
+            if(g.ResumeKind=="human_decision") SaveValidation.Require(b.Status=="human_pending","INVALID_SNAPSHOT");
+            if(g.ResumeKind is "animal_start" or "decision_info") SaveValidation.Require(b.Status=="animal_pending","INVALID_SNAPSHOT");
+        }
+        var aggregate=new GameAggregate(g,biomes,environments,decisions,snapshot,r.Objectives(game));
+        if(g.ResumeKind=="ending")SaveValidation.Require(g.Status is "final_pending" or "completed","INVALID_SNAPSHOT");
+        if(g.EndingRulesVersion==LocalFinalEvaluator.Version)
+        {
+            SaveValidation.Require(g.Status is "final_pending" or "completed" && g.ResumeKind=="ending" && g.CompletedAt is not null,"INVALID_SNAPSHOT");
+            SaveValidation.Require(LocalFinalEvaluator.Evaluate(aggregate).Ending==g.Ending,"FINAL_RESULT_CONFLICT");
+        }
+        return aggregate;
+    }
+    private GameAggregate Expected(SQLiteRepository r,string owner,string game,long revision)
+    {
+        var aggregate=Load(r,owner,game);
+        SaveValidation.Require(aggregate.Game.Revision==revision && aggregate.Game.IsCurrent && aggregate.Game.Status=="in_progress","REVISION_CONFLICT");
+        SaveValidation.Require(revision>=0 && revision<long.MaxValue); return aggregate;
+    }
+    private static BiomeProgress NotCompleted(GameAggregate game,string biome)
+    {
+        var progress=game.Biomes.Single(b=>b.BiomeId==biome);
+        SaveValidation.Require(progress.Status!="completed","BIOME_COMPLETED");return progress;
+    }
+    private BiomeAccess Access(GameAggregate game,string biome)
+    {
+        var progress=game.Biomes.Single(b=>b.BiomeId==biome);
+        var activity=progress.Status=="completed"?"completed":progress.Status=="animal_pending"
+            ||(game.Game.CurrentBiomeId==biome&&game.Game.ResumeKind=="human_decision")?"in_progress":"pending";
+        if(progress.Status=="completed") return new(progress,"unavailable",false,false,false,"BIOME_COMPLETED",activity);
+        if(!game.Game.IsCurrent || game.Game.Status!="in_progress")return new(progress,"unavailable",false,false,false,"GAME_NOT_ACTIVE",activity);
+        var available=_availability?.Evaluate(game,biome)??BiomeAvailability.Unknown;
+        SaveValidation.Require(Enum.IsDefined(available));
+        bool granted=available==BiomeAvailability.Available;
+        return new(progress,available switch {BiomeAvailability.Available=>"available",BiomeAvailability.Unavailable=>"unavailable",_=>"unknown"},
+            granted&&progress.Status=="human_pending",granted&&progress.Status=="animal_pending",granted,
+            available switch {BiomeAvailability.Available=>"AVAILABLE",BiomeAvailability.Unavailable=>"BIOME_UNAVAILABLE",_=>"AVAILABILITY_UNDEFINED"},activity);
+    }
+    public IReadOnlyList<BiomeAccess> GetGameProgress(string owner,string game)
+    {
+        SaveValidation.Id(owner);SaveValidation.Id(game);
+        return _work.Read(r=>{var state=Load(r,owner,game);return (IReadOnlyList<BiomeAccess>)state.Biomes.Select(b=>Access(state,b.BiomeId)).ToArray();});
+    }
+    public BiomeAccess GetBiomeAccess(string owner,string game,string biome)
+    { _catalog.Biome(biome);return GetGameProgress(owner,game).Single(b=>b.Progress.BiomeId==biome); }
+    public IReadOnlyList<BiomeProgress> GetCompletedBiomes(string owner,string game)=>GetBiomeProgress(owner,game).Where(b=>b.Status=="completed").ToArray();
+    public bool AreAllCanonicalBiomesCompleted(string owner,string game)
+    {
+        var state=LoadGame(owner,game);
+        return FreeBiomeAvailabilityPolicy.CanonicalBiomes.All(id=>
+            state.Biomes.Count(b=>b.BiomeId==id&&b.Status=="completed")==1);
+    }
+    public SaveReceipt EnterBiome(EnterBiomeCommand command)
+    {
+        if(command is null)throw new SaveException("INVALID_DATA");
+        _catalog.Biome(command.BiomeId);SaveValidation.Require(command.Perspective is "human" or "animal");
+        return _work.Write(command.OperationId,command.LocalPlayerId,"enter_biome",command,(r,record)=>{
+            var old=Expected(r,command.LocalPlayerId,command.GameId,command.ExpectedRevision);
+            _=NotCompleted(old,command.BiomeId);var access=Access(old,command.BiomeId);
+            SaveValidation.Require(access.Availability=="available",access.Reason);
+            SaveValidation.Require(command.Perspective=="human"?access.CanEnterHuman:access.CanEnterAnimal,"INVALID_STAGE");
+            var receipt=record(command.GameId,old.Game.Revision+1);
+            Advance(r,old,command.BiomeId,command.Perspective=="human"?"human_decision":"animal_start",
+                command.Perspective=="human"?null:"segment-start",BoundarySnapshot);return receipt;
+        });
+    }
+    public SaveReceipt CompleteBiome(CompleteBiomeCommand command)
+    {
+        if(command is null)throw new SaveException("INVALID_DATA");
+        _catalog.Biome(command.BiomeId);SaveValidation.Require(command.ConfirmedResult is "good" or "bad");
+        return _work.Write(command.OperationId,command.LocalPlayerId,"complete_biome",command,(r,record)=>{
+            var old=Expected(r,command.LocalPlayerId,command.GameId,command.ExpectedRevision);
+            var biome=NotCompleted(old,command.BiomeId);
+            SaveValidation.Require(biome.Status=="animal_pending","INVALID_STAGE");
+            var environment=old.Environments.Single(e=>e.BiomeId==command.BiomeId);
+            SaveValidation.Require(command.ConfirmedResult==(environment.StateKind=="healthy"?"good":"bad"),"INVALID_DATA");
+            var now=Now();var receipt=record(command.GameId,old.Game.Revision+1);
+            r.PutBiome(biome with {Status="completed",Result=command.ConfirmedResult,AnimalCompletedAt=now,UpdatedAt=now});
+            Advance(r,old,null,"menu",null,BoundarySnapshot);return receipt;
+        });
+    }
+    public SaveReceipt PrepareFinal(PrepareFinalCommand command)
+    {
+        if(command is null)throw new SaveException("INVALID_DATA");
+        return _work.Write(command.OperationId,command.LocalPlayerId,"prepare_final",command,(r,record)=>{
+            var old=Load(r,command.LocalPlayerId,command.GameId);
+            foreach(var decision in old.Decisions)
+            {
+                var decisionReceipt=r.Receipt(decision.OperationId);
+                SaveValidation.Require(decisionReceipt is not null && decisionReceipt.LocalPlayerId==command.LocalPlayerId &&
+                    decisionReceipt.GameId==command.GameId && decisionReceipt.OperationKind=="decision","FINAL_INPUT_INVALID");
+            }
+            var result=LocalFinalEvaluator.Evaluate(old);
+            if(old.Game.Status is "final_pending" or "completed")
+            {
+                SaveValidation.Require(old.Game.Ending==result.Ending && old.Game.EndingRulesVersion==result.RulesVersion,"FINAL_RESULT_CONFLICT");
+                return record(command.GameId,old.Game.Revision);
+            }
+            SaveValidation.Require(old.Game.IsCurrent && old.Game.Status=="in_progress" && old.Game.Revision==command.ExpectedRevision,"REVISION_CONFLICT");
+            var now=Now();var g=old.Game with {Status="final_pending",Revision=checked(old.Game.Revision+1),CurrentBiomeId=null,
+                ResumeKind="ending",CheckpointKey=null,Ending=result.Ending,EndingRulesVersion=result.RulesVersion,CompletedAt=now,SavedAt=now};
+            var receipt=record(g.GameId,g.Revision);r.PrepareFinal(g,old.Game.Revision);
+            r.PutSnapshot(old.Snapshot with {CapturedRevision=g.Revision,CapturedAt=now});Load(r,g.LocalPlayerId,g.GameId);return receipt;
+        });
+    }
+    public SaveReceipt CloseGame(CloseGameCommand command)
+    {
+        if(command is null)throw new SaveException("INVALID_DATA");
+        return _work.Write(command.OperationId,command.LocalPlayerId,"close_game",command,(r,record)=>{
+            var old=Load(r,command.LocalPlayerId,command.GameId);var g=old.Game;
+            SaveValidation.Require(g.EndingRulesVersion==LocalFinalEvaluator.Version && g.Ending==command.ConfirmedEnding &&
+                g.Ending==LocalFinalEvaluator.Evaluate(old).Ending,"FINAL_RESULT_CONFLICT");
+            if(g.Status=="completed" && !g.IsCurrent)return record(g.GameId,g.Revision);
+            SaveValidation.Require(g.IsCurrent && g.Status=="final_pending" && g.Revision==command.ExpectedRevision,"REVISION_CONFLICT");
+            var now=Now();var closed=g with {IsCurrent=false,Status="completed",Revision=checked(g.Revision+1),SavedAt=now,ArchivedAt=now};
+            var receipt=record(g.GameId,closed.Revision);r.UpdateGame(closed,g.Revision);
+            r.PutSnapshot(old.Snapshot with {CapturedRevision=closed.Revision,CapturedAt=now});Load(r,g.LocalPlayerId,g.GameId);return receipt;
+        });
+    }
+    private void Advance(SQLiteRepository r,GameAggregate old,string? biome,string resume,string? checkpoint,string snapshot)
+    {
+        _catalog.Resume(biome,resume,checkpoint,snapshot);
+        var now=Now(); var g=old.Game with {Revision=old.Game.Revision+1,CurrentBiomeId=biome,ResumeKind=resume,CheckpointKey=checkpoint,SavedAt=now};
+        r.UpdateGame(g,old.Game.Revision);
+        r.PutSnapshot(new ContinuationSnapshot(g.GameId,g.Revision,1,SaveValidation.JsonObject(snapshot,65536),now));
+        Load(r,g.LocalPlayerId,g.GameId);
+    }
+    public SaveReceipt SaveCurrentGame(SaveGameCommand command)
+    {
+        SaveValidation.Require(command.ResumeKind!="ending","UNSUPPORTED_CHECKPOINT");
+        _catalog.Resume(command.BiomeId,command.ResumeKind,command.CheckpointKey,command.SnapshotJson);
+        var canonical=command with {SnapshotJson=SaveValidation.JsonObject(command.SnapshotJson,65536)};
+        return _work.Write(command.OperationId,command.LocalPlayerId,"save_game",canonical,(r,record)=>{
+            var old=Expected(r,command.LocalPlayerId,command.GameId,command.ExpectedRevision);
+            if(command.BiomeId is not null)_=NotCompleted(old,command.BiomeId);
+            var receipt=record(command.GameId,old.Game.Revision+1);
+            Advance(r,old,command.BiomeId,command.ResumeKind,command.CheckpointKey,canonical.SnapshotJson); return receipt;
+        });
+    }
+    public SaveReceipt RecordDecision(RecordDecisionCommand command)
+    {
+        if(command is null)throw new SaveException("INVALID_DATA");
+        SaveValidation.Id(command.DecisionId); _catalog.Decision(command.BiomeId,command.DecisionKey,command.OptionId);
+        SaveValidation.Require(command.ResolvedEnvironment is "healthy" or "degraded");
+        var consequence=SaveValidation.JsonObject(command.ConsequencesJson,16384);
+        SaveValidation.Require(consequence==JsonSerializer.Serialize(new {stateKind=command.ResolvedEnvironment}));
+        int consequenceVersion=1;
+        if(command.Classification is not null)
+        {
+            SaveValidation.Classification(command.Classification);
+            consequence=SaveValidation.JsonObject(JsonSerializer.Serialize(new {stateKind=command.ResolvedEnvironment,
+                classification=new {kind=command.Classification.Kind,version=command.Classification.Version}}),16384);
+            consequenceVersion=2;
+        }
+        var canonical=command with {ConsequencesJson=consequence};
+        // Keep the pre-classification v1 digest shape, so old committed receipts remain retryable.
+        object payload=canonical.Classification is null ? new {canonical.OperationId,canonical.DecisionId,
+            canonical.LocalPlayerId,canonical.GameId,canonical.ExpectedRevision,canonical.BiomeId,canonical.DecisionKey,
+            canonical.OptionId,canonical.ResolvedEnvironment,canonical.ConsequencesJson} : (object)canonical;
+        return _work.Write(command.OperationId,command.LocalPlayerId,"decision",payload,(r,record)=>{
+            var old=Expected(r,command.LocalPlayerId,command.GameId,command.ExpectedRevision);
+            var biome=NotCompleted(old,command.BiomeId);
+            SaveValidation.Require(!r.HasDecision(command.GameId,command.BiomeId,command.DecisionKey),"DECISION_CONFLICT");
+            SaveValidation.Require(biome.Status=="human_pending","INVALID_DATA");
+            var now=Now(); var receipt=record(command.GameId,old.Game.Revision+1);
+            var order=r.Number("SELECT coalesce(max(decision_order),0)+1 FROM environmental_decisions WHERE game_id=$g;",("$g",command.GameId));
+            r.InsertDecision(new EnvironmentalDecision(command.DecisionId,command.GameId,command.BiomeId,command.DecisionKey,command.OptionId,order,consequence,consequenceVersion,_catalog.RulesVersion,command.OperationId,now));
+            r.PutEnvironment(new EnvironmentalState(command.GameId,command.BiomeId,command.ResolvedEnvironment,command.DecisionId,1,"{}",now));
+            r.PutBiome(biome with {Status="animal_pending",HumanCompletedAt=now,UpdatedAt=now});
+            Advance(r,old,command.BiomeId,"decision_info",null,BoundarySnapshot); return receipt;
+        });
+    }
+    public IReadOnlyList<EnvironmentalDecision> GetDecisions(string owner,string game,string? biome=null,long after=0,int limit=100)
+    {
+        SaveValidation.Require(after>=0 && limit is >=1 and <=100); if(biome is not null) _catalog.Biome(biome);
+        return _work.Read(r=>{ Load(r,owner,game); return r.Decisions(game,biome,after,limit); });
+    }
+    public IReadOnlyList<BiomeProgress> GetBiomeProgress(string owner,string game) => LoadGame(owner,game).Biomes;
+    public EnvironmentalState GetEnvironment(string owner,string game,string biome)
+    { _catalog.Biome(biome); return LoadGame(owner,game).Environments.Single(e=>e.BiomeId==biome); }
+    public SaveReceipt UpdateEnvironment(string operation,string owner,string game,long expected,EnvironmentalState state)
+    {
+        _catalog.Biome(state.BiomeId); SaveValidation.Require(state.GameId==game && state.PayloadVersion==1 && SaveValidation.JsonObject(state.ExtensionsJson,16384)=="{}");
+        return _work.Write(operation,owner,"environment",new {game,expected,state.BiomeId,state.StateKind,state.LastDecisionId,state.PayloadVersion,ExtensionsJson="{}"},(r,record)=>{
+            var old=Expected(r,owner,game,expected); var current=old.Environments.Single(x=>x.BiomeId==state.BiomeId);
+            _=NotCompleted(old,state.BiomeId);
+            SaveValidation.Require(current.StateKind==state.StateKind && current.LastDecisionId==state.LastDecisionId);
+            var receipt=record(game,expected+1); r.PutEnvironment(state with {UpdatedAt=Now(),ExtensionsJson="{}"});
+            Advance(r,old,old.Game.CurrentBiomeId,old.Game.ResumeKind,old.Game.CheckpointKey,old.Snapshot.SnapshotJson); return receipt;
+        });
+    }
+    public SaveReceipt UpdateBiomeProgress(string operation,string owner,string game,long expected,BiomeProgress biome)
+    {
+        _catalog.Biome(biome.BiomeId); SaveValidation.Require(biome.GameId==game && biome.AttemptNumber>=0);
+        return _work.Write(operation,owner,"biome_progress",new {game,expected,biome.BiomeId,biome.Status,biome.Result,biome.AttemptNumber,biome.HumanCompletedAt,biome.AnimalCompletedAt},(r,record)=>{
+            var old=Expected(r,owner,game,expected); _=NotCompleted(old,biome.BiomeId);var receipt=record(game,expected+1);
+            r.PutBiome(biome with {UpdatedAt=Now()});
+            // A completed biome resumes at menu; this stores an asserted outcome, not final/unlock rules.
+            Advance(r,old,null,"menu",null,BoundarySnapshot); return receipt;
+        });
+    }
+    public ResumePlan ContinueGame(string owner,string? game=null) => _work.Read(r=>{
+        Owned(r,owner); var id=game??r.CurrentGame(owner)?.GameId; SaveValidation.Require(id is not null,"NOT_FOUND");
+        var aggregate=Load(r,owner,id!); SaveValidation.Require(aggregate.Game.IsCurrent,"INVALID_DATA");
+        var g=aggregate.Game; return new ResumePlan(g.GameId,g.Revision,g.ResumeKind,g.CurrentBiomeId,g.CheckpointKey);
+    });
+    public SaveReceipt SetLocalSetting(string operation,string owner,long expected,string key,string valueJson)
+    {
+        SaveValidation.Require(_settings.Contains(key)); var canonical=SaveValidation.JsonObject(valueJson,4096);
+        using(var json=JsonDocument.Parse(canonical))
+        {
+            var hasValue=json.RootElement.TryGetProperty("value",out var value);
+            SaveValidation.Require(json.RootElement.EnumerateObject().Count()==1 && hasValue
+                && (value.ValueKind is JsonValueKind.True or JsonValueKind.False
+                    || value.ValueKind==JsonValueKind.Number && value.TryGetDouble(out var number) && double.IsFinite(number)));
+        }
+        return _work.Write(operation,owner,"setting",new {owner,expected,key,canonical},(r,record)=>{
+            var p=Owned(r,owner); SaveValidation.Require(p.Revision==expected,"REVISION_CONFLICT");
+            var receipt=record(null,expected+1); r.PutSetting(new LocalSetting(owner,key,canonical,1,Now()));
+            r.Rename(owner,p.DisplayName,expected,Now()); return receipt;
+        });
+    }
+    public LocalSetting? GetLocalSetting(string owner,string key) => _work.Read(r=>{ Owned(r,owner); return r.Setting(owner,key); });
+}

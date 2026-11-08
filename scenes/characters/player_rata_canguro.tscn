@@ -1,0 +1,146 @@
+[gd_scene format=3 uid="uid://yjhpmjoh2khv"]
+
+[ext_resource type="Script" uid="uid://dv2d385do1s3g" path="res://scripts/PlayerRataCanguro.cs" id="1_bjq04"]
+[ext_resource type="Texture2D" uid="uid://by1fkk48girgc" path="res://assets/sprites/characters/Rata Canguro/ANIMACION RATA CANGURO DAÑO.png" id="1_jhrcn"]
+[ext_resource type="Texture2D" uid="uid://dkr13c6gpbxnb" path="res://assets/sprites/characters/Rata Canguro/ANIMACION RATA CANGURO ESPERA.png" id="2_ovrfh"]
+[ext_resource type="Texture2D" uid="uid://ccq7ic1yj5uok" path="res://assets/sprites/characters/Rata Canguro/ANIMACION RATA CANGURO SALTO.png" id="3_wfvpy"]
+[ext_resource type="Script" uid="uid://e2hbk1y72d1r" path="res://scripts/globals/Hurtbox.cs" id="5_b6mnm"]
+[ext_resource type="Script" uid="uid://626atmjpyhm5" path="res://scripts/Estadisticas.cs" id="6_b6mnm"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_jx05s"]
+atlas = ExtResource("1_jhrcn")
+region = Rect2(0, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_bjq04"]
+atlas = ExtResource("2_ovrfh")
+region = Rect2(0, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_b6mnm"]
+atlas = ExtResource("2_ovrfh")
+region = Rect2(32, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_kwkb3"]
+atlas = ExtResource("2_ovrfh")
+region = Rect2(64, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_gy5ky"]
+atlas = ExtResource("2_ovrfh")
+region = Rect2(96, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_4ur5h"]
+atlas = ExtResource("3_wfvpy")
+region = Rect2(64, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_j05hf"]
+atlas = ExtResource("3_wfvpy")
+region = Rect2(96, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_kwodf"]
+atlas = ExtResource("3_wfvpy")
+region = Rect2(128, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_8rgx3"]
+atlas = ExtResource("3_wfvpy")
+region = Rect2(32, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_k4kjr"]
+atlas = ExtResource("3_wfvpy")
+region = Rect2(64, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_4p06e"]
+atlas = ExtResource("3_wfvpy")
+region = Rect2(96, 0, 32, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_tdbdy"]
+atlas = ExtResource("3_wfvpy")
+region = Rect2(128, 0, 32, 32)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_wbo4f"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_jx05s")
+}],
+"loop": true,
+"name": &"damage",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_bjq04")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_b6mnm")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_kwkb3")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_gy5ky")
+}],
+"loop": true,
+"name": &"idle",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_4ur5h")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_j05hf")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_kwodf")
+}],
+"loop": true,
+"name": &"jump",
+"speed": 6.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_8rgx3")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_k4kjr")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_4p06e")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_tdbdy")
+}],
+"loop": true,
+"name": &"run",
+"speed": 7.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_b6mnm"]
+size = Vector2(32, 34.75)
+
+[sub_resource type="CapsuleShape2D" id="CapsuleShape2D_kwkb3"]
+radius = 11.0
+height = 44.02115
+
+[node name="PlayerRataCanguro" type="CharacterBody2D" unique_id=828180516]
+script = ExtResource("1_bjq04")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=1579055800]
+sprite_frames = SubResource("SpriteFrames_wbo4f")
+animation = &"run"
+frame_progress = 0.90771365
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=1066331962]
+position = Vector2(4, -2.375)
+shape = SubResource("RectangleShape2D_b6mnm")
+
+[node name="Hurtbox" type="Area2D" parent="." unique_id=299071351]
+script = ExtResource("5_b6mnm")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Hurtbox" unique_id=666058032]
+position = Vector2(4, -2.0000005)
+rotation = 1.5830137
+shape = SubResource("CapsuleShape2D_kwkb3")
+debug_color = Color(0.9629198, 0, 0.504583, 0.41960785)
+
+[node name="Estadisticas" type="Node" parent="." unique_id=358966558]
+script = ExtResource("6_b6mnm")

@@ -1,0 +1,75 @@
+[gd_scene format=3 uid="uid://dwdkgymm5e1ut"]
+
+[ext_resource type="Script" uid="uid://ds4w2a0tvij3u" path="res://scripts/enemies/Loro.cs" id="1_2tpj5"]
+[ext_resource type="Texture2D" uid="uid://bhg56svkc3dd" path="res://assets/sprites/fondos/selva/LORO VOLANDO.png" id="2_bswqn"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_ga41q"]
+atlas = ExtResource("2_bswqn")
+region = Rect2(0, 0, 48, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_o3buh"]
+atlas = ExtResource("2_bswqn")
+region = Rect2(48, 0, 48, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_v08ln"]
+atlas = ExtResource("2_bswqn")
+region = Rect2(96, 0, 48, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_lqlk7"]
+atlas = ExtResource("2_bswqn")
+region = Rect2(144, 0, 48, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_hfv11"]
+atlas = ExtResource("2_bswqn")
+region = Rect2(192, 0, 48, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_e0mff"]
+atlas = ExtResource("2_bswqn")
+region = Rect2(240, 0, 48, 64)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_buta6"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_ga41q")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_o3buh")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_v08ln")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_lqlk7")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_hfv11")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_e0mff")
+}],
+"loop": true,
+"name": &"fly",
+"speed": 7.5
+}]
+
+[node name="VueloLoro" type="Node2D" unique_id=1137543267]
+
+[node name="PuntoA" type="Marker2D" parent="." unique_id=2066657449]
+position = Vector2(264, -31)
+
+[node name="PuntoB" type="Marker2D" parent="." unique_id=1774976385]
+position = Vector2(-261, -25)
+
+[node name="Loro" type="Node2D" parent="." unique_id=611335729 node_paths=PackedStringArray("PuntoA", "PuntoB")]
+position = Vector2(-53, -12)
+script = ExtResource("1_2tpj5")
+PuntoA = NodePath("../PuntoA")
+PuntoB = NodePath("../PuntoB")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="Loro" unique_id=95334411]
+position = Vector2(53, -21)
+sprite_frames = SubResource("SpriteFrames_buta6")
+animation = &"fly"
+autoplay = "fly"
+frame_progress = 0.15424371

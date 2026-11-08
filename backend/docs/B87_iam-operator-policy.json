@@ -1,0 +1,92 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyEverythingExceptOwnMfaSetupWhenNoMfa",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:ChangePassword",
+        "iam:CreateVirtualMFADevice",
+        "iam:EnableMFADevice",
+        "iam:GetUser",
+        "iam:ListMFADevices",
+        "iam:ListVirtualMFADevices",
+        "iam:ResyncMFADevice",
+        "sts:GetSessionToken"
+      ],
+      "Resource": "*",
+      "Condition": { "BoolIfExists": { "aws:MultiFactorAuthPresent": "false" } }
+    },
+    {
+      "Sid": "ReadOnlyForTheConsole",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*",
+        "ssm:DescribeInstanceInformation",
+        "ssm:GetConnectionStatus",
+        "iam:GetInstanceProfile",
+        "iam:ListInstanceProfiles",
+        "iam:ListRoles",
+        "iam:GetRole",
+        "cloudtrail:LookupEvents",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:ListMetrics",
+        "ce:GetCostAndUsage",
+        "budgets:ViewBudget",
+        "aws-portal:ViewBilling",
+        "cloudfront:ListDistributions",
+        "cloudfront:GetDistribution"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ManageTheMetabaseServerOnlyInUsEast1",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:RebootInstances",
+        "ec2:TerminateInstances",
+        "ec2:CreateTags",
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:AllocateAddress",
+        "ec2:AssociateAddress",
+        "ec2:DisassociateAddress",
+        "ec2:ReleaseAddress",
+        "ec2:CreateVolume",
+        "ec2:DeleteVolume",
+        "ec2:AttachVolume",
+        "ec2:DetachVolume",
+        "ec2:CreateSnapshot",
+        "ec2:DeleteSnapshot",
+        "ec2:ModifyInstanceMetadataOptions",
+        "ec2:AssociateIamInstanceProfile"
+      ],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "us-east-1" } }
+    },
+    {
+      "Sid": "PassOnlyTheSessionManagerRoleToEc2",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/twosides-metabase-ssm",
+      "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
+    },
+    {
+      "Sid": "SessionManagerToInstancesOfThisProject",
+      "Effect": "Allow",
+      "Action": ["ssm:StartSession", "ssm:TerminateSession", "ssm:ResumeSession"],
+      "Resource": [
+        "arn:aws:ec2:us-east-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ssm:us-east-1::document/SSM-SessionManagerRunShell",
+        "arn:aws:ssm:*:*:session/${aws:username}-*"
+      ]
+    }
+  ]
+}

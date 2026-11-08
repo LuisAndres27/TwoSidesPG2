@@ -1,0 +1,27 @@
+[gd_scene format=3 uid="uid://c1g0crppswl8j"]
+
+[ext_resource type="Script" uid="uid://ccqe0omeaa3t0" path="res://scripts/FuenteRecurso.cs" id="1_6jb7u"]
+[ext_resource type="PackedScene" uid="uid://7vs7nt8v581k" path="res://scenes/props/item_agua.tscn" id="2_xd0b5"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_t5hgx"]
+size = Vector2(60, 38)
+
+[node name="FuenteRecurso" type="Area2D" unique_id=753985797]
+collision_mask = 3
+script = ExtResource("1_6jb7u")
+EscenaRecurso = ExtResource("2_xd0b5")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=957770970]
+position = Vector2(16, -19)
+shape = SubResource("RectangleShape2D_t5hgx")
+
+[node name="PuntoDrop" type="Marker2D" parent="." unique_id=241476519]
+position = Vector2(16, -24)
+
+[node name="Indicador" type="Label" parent="." unique_id=266843178]
+offset_left = 6.0
+offset_top = -52.0
+offset_right = 46.0
+offset_bottom = -29.0
+text = "[E]"
+metadata/_edit_use_anchors_ = true

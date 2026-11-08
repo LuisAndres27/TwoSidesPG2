@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><AssemblyName>TwoSides.Production.Checks</AssemblyName>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier><SelfContained>true</SelfContained>
+    <RuntimeFrameworkVersion>8.0.30</RuntimeFrameworkVersion><TargetLatestRuntimePatch>false</TargetLatestRuntimePatch>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../src/TwoSides.LocalPersistence.csproj" />
+    <ProjectReference Include="../sync-http/TwoSides.SyncHttp.csproj" />
+    <Compile Include="*.cs.txt" />
+    <Compile Include="../../integration/sqlite/LocalGameState.cs" />
+    <Compile Include="../../integration/sqlite/LocalGameplayObserver.cs" />
+    <Compile Include="../../integration/sqlite/LocalStatisticsScreenState.cs" />
+    <Compile Include="../../integration/sqlite/GamePersistenceAdapter.cs" />
+    <Compile Include="../../integration/sqlite/RealGameCatalog.cs" />
+  </ItemGroup>
+</Project>

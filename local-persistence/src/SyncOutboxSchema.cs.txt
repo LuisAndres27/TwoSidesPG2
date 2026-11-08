@@ -1,0 +1,85 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+// Optional sync extension v1; never changes base user_version=2 or gameplay extension v1.
+public static class SyncOutboxSchema
+{
+    public const int Version=1;
+    private const string Sql="""
+CREATE TABLE sync_schema_migrations(version INTEGER PRIMARY KEY CHECK(version>0),migration_key TEXT NOT NULL UNIQUE,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
+CREATE TABLE sync_installations(
+ local_player_id TEXT NOT NULL REFERENCES local_profiles(local_player_id) ON DELETE RESTRICT,
+ installation_id TEXT NOT NULL,binding_generation INTEGER NOT NULL CHECK(binding_generation>0 AND binding_generation<=9007199254740991),
+ created_at_utc TEXT NOT NULL,PRIMARY KEY(local_player_id,installation_id,binding_generation));
+CREATE TABLE sync_outbox(
+ operation_id TEXT PRIMARY KEY NOT NULL,local_player_id TEXT NOT NULL,installation_id TEXT NOT NULL,binding_generation INTEGER NOT NULL,
+ game_id TEXT,source_id TEXT NOT NULL,source_key TEXT NOT NULL,type TEXT NOT NULL CHECK(type IN('game.report','session.report','gameplay.event','gameplay.interval')),
+ contract_version INTEGER NOT NULL CHECK(contract_version=1),created_at_utc TEXT NOT NULL,origin TEXT NOT NULL CHECK(origin IN('live_capture','historical_import')),
+ canonical_envelope TEXT NOT NULL CHECK(json_valid(canonical_envelope)),payload_hash TEXT NOT NULL CHECK(length(payload_hash)=64),
+ state TEXT NOT NULL CHECK(state IN('pending','in_flight','confirmed','retryable_failure','permanent_failure')),
+ attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0 AND attempts<=9007199254740991),next_attempt_ms INTEGER NOT NULL,
+ lease_id TEXT,lease_until_ms INTEGER,receipt_json TEXT CHECK(receipt_json IS NULL OR json_valid(receipt_json)),last_error_code TEXT,
+ UNIQUE(local_player_id,installation_id,binding_generation,source_key),
+ UNIQUE(operation_id,local_player_id,installation_id,binding_generation),
+ FOREIGN KEY(local_player_id,installation_id,binding_generation) REFERENCES sync_installations(local_player_id,installation_id,binding_generation) ON DELETE RESTRICT,
+ FOREIGN KEY(game_id,local_player_id) REFERENCES saved_games(game_id,local_player_id) ON DELETE RESTRICT,
+ CHECK((state='in_flight' AND lease_id IS NOT NULL AND lease_until_ms IS NOT NULL) OR (state!='in_flight' AND lease_id IS NULL AND lease_until_ms IS NULL)),
+ CHECK((state='confirmed' AND receipt_json IS NOT NULL) OR (state!='confirmed' AND receipt_json IS NULL)));
+CREATE INDEX ix_sync_due ON sync_outbox(local_player_id,installation_id,binding_generation,state,next_attempt_ms,operation_id);
+CREATE INDEX ix_sync_game ON sync_outbox(local_player_id,game_id,state);
+CREATE TABLE sync_dependencies(
+ operation_id TEXT NOT NULL,depends_on_id TEXT NOT NULL,local_player_id TEXT NOT NULL,installation_id TEXT NOT NULL,binding_generation INTEGER NOT NULL,
+ PRIMARY KEY(operation_id,depends_on_id),CHECK(operation_id!=depends_on_id),
+ FOREIGN KEY(operation_id,local_player_id,installation_id,binding_generation) REFERENCES sync_outbox(operation_id,local_player_id,installation_id,binding_generation) ON DELETE RESTRICT,
+ FOREIGN KEY(depends_on_id,local_player_id,installation_id,binding_generation) REFERENCES sync_outbox(operation_id,local_player_id,installation_id,binding_generation) ON DELETE RESTRICT);
+CREATE TRIGGER sync_outbox_immutable BEFORE UPDATE OF operation_id,local_player_id,installation_id,binding_generation,game_id,source_id,source_key,type,contract_version,created_at_utc,origin,canonical_envelope,payload_hash ON sync_outbox
+BEGIN SELECT RAISE(ABORT,'immutable_sync_fact'); END;
+CREATE TRIGGER sync_confirmed_immutable BEFORE UPDATE ON sync_outbox WHEN OLD.state='confirmed'
+BEGIN SELECT RAISE(ABORT,'immutable_sync_receipt'); END;
+""";
+    public static string Checksum=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Sql.ReplaceLineEndings("\n"))));
+    public static void MigrateSynthetic(SyntheticDatabase database,Action? beforeCommit=null)
+    {
+        SchemaManager.Verify(database);
+        try
+        {
+            using var c=database.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);
+            if(r.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'sync_*';")!=0){Verify(r);tx.Commit();return;}
+            r.Execute(Sql);
+            r.Execute("INSERT INTO sync_schema_migrations VALUES(1,'local-sync-outbox-v1',$h,$at);",("$h",Checksum),("$at",SaveValidation.Timestamp(DateTimeOffset.UtcNow)));
+            beforeCommit?.Invoke();tx.Commit();
+        }
+        catch(SqliteException e){throw StorageErrors.Map(e);}
+    }
+    public static void Verify(ISaveDatabase database)
+    {
+        SchemaManager.Verify(database);
+        try{using var c=database.Open();using var tx=c.BeginTransaction(deferred:true);Verify(new SQLiteRepository(c,tx));tx.Commit();}
+        catch(SqliteException e){throw StorageErrors.Map(e);}
+    }
+    internal static void Verify(SQLiteRepository r)
+    {
+        SaveValidation.Require(r.Number("PRAGMA user_version;")==2,"UNSUPPORTED_SCHEMA");
+        SaveValidation.Require(r.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('sync_schema_migrations','sync_installations','sync_outbox','sync_dependencies');")==4,"UNSUPPORTED_SYNC_SCHEMA");
+        SaveValidation.Require(r.Number("SELECT count(*) FROM sync_schema_migrations;")==1 &&
+            r.Number("SELECT count(*) FROM sync_schema_migrations WHERE version=1 AND migration_key='local-sync-outbox-v1' AND checksum=$h;",("$h",Checksum))==1,"UNSUPPORTED_SYNC_SCHEMA");
+        SaveValidation.Require(r.Number("SELECT count(*) FROM sqlite_master WHERE name IN('ix_sync_due','ix_sync_game','sync_outbox_immutable','sync_confirmed_immutable');")==4,"UNSUPPORTED_SYNC_SCHEMA");
+    }
+    // Reversible only on owned synthetic databases, before capturing anything. Never drop queued history.
+    public static void RollbackEmptySynthetic(SyntheticDatabase database)
+    {
+        try
+        {
+            using var c=database.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);Verify(r);
+            SaveValidation.Require(r.Number("SELECT count(*) FROM sync_outbox;")==0,"OUTBOX_NOT_EMPTY");
+            r.Execute("DROP TRIGGER sync_confirmed_immutable;DROP TRIGGER sync_outbox_immutable;DROP TABLE sync_dependencies;DROP TABLE sync_outbox;DROP TABLE sync_installations;DROP TABLE sync_schema_migrations;");
+            tx.Commit();
+        }
+        catch(SqliteException e){throw StorageErrors.Map(e);}
+    }
+}
+

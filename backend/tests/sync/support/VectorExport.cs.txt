@@ -1,0 +1,88 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class VectorExport
+{
+    private static int _id;
+    private static string Id()=>"10000000-0000-4000-8000-"+(++_id).ToString("x12");
+    public static int Main()
+    {
+        using var sandbox=new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot);
+        var db=sandbox.CreateDatabase();SchemaManager.Initialize(db);GameplayEventSchema.MigrateSynthetic(db);SyncOutboxSchema.MigrateSynthetic(db);
+        var time=DateTimeOffset.Parse("2026-10-28T00:00:00.123Z");
+        string owner=Id(),installation=Id();var binding=new SyncBinding(owner,installation,1);
+        var save=new GameSaveService(db,RealGameCatalog.InitialState(),()=>time);
+        save.CreateLocalProfile(Id(),owner,"Synthetic vector fixture");
+        void Capture(){SyncReconciliationCursor? cursor=null;do{var p=new SyntheticOutboxReconciler(db,()=>time).ReconcilePage(binding,100,cursor);if(!p.Consistent)throw new Exception("Vector source rejected");cursor=p.Next;}while(cursor is not null);}
+        var events=new GameplayEventService(db);
+        string menu=Id();events.RecordEvent(new(Id(),owner,menu,GameplayEventKind.SESSION_STARTED,time,0));Capture();
+        events.RecordInterval(new(Id(),owner,menu,0,3932,GameplayTimeState.Menu));
+        events.RecordEvent(new(Id(),owner,menu,GameplayEventKind.SESSION_ENDED,time.AddMilliseconds(3932),3932,SessionEnd:GameplaySessionEnd.Normal));Capture();
+        var biomes=new[]{"ocean","jungle","desert","forest","tundra"};
+        var keys=new[]{"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+        foreach(int rejectCount in new[]{3,5,0})
+        {
+            string game=Id();save.CreateNewGame(new(Id(),owner,game));Capture();
+            long Rev()=>save.LoadGame(owner,game).Game.Revision;
+            for(int i=0;i<5;i++)
+            {
+                string? completionSession=null,completionRun=null;
+                save.EnterBiome(new(Id(),owner,game,Rev(),biomes[i],"human"));
+                bool reject=i<rejectCount;
+                save.RecordDecision(new(Id(),Id(),owner,game,Rev(),biomes[i],keys[i],reject?"reject":"approve",reject?"healthy":"degraded",
+                    reject?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}",i==0?new("favorable","synthetic-classification-1"):null));Capture();
+                if(rejectCount==3 && i==0)
+                {
+                    string session=Id(),run=Id();events.RecordEvent(new(Id(),owner,session,GameplayEventKind.SESSION_STARTED,time,0));Capture();
+                    events.RecordEvent(new(run,owner,session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,time,0,game,biomes[i],run));Capture();
+                    events.RecordInterval(new(Id(),owner,session,0,10,GameplayTimeState.ActiveAnimal,game,biomes[i],run));Capture();
+                    events.RecordEvent(new(Id(),owner,session,GameplayEventKind.ANIMAL_DIED,time.AddMilliseconds(10),10,game,biomes[i],run,GameplayDeathCause.Damage));Capture();
+                    events.RecordEvent(new(Id(),owner,session,GameplayEventKind.ANIMAL_RETRY_REQUESTED,time.AddMilliseconds(10),10,game,biomes[i],run));Capture();
+                    events.RecordInterval(new(Id(),owner,session,10,30,GameplayTimeState.Paused,game,biomes[i],run));Capture();
+                    events.RecordEvent(new(Id(),owner,session,GameplayEventKind.ANIMAL_SEGMENT_EXITED,time.AddMilliseconds(30),30,game,biomes[i],run));Capture();
+                    events.RecordEvent(new(Id(),owner,session,GameplayEventKind.SESSION_ENDED,time.AddMilliseconds(30),30,SessionEnd:GameplaySessionEnd.Normal));Capture();
+                }
+                if(rejectCount==3 && i is 1 or 2)
+                {
+                    string session=Id(),run=Id();events.RecordEvent(new(Id(),owner,session,GameplayEventKind.SESSION_STARTED,time,0));Capture();
+                    events.RecordEvent(new(run,owner,session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,time,0,game,biomes[i],run));Capture();
+                    if(i==1)
+                    {
+                        events.RecordEvent(new(Id(),owner,session,GameplayEventKind.ANIMAL_RESTART_REQUESTED,time.AddMilliseconds(20),20,game,biomes[i],run));Capture();
+                        events.RecordEvent(new(Id(),owner,session,GameplayEventKind.ANIMAL_SEGMENT_EXITED,time.AddMilliseconds(20),20,game,biomes[i],run));Capture();
+                        events.RecordEvent(new(Id(),owner,session,GameplayEventKind.SESSION_ENDED,time.AddMilliseconds(20),20,SessionEnd:GameplaySessionEnd.Normal));Capture();
+                    }
+                    else {completionSession=session;completionRun=run;}
+                }
+                save.CompleteBiome(new(Id(),owner,game,Rev(),biomes[i],reject?"good":"bad"));Capture();
+                if(completionSession is not null)
+                {
+                    events.RecordEvent(new(Id(),owner,completionSession,GameplayEventKind.ANIMAL_SEGMENT_COMPLETED,time.AddMilliseconds(10),10,game,biomes[i],completionRun));Capture();
+                    events.RecordEvent(new(Id(),owner,completionSession,GameplayEventKind.ANIMAL_SEGMENT_EXITED,time.AddMilliseconds(10),10,game,biomes[i],completionRun));Capture();
+                    events.RecordEvent(new(Id(),owner,completionSession,GameplayEventKind.SESSION_ENDED,time.AddMilliseconds(10),10,SessionEnd:GameplaySessionEnd.Normal));Capture();
+                }
+            }
+            save.PrepareFinal(new(Id(),owner,game,Rev()));Capture();
+            save.CloseGame(new(Id(),owner,game,Rev(),rejectCount==5?"good":rejectCount>=3?"medium":"bad"));Capture();
+        }
+        string interrupted=Id();events.RecordEvent(new(Id(),owner,interrupted,GameplayEventKind.SESSION_STARTED,time,0));Capture();
+        events.RecordInterval(new(Id(),owner,interrupted,0,9007199254740991,GameplayTimeState.Menu));
+        events.InterruptSession(owner,interrupted,Id(),time);Capture();
+        var queue=new SyncOutboxService(db);var rows=new List<OutboxOperation>();var deps=new Dictionary<string,string[]>();
+        using(var c=db.Open())
+        {
+            using(var q=c.CreateCommand()){q.CommandText="SELECT operation_id FROM sync_outbox ORDER BY rowid;";using var r=q.ExecuteReader();while(r.Read())rows.Add(queue.Get(owner,r.GetString(0))!);}
+            foreach(var row in rows){using var q=c.CreateCommand();q.CommandText="SELECT depends_on_id FROM sync_dependencies WHERE operation_id=$id ORDER BY depends_on_id;";q.Parameters.AddWithValue("$id",row.OperationId);using var r=q.ExecuteReader();var ids=new List<string>();while(r.Read())ids.Add(r.GetString(0));deps[row.OperationId]=ids.ToArray();}
+        }
+        var ordered=new List<OutboxOperation>();while(ordered.Count<rows.Count){var next=rows.FirstOrDefault(x=>!ordered.Contains(x)&&deps[x.OperationId].All(d=>ordered.Any(o=>o.OperationId==d)))??throw new Exception("Vector cycle");ordered.Add(next);}
+        var output=new {producer="SyncOutboxService/SyntheticOutboxReconciler .NET8",synthetic=true,localPlayerId=owner,installationId=installation,
+            operations=ordered.Select(x=>new {operationId=x.OperationId,payloadHash=x.PayloadHash,canonicalEnvelope=x.CanonicalEnvelope,
+                dependencies=deps[x.OperationId],leaseId=Id(),attempt=1}).ToArray()};
+        Console.WriteLine(JsonSerializer.Serialize(output));return 0;
+    }
+}

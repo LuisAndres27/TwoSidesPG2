@@ -1,0 +1,75 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+// Optional extension v1 over base v2. Explicit synthetic-only migration, never automatic on runtime open.
+public static class GameplayEventSchema
+{
+    public const int Version=1;
+    private const string Sql="""
+CREATE TABLE gameplay_schema_migrations(version INTEGER PRIMARY KEY CHECK(version>0),migration_key TEXT NOT NULL UNIQUE,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
+CREATE TABLE gameplay_sessions(
+ session_id TEXT PRIMARY KEY NOT NULL,local_player_id TEXT NOT NULL REFERENCES local_profiles(local_player_id),
+ started_at_utc TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('open','closed','interrupted')),
+ ended_at_utc TEXT,end_offset_ms INTEGER CHECK(end_offset_ms>=0),UNIQUE(session_id,local_player_id),
+ CHECK((status='open' AND ended_at_utc IS NULL AND end_offset_ms IS NULL) OR (status='closed' AND ended_at_utc IS NOT NULL AND end_offset_ms IS NOT NULL) OR (status='interrupted' AND ended_at_utc IS NULL AND end_offset_ms IS NOT NULL)));
+CREATE UNIQUE INDEX ux_gameplay_open_session ON gameplay_sessions(local_player_id) WHERE status='open';
+CREATE TABLE gameplay_events(
+ event_id TEXT PRIMARY KEY NOT NULL,local_player_id TEXT NOT NULL,session_id TEXT NOT NULL,kind TEXT NOT NULL,
+ occurred_at_utc TEXT NOT NULL,offset_ms INTEGER NOT NULL CHECK(offset_ms>=0),game_id TEXT,biome_id TEXT,animal_run_id TEXT,
+ death_cause TEXT,session_end TEXT,contract_version INTEGER NOT NULL CHECK(contract_version=1),payload_digest TEXT NOT NULL CHECK(length(payload_digest)=64),dedupe_key TEXT NOT NULL,
+ UNIQUE(local_player_id,dedupe_key),UNIQUE(event_id,local_player_id,session_id,game_id,biome_id),
+ FOREIGN KEY(session_id,local_player_id) REFERENCES gameplay_sessions(session_id,local_player_id),
+ FOREIGN KEY(game_id,local_player_id) REFERENCES saved_games(game_id,local_player_id),
+ FOREIGN KEY(game_id,biome_id) REFERENCES biome_progress(game_id,biome_id),
+ FOREIGN KEY(animal_run_id,local_player_id,session_id,game_id,biome_id) REFERENCES gameplay_events(event_id,local_player_id,session_id,game_id,biome_id),
+ CHECK(kind IN('SESSION_STARTED','SESSION_ENDED','ANIMAL_SEGMENT_STARTED','ANIMAL_DIED','ANIMAL_RESTART_REQUESTED','ANIMAL_RETRY_REQUESTED','ANIMAL_SEGMENT_EXITED','ANIMAL_SEGMENT_COMPLETED')));
+CREATE INDEX ix_gameplay_events_game ON gameplay_events(local_player_id,game_id,biome_id,kind,offset_ms,event_id);
+CREATE INDEX ix_gameplay_events_session ON gameplay_events(session_id,offset_ms,event_id);
+CREATE TABLE gameplay_intervals(
+ interval_id TEXT PRIMARY KEY NOT NULL,local_player_id TEXT NOT NULL,session_id TEXT NOT NULL,
+ start_ms INTEGER NOT NULL CHECK(start_ms>=0),end_ms INTEGER NOT NULL CHECK(end_ms>=start_ms),state TEXT NOT NULL,
+ game_id TEXT,biome_id TEXT,animal_run_id TEXT,contract_version INTEGER NOT NULL CHECK(contract_version=1),payload_digest TEXT NOT NULL CHECK(length(payload_digest)=64),
+ FOREIGN KEY(session_id,local_player_id) REFERENCES gameplay_sessions(session_id,local_player_id),
+ FOREIGN KEY(game_id,local_player_id) REFERENCES saved_games(game_id,local_player_id),
+ FOREIGN KEY(game_id,biome_id) REFERENCES biome_progress(game_id,biome_id),
+ FOREIGN KEY(animal_run_id,local_player_id,session_id,game_id,biome_id) REFERENCES gameplay_events(event_id,local_player_id,session_id,game_id,biome_id),
+ UNIQUE(session_id,start_ms,end_ms,state),CHECK(state IN('ActiveHuman','ActiveAnimal','Paused','Menu','GameOver','Loading','Background')));
+CREATE INDEX ix_gameplay_intervals_session ON gameplay_intervals(session_id,start_ms,end_ms);
+CREATE INDEX ix_gameplay_intervals_game ON gameplay_intervals(local_player_id,game_id,biome_id,state);
+""";
+    public static string Checksum=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Sql.ReplaceLineEndings("\n"))));
+    public static void MigrateSynthetic(SyntheticDatabase database,Action? beforeCommit=null)
+    {
+        SchemaManager.Verify(database);
+        try
+        {
+            using var c=database.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);
+            Install(r);
+            beforeCommit?.Invoke();tx.Commit();
+        }
+        catch(SqliteException e){throw StorageErrors.Map(e);}
+    }
+    // Same v1 SQL/checksum, shared by the explicitly scoped statistics initialization transaction.
+    internal static void Install(SQLiteRepository r)
+    {
+        if(r.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name GLOB 'gameplay_*';")!=0){Verify(r);return;}
+        r.Execute(Sql);
+        r.Execute("INSERT INTO gameplay_schema_migrations VALUES(1,'local-gameplay-extension-v1',$h,$at);",("$h",Checksum),("$at",SaveValidation.Timestamp(DateTimeOffset.UtcNow)));
+    }
+    public static void Verify(ISaveDatabase database)
+    {
+        SchemaManager.Verify(database);
+        try{using var c=database.Open();using var tx=c.BeginTransaction(deferred:true);Verify(new SQLiteRepository(c,tx));tx.Commit();}
+        catch(SqliteException e){throw StorageErrors.Map(e);}
+    }
+    internal static void Verify(SQLiteRepository r)
+    {
+        SaveValidation.Require(r.Number("PRAGMA user_version;")==2,"UNSUPPORTED_SCHEMA");
+        SaveValidation.Require(r.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('gameplay_schema_migrations','gameplay_sessions','gameplay_events','gameplay_intervals');")==4,"UNSUPPORTED_EVENT_SCHEMA");
+        SaveValidation.Require(r.Number("SELECT count(*) FROM gameplay_schema_migrations;")==1 && r.Number("SELECT count(*) FROM gameplay_schema_migrations WHERE version=1 AND migration_key='local-gameplay-extension-v1' AND checksum=$h;",("$h",Checksum))==1,"UNSUPPORTED_EVENT_SCHEMA");
+    }
+}

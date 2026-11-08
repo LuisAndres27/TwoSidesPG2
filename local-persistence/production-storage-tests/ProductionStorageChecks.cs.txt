@@ -1,0 +1,242 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+using TwoSides.LocalPersistence;
+
+// B68: per-user production save path. Everything runs against DISPOSABLE simulated "LocalAppData" roots created under the real LocalAppData of
+// the machine (...\TwoSidesTests\B68\<guid>\<profile>\AppData\Local) and removed afterwards. The developer's historical store and the real
+// %LOCALAPPDATA%\TwoSides\PlayerData folder are never opened or created by these checks.
+internal static class ProductionStorageChecks
+{
+    private static int _count;
+    private static void Check(bool ok, string label) { if (!ok) throw new Exception("CHECK FAILED: " + label); _count++; Console.WriteLine("PASS " + label); }
+    private static string Id() => Guid.NewGuid().ToString("D");
+    private static bool Rejects(Action action, params string[] codes)
+    {
+        try { action(); return false; }
+        catch (SaveException e) { return codes.Length == 0 || codes.Contains(e.Code); }
+    }
+    private static readonly string RealLocal = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+    // Simulated Windows profiles. Each gets its own LocalAppData that must already exist (as it does for a real account).
+    private static string NewLab() => Path.Combine(RealLocal, "TwoSidesTests", "B68", Guid.NewGuid().ToString("N"));
+    private static string Profile(string lab, string user)
+    {
+        string local = Path.Combine(lab, user, "AppData", "Local");
+        Directory.CreateDirectory(local);
+        return local;
+    }
+    private static void RemoveLab(string lab)
+    {
+        // Only inside the lab this run created: files first, then directories bottom-up. Never a recursive delete.
+        string expected = Path.Combine(RealLocal, "TwoSidesTests", "B68") + Path.DirectorySeparatorChar;
+        if (!Path.GetFullPath(lab).StartsWith(expected, StringComparison.OrdinalIgnoreCase) || !Directory.Exists(lab)) return;
+        foreach (string file in Directory.EnumerateFiles(lab, "*", SearchOption.AllDirectories)) File.Delete(file);
+        foreach (string dir in Directory.EnumerateDirectories(lab, "*", SearchOption.AllDirectories).OrderByDescending(d => d.Length)) Directory.Delete(dir);
+        Directory.Delete(lab);
+    }
+    private static string PathFor(string local) => Path.Combine(OwnedPublic(local), "save.sqlite3");
+    private static string OwnedPublic(string local) => Path.Combine(local, "TwoSides", "PlayerData");
+
+    public static Task<int> Run(string[] args)
+    {
+        string projectRoot = args.Length > 0 ? Path.GetFullPath(args[0]) : throw new Exception("argument: local-persistence root");
+        var labs = new List<string>();
+        try { Body(projectRoot, labs); }
+        finally { foreach (string lab in labs) RemoveLab(lab); }
+        Console.WriteLine("ALL PRODUCTION STORAGE CHECKS PASSED " + _count);
+        return Task.FromResult(0);
+    }
+
+    private static void Body(string projectRoot, List<string> labs)
+    {
+        // ---- 1. Path rules for different Windows profiles (pure, nothing is created) ----
+        var samples = new[]
+        {
+            @"C:\Users\Ana\AppData\Local",
+            @"C:\Users\Jos" + "\u00e9 \u00d1and\u00fa P\u00e9rez" + @"\AppData\Local",
+            @"D:\Users\Mar" + "\u00eda Luisa" + @"\AppData\Local",
+            @"C:\Users\" + new string('x', 60) + @"\AppData\Local",
+            @"E:\Perfiles\Alumno 7\AppData\Local",
+        };
+        foreach (string s in samples)
+        {
+            string expected = Path.Combine(s, "TwoSides", "PlayerData");
+            Check(OwnedCopyDatabase.ProductionDirectoryUnder(s) == expected, "production directory is <LocalAppData>\\TwoSides\\PlayerData for " + s.Length + "-char profile");
+        }
+        Check(samples.Select(OwnedCopyDatabase.ProductionDirectoryUnder).Distinct(StringComparer.OrdinalIgnoreCase).Count() == samples.Length, "different Windows profiles map to different save locations");
+
+        // ---- 2. The real production path is derived from the user's LocalAppData and from nothing in the developer workspace ----
+        string prod = CopyGameDatabase.ProductionPath;
+        Check(string.Equals(prod, Path.Combine(RealLocal, "TwoSides", "PlayerData", "save.sqlite3"), StringComparison.OrdinalIgnoreCase), "ProductionPath is %LOCALAPPDATA%\\TwoSides\\PlayerData\\save.sqlite3");
+        Check(GamePersistenceAdapter.ProductionStoragePath == prod, "adapter exposes the same production path");
+        Check(!prod.StartsWith(SyntheticSandbox.AuthorizedProjectRoot, StringComparison.OrdinalIgnoreCase) && !prod.Contains("local-persistence") && !prod.Contains(".work") && !prod.Contains("OneDrive")
+            && !prod.Contains("ReconstructionTests"), "production path is outside the project, .work, OneDrive and the test-copy tree");
+        var others = new[] { CopyGameDatabase.RuntimePath, CopyGameDatabase.AuthorizedPath, GamePersistenceAdapter.StoragePath, GamePersistenceAdapter.RuntimeStoragePath };
+        Check(others.All(o => !string.Equals(o, prod, StringComparison.OrdinalIgnoreCase) && !Path.GetDirectoryName(o)!.Equals(Path.GetDirectoryName(prod), StringComparison.OrdinalIgnoreCase)),
+            "production store is a different file and directory from the historical runtime store and the test copies");
+
+        // ---- 3. Wrong-path requests are refused BEFORE any file system access ----
+        // B79: never probe the real PlayerData, even for existence. The two historical existence assertions
+        // are explicitly excluded; isolation is exercised against the disposable profile capabilities below.
+        foreach (string wrong in new[] { CopyGameDatabase.RuntimePath, CopyGameDatabase.AuthorizedPath, "", "save.sqlite3", @"C:\x\save.sqlite3", prod + "x" })
+        {
+            Check(Rejects(() => CopyGameDatabase.OpenProductionOrCreate(wrong), "UNSAFE_PATH"), "production store refuses a path that is not exactly its own");
+        }
+        Check(Rejects(() => CopyGameDatabase.OpenRuntimeOrCreate(prod), "UNSAFE_PATH") && Rejects(() => CopyGameDatabase.OpenOrCreate(prod), "UNSAFE_PATH"),
+            "the historical runtime store and the test copy refuse the production path");
+        {
+            var adapter = new GamePersistenceAdapter(production: true);
+            foreach (string wrong in new[] { CopyGameDatabase.RuntimePath, GamePersistenceAdapter.StoragePath, "", @"C:\Users\someone\save.sqlite3" })
+            {
+                var r = adapter.OpenAsync(wrong).GetAwaiter().GetResult();
+                Check(!r.Success && r.Code == "UNSAFE_PATH", "production adapter rejects a non-production path with UNSAFE_PATH");
+            }
+            adapter.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        {
+            var runtimeAdapter = new GamePersistenceAdapter(runtime: true);
+            var r = runtimeAdapter.OpenAsync(prod).GetAwaiter().GetResult();
+            Check(!r.Success && r.Code == "UNSAFE_PATH", "historical runtime adapter rejects the production path with UNSAFE_PATH");
+            runtimeAdapter.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        bool bothThrew = false;
+        try { _ = new GamePersistenceAdapter(runtime: true, production: true); } catch (ArgumentException) { bothThrew = true; }
+        Check(bothThrew, "an adapter cannot be both historical-runtime and production");
+
+        // ---- 4. Unsafe local roots fail closed and create nothing ----
+        string lab0 = NewLab(); labs.Add(lab0);
+        var badRoots = new Dictionary<string, string>
+        {
+            ["relative"] = @"Users\Ana\AppData\Local",
+            ["UNC"] = @"\\server\share\Users\Ana\AppData\Local",
+            ["dot-dot"] = Path.Combine(lab0, "a", "..", "b"),
+            ["OneDrive folder"] = Path.Combine(lab0, "OneDrive - Facultad", "AppData", "Local"),
+            ["empty"] = "",
+        };
+        string noDrive = new string(Enumerable.Range('Q', 9).Select(c => (char)c).First(c => !Directory.Exists(c + @":\")), 1) + @":\Users\Ana\AppData\Local";
+        badRoots["missing drive"] = noDrive;
+        foreach (var kv in badRoots)
+        {
+            string abs = Path.Combine(kv.Value, "TwoSides", "PlayerData", "save.sqlite3");
+            Check(Rejects(() => CopyGameDatabase.OpenProductionUnder(kv.Value, abs)), "unsafe root is refused (" + kv.Key + ")");
+        }
+        Check(!Directory.Exists(Path.Combine(lab0, "OneDrive - Facultad")) && !Directory.Exists(Path.Combine(lab0, "a")) && !Directory.Exists(Path.Combine(lab0, "b")), "refused roots created no directories");
+
+        // ---- 5. A fresh profile: automatic creation, ownership, schema, persistence, isolation ----
+        string labA = NewLab(); labs.Add(labA);
+        string localAna = Profile(labA, "Ana"), localJose = Profile(labA, "Jos\u00e9 P\u00e9rez");
+        string anaPath = PathFor(localAna), josePath = PathFor(localJose);
+        Check(!Directory.Exists(OwnedPublic(localAna)), "a new profile starts with no TwoSides folder");
+
+        string anaOwner = Id(), joseOwner = Id();
+        using (var db = CopyGameDatabase.OpenProductionUnder(localAna, anaPath))
+        {
+            Check(db.Path == anaPath, "store opens at <LocalAppData>\\TwoSides\\PlayerData\\save.sqlite3 of that profile");
+            Check(Directory.Exists(OwnedPublic(localAna)) && File.Exists(anaPath) && File.Exists(Path.Combine(OwnedPublic(localAna), "ownership.json")) && File.Exists(Path.Combine(OwnedPublic(localAna), "store.lease")), "directory, database, ownership manifest and lease are created automatically");
+            var service = new GameSaveService(db, RealGameCatalog.InitialState());
+            Check(service.GetLocalProfile() is null, "a brand-new install has no profile (it never inherits the developer's data)");
+            service.CreateLocalProfile(Id(), anaOwner, "Ana");
+            service.CreateNewGame(new(Id(), anaOwner, Id()));
+            Check(service.GetGameHistory(anaOwner).Count == 1, "a game is saved");
+            // second instance on the same store is refused (single-owner lease)
+            Check(Rejects(() => CopyGameDatabase.OpenProductionUnder(localAna, anaPath)), "a second concurrent instance cannot open the same production store");
+        }
+        string manifest = File.ReadAllText(Path.Combine(OwnedPublic(localAna), "ownership.json"));
+        Check(manifest.Contains("player-production-save") && manifest.Contains("two-sides-player-save-v1") && !manifest.Contains("06dc7ade") && !manifest.Contains("copy-"), "ownership manifest names the production purpose/store id, not a test copy");
+        using (var db = CopyGameDatabase.OpenProductionUnder(localAna, anaPath))
+        {
+            var service = new GameSaveService(db, RealGameCatalog.InitialState());
+            Check(service.GetLocalProfile()?.LocalPlayerId == anaOwner && service.GetGameHistory(anaOwner).Count == 1, "close and reopen: profile and game persist");
+            using var c = db.Open(); using var q = c.CreateCommand(); q.CommandText = "PRAGMA application_id;";
+            Check(Convert.ToInt32(q.ExecuteScalar()) == 0x54535044, "production database has its own application id (distinct from test, copy and runtime stores)");
+        }
+        using (var dbJ = CopyGameDatabase.OpenProductionUnder(localJose, josePath))
+        {
+            var service = new GameSaveService(dbJ, RealGameCatalog.InitialState());
+            Check(service.GetLocalProfile() is null && Directory.Exists(OwnedPublic(localJose)), "a second Windows profile gets its own independent store (no data from the first)");
+            service.CreateLocalProfile(Id(), joseOwner, "Jos\u00e9");
+            Check(service.GetLocalProfile()!.LocalPlayerId == joseOwner, "profile with accents and spaces in its path works");
+        }
+        using (var dbA = CopyGameDatabase.OpenProductionUnder(localAna, anaPath))
+            Check(new GameSaveService(dbA, RealGameCatalog.InitialState()).GetLocalProfile()!.LocalPlayerId == anaOwner, "the first profile is unchanged by the second");
+
+        // ---- 6. Schema/Outbox structure identical to the existing stores ----
+        using (var sandbox = new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot))
+        {
+            var reference = sandbox.CreateDatabase(); SchemaManager.Initialize(reference);
+            List<string> Schema(ISaveDatabase d)
+            {
+                using var c = d.Open(); using var q = c.CreateCommand();
+                q.CommandText = "SELECT type||'|'||name||'|'||coalesce(sql,'') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name;";
+                using var r = q.ExecuteReader(); var rows = new List<string>(); while (r.Read()) rows.Add(r.GetString(0)); return rows;
+            }
+            List<string> expected = Schema(reference), actual;
+            using (var dbA = CopyGameDatabase.OpenProductionUnder(localAna, anaPath)) actual = Schema(dbA);
+            Check(expected.Count == actual.Count && expected.Count >= 10, "schema object count equals the reference store (" + expected.Count + " vs " + actual.Count + ")");
+            Check(expected.SequenceEqual(actual), "production database base schema (tables, indexes, triggers) is identical to the existing stores: " + actual.Count + " objects");
+            // Like the reference store, a NEW store holds the base schema only: gameplay-event and Outbox tables are installed by the separate, authorized activation
+            // tools (not changed here). The existing code paths must treat that state as "not activated", never as corruption.
+            Check(!actual.Any(x => x.Contains("sync_outbox")) && !actual.Any(x => x.Contains("gameplay_")), "a new production store has the base schema only (no Outbox / gameplay-event tables yet), same as a new reference store");
+            using (var dbP = CopyGameDatabase.OpenProductionUnder(localAna, anaPath))
+            {
+                var page = new LocalOutboxPump(dbP).Step(null);
+                Check(page.Code == "OUTBOX_NOT_ACTIVATED" && !page.IntegrityFailure, "Outbox pump on a new production store reports OUTBOX_NOT_ACTIVATED, not an integrity failure");
+                string eventCode = "none";
+                try { _ = new GameplayEventService(dbP); } catch (SaveException e) { eventCode = e.Code; }
+                Check(eventCode != "none", "gameplay-event service refuses a store without its schema with a controlled code (" + eventCode + ")");
+            }
+        }
+
+        // ---- 7. A foreign/unknown database at the production location is never adopted ----
+        string labB = NewLab(); labs.Add(labB);
+        string localBob = Profile(labB, "Bob");
+        Directory.CreateDirectory(OwnedPublic(localBob));
+        string bobPath = PathFor(localBob);
+        File.WriteAllBytes(bobPath, new byte[] { 1, 2, 3, 4 });
+        Check(Rejects(() => CopyGameDatabase.OpenProductionUnder(localBob, bobPath), "UNKNOWN_DATABASE"), "an unowned file at the production path is refused (UNKNOWN_DATABASE), not adopted");
+        Check(File.ReadAllBytes(bobPath).Length == 4, "and left untouched");
+
+        // ---- 8. Synchronization stays off without a backend URL; test flags keep their own locations ----
+        Check(SyncMainMode.FromConfiguration("", Array.Empty<string>()) is null && SyncMainMode.FromConfiguration("   ", Array.Empty<string>()) is null && SyncMainMode.FromConfiguration(null, Array.Empty<string>()) is null, "no URL: no main sync");
+        Check(SyncMainMode.FromConfiguration("http://example.test/", Array.Empty<string>()) is null && SyncMainMode.FromConfiguration("not a url", Array.Empty<string>()) is null, "non-HTTPS or invalid URL: no main sync");
+        Check(SyncMainMode.FromConfiguration("https://example.test/", Array.Empty<string>()) is not null, "a valid HTTPS URL would enable it (control)");
+        Check(SyncMainMode.FromConfiguration("https://example.test/", new[] { SyncLocalMode.Flag }) is null, "a test flag disables main sync");
+        string godot = Path.GetFullPath(Path.Combine(projectRoot, "..", "project.godot"));
+        Check(File.Exists(godot) && !File.ReadAllText(godot).Contains("main_api_url"), "project.godot defines no backend URL, so the exported game keeps synchronization disabled");
+        Check(SyncTestStorageMode.FromArguments(Array.Empty<string>()) == SyncTestStorageRequest.None && GameTestStorage.FromArguments(Array.Empty<string>()) is null, "no test arguments: no sandbox storage");
+
+        // ---- 8b. Test flags use ONLY their own disposable sandbox, never the production store ----
+        using (var storage = GameTestStorage.FromArguments(new[] { SyncLocalMode.Flag, SyncTestStorageMode.Flag })!)
+        {
+            string sandboxPath = storage.Database.Path;
+            string databases = Path.Combine(SyntheticSandbox.AuthorizedProjectRoot, ".work", "databases") + Path.DirectorySeparatorChar;
+            Check(sandboxPath.StartsWith(databases, StringComparison.OrdinalIgnoreCase) && !sandboxPath.StartsWith(Path.GetDirectoryName(CopyGameDatabase.ProductionPath)!, StringComparison.OrdinalIgnoreCase), "test-flag storage is a disposable sandbox database, outside the production folder");
+            var sandboxAdapter = storage.CreateAdapter();
+            foreach (string forbidden in new[] { CopyGameDatabase.ProductionPath, CopyGameDatabase.RuntimePath, GamePersistenceAdapter.StoragePath })
+            {
+                var r = sandboxAdapter.OpenAsync(forbidden).GetAwaiter().GetResult();
+                Check(!r.Success, "sandbox adapter refuses a production/historical/protected path");
+            }
+            var okOpen = sandboxAdapter.OpenAsync(GameTestStorage.OpenPath).GetAwaiter().GetResult();
+            Check(okOpen.Success, "sandbox adapter opens only its own sandbox token");
+            sandboxAdapter.DrainOutboxAsync(TimeSpan.FromSeconds(1)).GetAwaiter().GetResult();
+            sandboxAdapter.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+
+        // ---- 9. The production flow contains no developer-specific absolute path ----
+        string context = File.ReadAllText(Path.GetFullPath(Path.Combine(projectRoot, "..", "integration", "sqlite", "GamePersistenceContext.cs")));
+        Check(context.Contains("new(production:true)") && !context.Contains("runtime:true") && !context.Contains("RuntimeStoragePath") && !context.Contains("AuthorizedProjectRoot"), "game start-up uses the production store and no historical/runtime path");
+        string sync = File.ReadAllText(Path.GetFullPath(Path.Combine(projectRoot, "..", "integration", "sqlite", "GameSyncHost.cs")));
+        Check(!sync.Contains("AuthorizedProjectRoot") && !sync.Contains("RuntimeStoragePath") && !sync.Contains(@"C:\"), "the sync host uses no developer path");
+        string owned = File.ReadAllText(Path.Combine(projectRoot, "src", "OwnedCopyDatabase.cs.txt"));
+        string production = owned.Substring(owned.IndexOf("internal static OwnedCopyDatabase OpenProduction", StringComparison.Ordinal));
+        production = production.Substring(0, production.IndexOf("internal static OwnedCopyDatabase OpenOrCreate", StringComparison.Ordinal));
+        Check(!production.Contains("AuthorizedProjectRoot") && !production.Contains("luis2") && !production.Contains("RuntimeDirectory"), "OpenProduction itself references no developer-specific location");
+    }
+}

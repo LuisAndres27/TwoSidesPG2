@@ -1,0 +1,58 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# Secrets and sensitive local data: never commit (B00).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*authorization*.json
+*-integrity-manifest*.json
+Respaldo*/
+secrets/
+TwoSidesMainSecrets/
+*.secret
+*.bak
+
+# Per-machine Godot project-setting overrides (they would carry the API URL of one machine).
+override.cfg
+
+# Publication hygiene (B87 / repo upload)
+# Work output, evidence and temporary Godot/Mono copies
+.work/
+**/.work/
+.work.godot/
+**/.work.godot/
+backend/.npm-cache/
+backend/.tmp/
+node_modules/
+# Build output and per-user files (Godot 4 C# / .NET)
+.mono/
+bin/
+obj/
+*.user
+*.pdb
+*.dll
+*.so
+*.dylib
+# Exported builds: published as GitHub Releases, never committed
+*.exe
+*.pck
+TwoSides-Entrega/
+TwoSidesBuild/
+# Logs, backups and shortcuts
+*.log
+*.old
+*.lnk
+# Player data and local saves
+PlayerData/
+**/PlayerData/

@@ -1,0 +1,41 @@
+[gd_scene format=3 uid="uid://cxhgd71twywyh"]
+
+[ext_resource type="Script" uid="uid://f44yi7xnypk6" path="res://scripts/InfoDecision.cs" id="1_hywre"]
+
+[node name="InfoMala" type="Control" unique_id=964135740]
+layout_mode = 3
+anchors_preset = 0
+script = ExtResource("1_hywre")
+EscenaSiguiente = "uid://dtbca7qsik7vc"
+metadata/_edit_vertical_guides_ = [326.0]
+
+[node name="Fondo" type="ColorRect" parent="." unique_id=683321040]
+layout_mode = 0
+offset_right = 647.0
+offset_bottom = 369.0
+color = Color(0, 0, 0, 1)
+
+[node name="Titulo" type="Label" parent="." unique_id=1514477661]
+layout_mode = 0
+offset_left = 215.0
+offset_top = 5.0
+offset_right = 437.0
+offset_bottom = 28.0
+text = "Bioma Tundra: consecuencia"
+
+[node name="Texto" type="RichTextLabel" parent="." unique_id=1935541013]
+layout_mode = 0
+offset_left = 74.0
+offset_top = 108.0
+offset_right = 600.0
+offset_bottom = 273.0
+text = "La explotación masiva de combustibles fósiles genera emisiones masivas que desestabilizan el clima. Esta desestabilización desequilibra las corrientes atmosféricas, provocando tormentas invernales mortales y fuera de temporada."
+scroll_active = false
+
+[node name="Continuar" type="Label" parent="." unique_id=4038731]
+layout_mode = 0
+offset_left = 245.0
+offset_top = 319.0
+offset_right = 409.0
+offset_bottom = 342.0
+text = "Clic para continuar ▼"

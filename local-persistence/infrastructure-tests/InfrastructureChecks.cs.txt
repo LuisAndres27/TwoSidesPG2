@@ -1,0 +1,138 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Runtime.InteropServices;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class InfrastructureChecks
+{
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr SqliteVersion();
+    private static int _count;
+    private static void Check(bool value, string name) { if (!value) throw new Exception(name); _count++; Console.WriteLine("PASS " + name); }
+    private static void Reject(Action action, string code, string name)
+    {
+        try { action(); throw new Exception("Unexpected success: " + name); }
+        catch (SaveException e) { Check(e.Code == code, name + " (expected " + code + ", received " + e.Code + ")"); }
+    }
+    private static string Hash(string file) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file)));
+    public static async Task<int> Main(string[] args)
+    {
+        try
+        {
+            if (args.Length == 1 && args[0] == "--probe")
+            {
+                using var db = DurableTestDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedPath);
+                using var c = db.Open(); using var command = c.CreateCommand();
+                command.CommandText = "SELECT count(*) FROM local_profiles WHERE display_name='Perfil sintético B04.2B.2A';";
+                return Convert.ToInt32(command.ExecuteScalar()) == 1 ? 0 : 1;
+            }
+            Reject(() => DurableTestDatabase.OpenOrCreate("save.sqlite3"), "UNSAFE_PATH", "relative path rejected");
+            Reject(() => DurableTestDatabase.OpenOrCreate(@"C:\outside\save.sqlite3"), "UNSAFE_PATH", "external path rejected before access");
+            Reject(() => DurableTestDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedDirectory + @"\..\persistence\save.sqlite3"), "UNSAFE_PATH", "ambiguous traversal rejected");
+            string gameOutput = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!,
+                "integration", "sqlite", ".work", "bin", "Debug");
+            using (var stream = File.OpenRead(System.IO.Path.Combine(gameOutput, "TwoSides.dll")))
+            using (var pe = new PEReader(stream))
+            {
+                var metadata = pe.GetMetadataReader();
+                Check(metadata.AssemblyReferences.Select(h => metadata.GetString(metadata.GetAssemblyReference(h).Name))
+                    .Contains("TwoSides.LocalPersistence"), "compiled Godot assembly references library");
+                Check(metadata.TypeDefinitions.Select(h => metadata.GetString(metadata.GetTypeDefinition(h).Name))
+                    .Contains("GodotSqliteInfrastructureAdapter"), "adapter included in compiled Godot assembly");
+            }
+            IntPtr native = NativeLibrary.Load(System.IO.Path.Combine(gameOutput, "runtimes", "win-x64", "native", "e_sqlite3.dll"));
+            try
+            {
+                var version = Marshal.GetDelegateForFunctionPointer<SqliteVersion>(NativeLibrary.GetExport(native, "sqlite3_libversion"));
+                Check(Marshal.PtrToStringAnsi(version()) == "3.53.3", "native SQLite from Godot build output loads on Windows x64");
+            }
+            finally { NativeLibrary.Free(native); }
+            Console.WriteLine("Synthetic durable destination: " + DurableTestDatabase.AuthorizedPath);
+            await using (var adapter = new GodotSqliteInfrastructureAdapter())
+            {
+                var open = await adapter.OpenAsync(GodotSqliteInfrastructureAdapter.StoragePath);
+                Check(open.Success, "adapter initializes SQLite");
+                var profile = await adapter.EnsureSyntheticProfileAsync();
+                Check(profile.Success && profile.Profile?.DisplayName == "Perfil sintético B04.2B.2A", "synthetic profile created/read");
+                string id = profile.Profile!.LocalPlayerId;
+                Check((await adapter.GetSyntheticProfileAsync()).Profile?.LocalPlayerId == id, "profile identity stable");
+                await adapter.CloseAsync();
+                Check(!(await adapter.GetSyntheticProfileAsync()).Success, "closed adapter rejects read");
+                Check((await adapter.OpenAsync(GodotSqliteInfrastructureAdapter.StoragePath)).Success, "adapter reopens");
+                Check((await adapter.GetSyntheticProfileAsync()).Profile?.LocalPlayerId == id, "profile survives connection disposal");
+            }
+            using (var db = DurableTestDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedPath))
+            {
+                Check(SchemaManager.ReadVersion(db) == 2, "migrations v1/v2 and history recognized");
+                using var c = db.Open(); using var cmd = c.CreateCommand(); cmd.CommandText = "SELECT sqlite_version();";
+                Console.WriteLine("SQLite " + cmd.ExecuteScalar());
+                using (var tx = c.BeginTransaction())
+                {
+                    cmd.Transaction = tx; cmd.CommandText = "UPDATE local_profiles SET display_name='ROLLBACK-MARKER';";
+                    cmd.ExecuteNonQuery(); tx.Rollback();
+                }
+                cmd.Transaction = null; cmd.CommandText = "SELECT display_name FROM local_profiles;";
+                Check((string?)cmd.ExecuteScalar() == "Perfil sintético B04.2B.2A", "transaction rollback preserves profile");
+                cmd.CommandText = "PRAGMA foreign_keys;"; Check(Convert.ToInt32(cmd.ExecuteScalar()) == 1, "foreign keys enabled");
+                cmd.CommandText = "PRAGMA max_page_count;"; long pages = Convert.ToInt64(cmd.ExecuteScalar()!);
+                cmd.CommandText = "PRAGMA page_count;"; long used = Convert.ToInt64(cmd.ExecuteScalar()!);
+                cmd.CommandText = "PRAGMA max_page_count=" + used; cmd.ExecuteScalar();
+                try
+                {
+                    cmd.CommandText = "CREATE TABLE disk_failure_probe(value BLOB); INSERT INTO disk_failure_probe VALUES(zeroblob(1048576));";
+                    using var tx = c.BeginTransaction(); cmd.Transaction = tx;
+                    try { cmd.ExecuteNonQuery(); throw new Exception("Expected SQLITE_FULL"); }
+                    catch (Microsoft.Data.Sqlite.SqliteException e) { Check(StorageErrors.Map(e).Code == "DISK_FULL", "controlled disk-full error mapping"); }
+                    finally { tx.Rollback(); cmd.Transaction = null; }
+                }
+                finally { cmd.CommandText = "PRAGMA max_page_count=" + pages; cmd.ExecuteScalar(); }
+                SchemaManager.Verify(db);
+            }
+            // Separate executable instance: no retained service/connection/global cache.
+            using (var child = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--probe") { UseShellExecute = false, CreateNoWindow = true }))
+            {
+                child!.WaitForExit(); Check(child.ExitCode == 0, "profile survives process restart offline");
+            }
+            string root = DurableTestDatabase.AuthorizedDirectory;
+            string manifest = System.IO.Path.Combine(root, "ownership.json");
+            string held = System.IO.Path.Combine(root, "ownership.test-held");
+            string before = Hash(DurableTestDatabase.AuthorizedPath);
+            // Only files created by this infrastructure suite are moved; never adopt another database.
+            Check(!File.Exists(held), "unknown-database test destination vacant");
+            File.Move(manifest, held);
+            try { Reject(() => DurableTestDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedPath), "UNKNOWN_DATABASE", "database without ownership rejected"); }
+            finally { File.Move(held, manifest); }
+            Check(Hash(DurableTestDatabase.AuthorizedPath) == before, "unrecognized database not modified");
+            string sidecar = DurableTestDatabase.AuthorizedPath + "-shm";
+            Check(!File.Exists(sidecar) && !Directory.Exists(sidecar), "redirect test destination vacant");
+            var start = new ProcessStartInfo("cmd.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            start.ArgumentList.Add("/c"); start.ArgumentList.Add("mklink"); start.ArgumentList.Add("/J"); start.ArgumentList.Add(sidecar); start.ArgumentList.Add(root);
+            using (var junction = Process.Start(start)) { junction!.WaitForExit(); Check(junction.ExitCode == 0, "synthetic junction created"); }
+            try { Reject(() => DurableTestDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedPath), "UNSAFE_PATH", "redirect sidecar rejected"); }
+            finally { Directory.Delete(sidecar, false); } // remove only this junction, never recurse
+            string absentTarget = System.IO.Path.Combine(root, "never-created-junction-target");
+            Check(!File.Exists(absentTarget) && !Directory.Exists(absentTarget), "dangling junction target absent");
+            start.ArgumentList[start.ArgumentList.Count - 1] = absentTarget;
+            using (var junction = Process.Start(start)) { junction!.WaitForExit(); Check(junction.ExitCode == 0, "dangling synthetic junction created"); }
+            try { Reject(() => DurableTestDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedPath), "UNSAFE_PATH", "dangling redirect rejected without target creation"); }
+            finally { Directory.Delete(sidecar, false); }
+            using (var heldFile = new FileStream(DurableTestDatabase.AuthorizedPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                Reject(() => DurableTestDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedPath), "ACCESS_DENIED", "denied sharing handled without ACL edits");
+            await using (var adapter = new GodotSqliteInfrastructureAdapter())
+            {
+                var result = await adapter.OpenAsync(@"C:\not-authorized\secret.sqlite3");
+                Check(!result.Success && result.Code == "UNSAFE_PATH" && result.Profile is null, "errors sanitized no path/secret echo");
+            }
+            Console.WriteLine($"Infrastructure: {_count} passed, 0 failed; durable synthetic store retained, no cleanup of existing databases.");
+            return 0;
+        }
+        catch (Exception e) { Console.Error.WriteLine("FAIL " + e.GetType().Name + ": " + e.Message); return 1; }
+    }
+}

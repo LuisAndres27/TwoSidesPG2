@@ -1,0 +1,51 @@
+# sync-test.ps1.template — the ONE controlled synthetic write test against Express main through Caddy HTTPS (B29). NOT run by the repository.
+# Copy it OUTSIDE the project (e.g. %LOCALAPPDATA%\TwoSidesSyntheticRun\sync-test.ps1). Run it ONLY after the owner authorized the writes, with the CA installed,
+# Caddy on 127.0.0.1:8443 and Express main on 127.0.0.1:3000.  Usage:   .\sync-test.ps1 -RunDir <folder produced by build.mjs> -ConfirmSyntheticWrites
+# Windows trust store validates TLS (nothing is disabled). Prints status codes and public identifiers only: never the credential, the token or a password.
+# Writes performed (all through the public API, all marked by the random ids in run-ids.json):  1 registration, 1 session, 1 sync operation (+ 2 idempotent re-sends, 0 new documents).
+param([Parameter(Mandatory = $true)][string]$RunDir, [switch]$ConfirmSyntheticWrites)
+$ErrorActionPreference = 'Stop'
+if (-not $ConfirmSyntheticWrites) { Write-Error 'Synthetic writes not confirmed: pass -ConfirmSyntheticWrites explicitly.'; exit 1 }
+$base = 'https://localhost:8443'
+$run = Get-Content -Raw -LiteralPath (Join-Path $RunDir 'run-ids.json') | ConvertFrom-Json
+$batchBytes = [IO.File]::ReadAllBytes((Join-Path $RunDir 'batch.json'))              # sent byte for byte: the canonical envelope must not be re-serialized
+$queryBytes = [IO.File]::ReadAllBytes((Join-Path $RunDir 'receipts-query.json'))
+function Send($method, $path, $body, $token) {
+    $headers = @{}; if ($token) { $headers['Authorization'] = 'Bearer ' + $token }
+    $arguments = @{ Uri = $base + $path; Method = $method; Headers = $headers; TimeoutSec = 20; UseBasicParsing = $true }
+    if ($null -ne $body) { $arguments.Body = $body; $arguments.ContentType = 'application/json; charset=utf-8' }
+    try { $r = Invoke-WebRequest @arguments; return @{ Status = [int]$r.StatusCode; Content = $r.Content } }
+    catch [System.Net.WebException] {
+        if ($_.Exception.Response) { $s = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); return @{ Status = [int]$_.Exception.Response.StatusCode; Content = $s.ReadToEnd() } }
+        return @{ Status = 0; Content = '' }                                           # TLS/connection failure
+    }
+}
+function Json($o) { ,[Text.Encoding]::UTF8.GetBytes(($o | ConvertTo-Json -Compress -Depth 8)) }   # unary comma: return ONE Byte[] (without it PowerShell unrolls it into Object[] and the body is sent as "123 34 115 ...")
+'0) health (read-only):                       ' + (Send 'GET' '/api/health').Status + '   expect 200'
+$bytes = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$credential = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')     # 43 chars, memory only, never written or printed
+$reg = Send 'POST' '/api/v2/technical/registrations' (Json @{ schemaVersion = 2; registrationId = $run.registrationId; credential = $credential; installationId = $run.installationId; localPlayerId = $run.localPlayerId; bindingGeneration = 1 })
+'1) registration:                             ' + $reg.Status + '   expect 201  (creates identities+1, ownerGuards+1)'
+if ($reg.Status -ne 201) { 'STOP: registration failed; nothing else was sent.'; exit 2 }
+$account = ($reg.Content | ConvertFrom-Json).technicalAccountId
+'   technicalAccountId=' + $account
+$ses = Send 'POST' '/api/v2/technical/sessions' (Json @{ schemaVersion = 2; technicalAccountId = $account; credential = $credential; installationId = $run.installationId; localPlayerId = $run.localPlayerId })
+'2) session:                                  ' + $ses.Status + '   expect 200  (creates identitySessions+1)'
+if ($ses.Status -ne 200) { 'STOP: session failed; account ' + $account + ' remains as an orphan synthetic identity.'; exit 3 }
+$token = ($ses.Content | ConvertFrom-Json).accessToken
+'3) GET /api/v2/technical/me:                 ' + (Send 'GET' '/api/v2/technical/me' $null $token).Status + '   expect 200'
+$b1 = Send 'POST' '/api/v2/sync/batches' $batchBytes $token
+$j1 = $null; try { $j1 = $b1.Content | ConvertFrom-Json } catch { }
+'4) POST sync/batches (first send):           ' + $b1.Status + '   expect 200 outcome=all_accepted, results[0].status=committed, httpStatus=201'
+if ($j1 -and $j1.results) { '   outcome=' + $j1.outcome + ' status=' + $j1.results[0].status + ' httpStatus=' + $j1.results[0].httpStatus + ' counters=' + ($j1.counters | ConvertTo-Json -Compress) + ' acceptedAs=' + $j1.results[0].receipt.acceptedAs + ' receiptId=' + $j1.results[0].receipt.receiptId }
+else { '   no results; body=' + $b1.Content.Substring(0, [math]::Min(300, $b1.Content.Length)); 'STOP: do NOT resend automatically; verify with the receipts query first (see B29 section on partial errors).'; exit 4 }
+$b2 = Send 'POST' '/api/v2/sync/batches' $batchBytes $token
+$j2 = $b2.Content | ConvertFrom-Json
+'5) POST sync/batches (SAME bytes again):     ' + $b2.Status + '   expect 200 results[0].status=duplicate, same receiptId, 0 new documents'
+'   status=' + $j2.results[0].status + ' httpStatus=' + $j2.results[0].httpStatus + ' sameReceiptId=' + ($j2.results[0].receipt.receiptId -eq $j1.results[0].receipt.receiptId)
+$q = Send 'POST' '/api/v2/sync/receipts/query' $queryBytes $token
+$jq = $q.Content | ConvertFrom-Json
+'6) POST sync/receipts/query:                 ' + $q.Status + '   expect 200, receipt found with the same receiptId'
+'   ' + ($q.Content.Substring(0, [math]::Min(400, $q.Content.Length)))
+'Synthetic ids (public, for audit/cleanup): runId=' + $run.runId + ' registrationId=' + $run.registrationId + ' technicalAccountId=' + $account + ' installationId=' + $run.installationId + ' localPlayerId=' + $run.localPlayerId + ' sessionId(source)=' + $run.sessionId + ' operationId=' + $run.operationId
+Remove-Variable credential, bytes, token, ses, reg -ErrorAction SilentlyContinue

@@ -1,0 +1,352 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class ReconciliationChecks
+{
+    private static int _count;
+    private static readonly DateTimeOffset Time=DateTimeOffset.Parse("2026-10-28T00:00:00.000Z",CultureInfo.InvariantCulture);
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok){if(!ok)throw new Exception("Reconciliation assertion failed");}
+    internal sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly string Owner=Id(),Game=Id(),Installation=Id();
+        internal readonly GameSaveService Save;
+        internal string Session="",Run="",Death="",Restart="",Retry="",Exit="",Interval="";
+        internal SyncBinding Binding=>new(Owner,Installation,1);
+        internal SyntheticOutboxReconciler Reconciler=>new(Db,()=>Time);
+        internal SyncOutboxService Queue=>new(Db,()=>Time,()=>0);
+        internal long Revision=>Save.LoadGame(Owner,Game).Game.Revision;
+        internal F(bool game=true,bool events=false)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState(),()=>Time);
+            Save.CreateLocalProfile(Id(),Owner,"Synthetic private display name");
+            if(game)Save.CreateNewGame(new(Id(),Owner,Game));
+            if(events)GameplayEventSchema.MigrateSynthetic(Db);
+            SyncOutboxSchema.MigrateSynthetic(Db);
+        }
+        internal void Decide(int i,bool reject=true)
+        {
+            Save.EnterBiome(new(Id(),Owner,Game,Revision,Biomes[i],"human"));
+            Save.RecordDecision(new(Id(),Id(),Owner,Game,Revision,Biomes[i],Keys[i],reject?"reject":"approve",reject?"healthy":"degraded",
+                reject?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));
+        }
+        internal void Complete(int i)=>Save.CompleteBiome(new(Id(),Owner,Game,Revision,Biomes[i],
+            Save.LoadGame(Owner,Game).Decisions.Single(d=>d.BiomeId==Biomes[i]).OptionId=="reject"?"good":"bad"));
+        internal void Final(bool close=false)
+        {
+            foreach(int i in new[]{4,2,0,3,1}){Decide(i);Complete(i);}
+            Save.PrepareFinal(new(Id(),Owner,Game,Revision));
+            if(close)Save.CloseGame(new(Id(),Owner,Game,Revision,"good"));
+        }
+        internal void Telemetry()
+        {
+            Decide(0);Session=Id();Run=Id();Death=Id();Retry=Id();Restart=Id();Exit=Id();Interval=Id();
+            var e=new GameplayEventService(Db);
+            e.RecordEvent(new(Id(),Owner,Session,GameplayEventKind.SESSION_STARTED,Time,0));
+            e.RecordEvent(new(Run,Owner,Session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,Time,0,Game,"ocean",Run));
+            e.RecordInterval(new(Interval,Owner,Session,0,10,GameplayTimeState.ActiveAnimal,Game,"ocean",Run));
+            e.RecordEvent(new(Death,Owner,Session,GameplayEventKind.ANIMAL_DIED,Time.AddMilliseconds(10),10,Game,"ocean",Run,GameplayDeathCause.Damage));
+            e.RecordEvent(new(Retry,Owner,Session,GameplayEventKind.ANIMAL_RETRY_REQUESTED,Time.AddMilliseconds(11),11,Game,"ocean",Run));
+            string nextRun=Id();
+            e.RecordEvent(new(nextRun,Owner,Session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,Time.AddMilliseconds(12),12,Game,"ocean",nextRun));
+            e.RecordEvent(new(Restart,Owner,Session,GameplayEventKind.ANIMAL_RESTART_REQUESTED,Time.AddMilliseconds(13),13,Game,"ocean",nextRun));
+            string lastRun=Id();
+            e.RecordEvent(new(lastRun,Owner,Session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,Time.AddMilliseconds(14),14,Game,"ocean",lastRun));
+            e.RecordEvent(new(Exit,Owner,Session,GameplayEventKind.ANIMAL_SEGMENT_EXITED,Time.AddMilliseconds(15),15,Game,"ocean",lastRun));
+            e.RecordEvent(new(Id(),Owner,Session,GameplayEventKind.SESSION_ENDED,Time.AddMilliseconds(15),15,SessionEnd:GameplaySessionEnd.Normal));
+        }
+        internal long Number(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+        internal void Sql(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;q.ExecuteNonQuery();}
+        internal string[] RowStrings(string sql)
+        {using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;using var d=q.ExecuteReader();var rows=new List<string>();while(d.Read())rows.Add(d.GetString(0));return rows.ToArray();}
+        internal OutboxOperation[] Operations()=>RowStrings("SELECT operation_id FROM sync_outbox ORDER BY operation_id;").Select(id=>Queue.Get(Owner,id)!).ToArray();
+        internal SyncReconciliationPage[] Pass(int limit=10,string origin="historical_import")
+        {
+            var pages=new List<SyncReconciliationPage>();SyncReconciliationCursor? cursor=null;
+            do{var page=Reconciler.ReconcilePage(Binding,limit,cursor,origin);pages.Add(page);if(!page.Committed)break;cursor=page.Next;Check(pages.Count<200);}while(cursor is not null);
+            return pages.ToArray();
+        }
+        internal OutboxOperation GameOperation()=>Operations().Last(x=>x.Type=="game.report" && x.SourceKey=="game:"+Game+":"+Revision);
+        internal JsonDocument GamePayload()=>JsonDocument.Parse(GameOperation().CanonicalEnvelope);
+        internal string DomainDigest()
+        {
+            using var c=Db.Open();using var tx=c.BeginTransaction(deferred:true);var r=new SQLiteRepository(c,tx);
+            var result=new List<string>();
+            string[] tables={"local_profiles","saved_games","biome_progress","biome_objectives","environmental_decisions","environmental_state","continuation_snapshots","local_settings","local_operations",
+                "gameplay_sessions","gameplay_events","gameplay_intervals"};
+            foreach(string table in tables)
+            {
+                if(r.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=$t;",("$t",table))==0)continue;
+                // Table names above are fixed, never caller input; only synthetic data.
+                using var q=r.Command("SELECT * FROM "+table+" ORDER BY rowid;");using var reader=q.ExecuteReader();
+                while(reader.Read()){var cells=new object[reader.FieldCount];reader.GetValues(cells);result.Add(JsonSerializer.Serialize(cells));}
+            }
+            tx.Commit();return string.Join("\n",result);
+        }
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static void Case(string label,Action<F> action,bool game=true,bool events=false)
+    {using var f=new F(game,events);action(f);_count++;Console.WriteLine("PASS "+label);}
+    private static async Task AsyncCase(string label,Func<F,Task> action)
+    {using var f=new F(events:true);await action(f);_count++;Console.WriteLine("PASS "+label);}
+    public static int Probe(string[] args)
+    {
+        // mode,synthetic path,owner,installation. Never an arbitrary runtime capability.
+        var db=new OutboxChecks.ProbeStore(args[1]);var binding=new SyncBinding(args[2],args[3],1);
+        SyncReconciliationCursor? cursor=null;
+        try
+        {
+            do
+            {
+                using var c=db.Open();using var tx=c.BeginTransaction(deferred:false);
+                var page=SyntheticOutboxReconciler.PrepareSyntheticPage(new(c,tx),binding,Time,10,cursor);
+                if(args[0]=="crash")Environment.Exit(74);
+                if(page.Diagnostics.Count!=0)return 79;
+                tx.Commit();cursor=page.Next;
+            }while(cursor is not null);
+            return 0;
+        }
+        catch(SqliteException e) when(e.SqliteErrorCode is 5 or 6){return 75;}
+    }
+    internal static async Task<int> Child(F f,string mode)
+    {
+        var psi=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true};
+        foreach(string arg in new[]{"--reconcile-probe",mode,f.Db.Path,f.Owner,f.Installation})psi.ArgumentList.Add(arg);
+        using var process=Process.Start(psi)!;using var timeout=new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(20));
+        try{await process.WaitForExitAsync(timeout.Token);}catch{process.Kill();throw new Exception("Synthetic process timeout");}
+        Check((await process.StandardOutput.ReadToEndAsync()).Length==0 && (await process.StandardError.ReadToEndAsync()).Length==0);
+        return process.ExitCode;
+    }
+    public static async Task<int> Run()
+    {
+        Case("profile capture persists only local binding with no remote identity or standalone personal payload",f=>{
+            Check(f.Pass().All(p=>p.Consistent));Check(f.Number("SELECT count(*) FROM sync_installations;")==1 && f.Operations().Length==0);
+            Check(f.Save.GetLocalProfile()!.TechnicalAccountId is null && f.Save.GetLocalProfile()!.RegistrationStatus=="LOCAL_ONLY");
+        },false);
+        Case("confirmed game creation produces approved game report and preserves source UUID",f=>{
+            Check(f.Pass().All(p=>p.Consistent));var op=f.GameOperation();Check(op.SourceId==f.Game && op.SourceKey=="game:"+f.Game+":0");
+        });
+        Case("committed decision is included once in game report with original identifiers",f=>{
+            f.Decide(0);Check(f.Pass().All(p=>p.Consistent));using var doc=f.GamePayload();
+            var decisions=doc.RootElement.GetProperty("payload").GetProperty("decisions");
+            Check(decisions.GetArrayLength()==1 && decisions[0].GetProperty("optionId").GetString()=="reject" &&
+                decisions[0].GetProperty("decisionId").GetString()==f.Save.LoadGame(f.Owner,f.Game).Decisions.Single().DecisionId);
+        });
+        Case("confirmed environmental consequence matches decision and creates no parallel fact",f=>{
+            f.Decide(0,false);f.Pass();using var doc=f.GamePayload();
+            Check(doc.RootElement.GetProperty("payload").GetProperty("decisions")[0].GetProperty("stateKind").GetString()=="degraded" && f.Operations().Length==1);
+        });
+        Case("biome progress animal pending is captured without claiming physical completion",f=>{
+            f.Decide(0);f.Pass();using var doc=f.GamePayload();
+            Check(doc.RootElement.GetProperty("payload").GetProperty("biomes").EnumerateArray().Single(b=>b.GetProperty("biomeId").GetString()=="ocean").GetProperty("status").GetString()=="animal_pending");
+        });
+        Case("confirmed biome completion carries original result and durable date",f=>{
+            f.Decide(0);f.Complete(0);f.Pass();using var doc=f.GamePayload();
+            var b=doc.RootElement.GetProperty("payload").GetProperty("biomes").EnumerateArray().Single(x=>x.GetProperty("biomeId").GetString()=="ocean");
+            Check(b.GetProperty("status").GetString()=="completed" && b.GetProperty("result").GetString()=="good" && b.GetProperty("animalCompletedAtUtc").ValueKind==JsonValueKind.String);
+        });
+        Case("entry receipt advances game report without inventing a human-entry event",f=>{
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"forest","human"));f.Pass();
+            Check(f.GameOperation().SourceKey=="game:"+f.Game+":1" && f.Operations().All(x=>x.Type=="game.report"));
+        });
+        Case("sessions normalize to open and terminal reports without duplicate session events",f=>{
+            f.Telemetry();Check(f.Pass().All(p=>p.Consistent));var ops=f.Operations();
+            Check(ops.Count(o=>o.Type=="session.report")==2 &&
+                ops.Where(o=>o.Type=="gameplay.event").All(o=>!o.CanonicalEnvelope.Contains("SESSION_STARTED") && !o.CanonicalEnvelope.Contains("SESSION_ENDED")));
+        },events:true);
+        foreach(var kind in new[]{"ANIMAL_SEGMENT_STARTED","ANIMAL_DIED","ANIMAL_RESTART_REQUESTED","ANIMAL_RETRY_REQUESTED","ANIMAL_SEGMENT_EXITED"})
+            Case("measured "+kind+" is captured once with original type and IDs",f=>{
+                f.Telemetry();f.Pass();var ids=f.Operations().Where(o=>o.Type=="gameplay.event" && o.CanonicalEnvelope.Contains(kind)).Select(o=>o.SourceId).ToArray();
+                Check(ids.Length==(kind=="ANIMAL_SEGMENT_STARTED"?3:1));Check(f.Pass().All(p=>p.Consistent));
+                Check(f.Operations().Where(o=>o.Type=="gameplay.event" && o.CanonicalEnvelope.Contains(kind)).Count()==ids.Length);
+            },events:true);
+        Case("effective interval preserves measured offsets without aggregating unknown history",f=>{
+            f.Telemetry();f.Pass();var interval=f.Operations().Single(o=>o.Type=="gameplay.interval");using var doc=JsonDocument.Parse(interval.CanonicalEnvelope);
+            var p=doc.RootElement.GetProperty("payload");Check(p.GetProperty("startMs").GetInt64()==0 && p.GetProperty("endMs").GetInt64()==10 &&
+                p.GetProperty("state").GetString()=="ActiveAnimal" && !interval.CanonicalEnvelope.Contains("totalTime"));
+        },events:true);
+        Case("confirmed final result is distinct from closure and never marks final as read",f=>{
+            f.Final();Check(f.Pass().All(p=>p.Consistent));using var doc=f.GamePayload();var p=doc.RootElement.GetProperty("payload");
+            Check(p.GetProperty("status").GetString()=="final_pending" && p.GetProperty("ending").GetString()=="good" && p.GetProperty("closedAtUtc").ValueKind==JsonValueKind.Null);
+        });
+        Case("global closure becomes completed with original game and known ending",f=>{
+            f.Final(true);f.Pass();using var doc=f.GamePayload();var p=doc.RootElement.GetProperty("payload");
+            Check(p.GetProperty("status").GetString()=="completed" && p.GetProperty("closedAtUtc").ValueKind==JsonValueKind.String);
+        });
+        Case("five biomes in free order retain confirmed decision order and their IDs",f=>{
+            f.Final(true);var before=f.Save.LoadGame(f.Owner,f.Game).Decisions.Select(d=>d.DecisionId).ToArray();f.Pass();using var doc=f.GamePayload();
+            Check(doc.RootElement.GetProperty("payload").GetProperty("decisions").EnumerateArray().Select(d=>d.GetProperty("decisionId").GetString()).SequenceEqual(before));
+        });
+        Case("repeated pass retains operation identifiers hashes and envelopes",f=>{
+            f.Telemetry();f.Pass();var before=f.Operations();Check(f.Pass().All(p=>p.Consistent));Check(f.Operations().SequenceEqual(before));
+        },events:true);
+        Case("confirmed rows remain byte-identical under repeated reconciliation",f=>{
+            f.Pass();var row=f.Queue.Reserve(f.Binding).Single();f.Queue.Confirm(new(row.OperationId,f.Owner,f.Installation,1,row.PayloadHash,row.LeaseId!,row.Attempts,Id(),"2026-10-28T00:00:00.000Z"));
+            var confirmed=f.Queue.Get(f.Owner,row.OperationId);Check(f.Pass().All(p=>p.Consistent));Check(f.Queue.Get(f.Owner,row.OperationId)==confirmed);
+        });
+        Case("existing live origin is preserved by historical backfill without conflicts or rewrite",f=>{
+            f.Pass(origin:"live_capture");var before=f.Operations();Check(f.Pass().All(p=>p.Consistent));Check(before.SequenceEqual(f.Operations()));
+        });
+        Case("same source revision with contradictory payload is diagnosed and not overwritten",f=>{
+            f.Pass();var before=f.Operations();f.Sql("UPDATE saved_games SET content_version='contradiction';");var pages=f.Pass();
+            Check(pages.Any(p=>p.Diagnostics.ContainsKey("OUTBOX_CONFLICT")) && before.SequenceEqual(f.Operations()));
+        });
+        Case("environment inconsistent with immutable decision is reported without repair",f=>{
+            f.Decide(0);f.Sql("UPDATE environmental_state SET state_kind='degraded' WHERE biome_id='ocean';");
+            var before=f.DomainDigest();var pages=f.Pass();Check(pages.Any(p=>p.Diagnostics.ContainsKey("SOURCE_CONTENT_CONFLICT")) && before==f.DomainDigest() && f.Operations().Length==0);
+        });
+        Case("missing outbox after committed source is reconstructed by stable source key",f=>{
+            Check(f.Operations().Length==0);f.Decide(0);Check(f.Pass().All(p=>p.Consistent));Check(f.Operations().Length==1);
+        });
+        Case("outbox entry with deleted event source is explicitly diagnosed as orphaned",f=>{
+            f.Telemetry();f.Pass();f.Sql("DELETE FROM gameplay_events WHERE event_id='"+f.Death+"';");
+            var before=f.Operations();var pages=f.Pass();Check(pages.Any(p=>p.Diagnostics.ContainsKey("ORPHANED_OUTBOX")) && before.SequenceEqual(f.Operations()));
+        },events:true);
+        Case("multiple game revisions survive and old snapshot limitations are explicit",f=>{
+            f.Pass();var first=f.Operations().Single();f.Decide(0);Check(f.Pass().All(p=>p.Consistent));
+            Check(f.Operations().Count(o=>o.Type=="game.report")==2 && f.Queue.Get(f.Owner,first.OperationId)==first && f.Pass().Sum(p=>p.HistoricalSnapshots)>0);
+        });
+        Case("older snapshots still detect contradictions in immutable source metadata",f=>{
+            f.Pass();f.Decide(0);f.Sql("UPDATE saved_games SET content_version='contradiction';");
+            var pages=f.Pass();Check(pages.Any(p=>p.Diagnostics.ContainsKey("SOURCE_CONTENT_CONFLICT")));
+        });
+        Case("history prior to telemetry creates reports only and keeps unknown distinct from zero",f=>{
+            f.Final(true);Check(f.Pass().All(p=>p.Consistent));var ops=f.Operations();
+            Check(ops.Length==1 && ops[0].CanonicalEnvelope.Contains("\"historicalCoverageUnknown\":true") &&
+                !ops[0].CanonicalEnvelope.Contains("deaths") && f.Number("SELECT count(*) FROM sqlite_master WHERE name='gameplay_sessions';")==0);
+        });
+        Case("instrumented history exports only actually measured events and intervals",f=>{
+            f.Telemetry();long originalEvents=f.Number("SELECT count(*) FROM gameplay_events;");var before=f.DomainDigest();
+            f.Pass();Check(f.Number("SELECT count(*) FROM gameplay_events;")==originalEvents && before==f.DomainDigest() &&
+                f.Operations().Count(o=>o.Type=="gameplay.interval")==1);
+        },events:true);
+        Case("outbox failure cannot undo an already confirmed domain decision",f=>{
+            f.Decide(0);var before=f.DomainDigest();var result=new SyntheticOutboxReconciler(f.Db,()=>Time,()=>throw new SaveException("private-fault")).ReconcilePage(f.Binding);
+            Check(!result.Committed && result.Inserted==0 && result.Diagnostics.ContainsKey("RECONCILIATION_FAILED") &&
+                f.DomainDigest()==before && f.Operations().Length==0 && f.Pass().All(p=>p.Consistent));
+        });
+        Case("capacity error rolls back reconciliation page but preserves domain and diagnostic",f=>{
+            f.Telemetry();var before=f.DomainDigest();var page=new SyntheticOutboxReconciler(f.Db,()=>Time,capacity:1).ReconcilePage(f.Binding);
+            Check(!page.Committed && page.Diagnostics.ContainsKey("OUTBOX_FULL") && f.Operations().Length==0 && before==f.DomainDigest());
+        },events:true);
+        Case("temporarily busy SQLite returns controlled diagnostic and subsequent retry works",f=>{
+            using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false)){
+                var page=f.Reconciler.ReconcilePage(f.Binding);Check(!page.Committed && page.Diagnostics.ContainsKey("STORAGE_BUSY"));
+            }
+            Check(f.Pass().All(p=>p.Consistent));
+        });
+        Case("missing source file returns a controlled diagnostic without recreating it",f=>{
+            File.Delete(f.Db.Path);var p=f.Reconciler.ReconcilePage(f.Binding);Check(!p.Committed && p.Diagnostics.ContainsKey("NOT_FOUND") && !File.Exists(f.Db.Path));
+        });
+        Case("progress decisions consequences final and history are unchanged by a full pass",f=>{
+            f.Final(true);var before=f.DomainDigest();f.Pass();Check(before==f.DomainDigest());
+        });
+        Case("a successful page records queue only and never generates remote confirmation",f=>{
+            f.Telemetry();f.Pass();Check(f.Operations().All(o=>o.State==OutboxDeliveryState.Pending && o.Attempts==0 && o.ReceiptJson is null));
+        },events:true);
+        Case("new dependent events require session game and animal-run reports before reservation",f=>{
+            f.Telemetry();f.Pass();var death=f.Operations().Single(o=>o.SourceId==f.Death);
+            Check(f.Number("SELECT count(*) FROM sync_dependencies WHERE operation_id='"+death.OperationId+"';")==3);
+            Check(f.Queue.Reserve(f.Binding).All(o=>o.Type=="game.report" || o.Type=="session.report" && o.SourceKey.EndsWith(":open",StringComparison.Ordinal)));
+        },events:true);
+        Case("page boundary inserts missing prerequisites in the same transaction",f=>{
+            f.Telemetry();SyncReconciliationCursor? cursor=null;int count=0;
+            do{var p=f.Reconciler.ReconcilePage(f.Binding,1,cursor);Check(p.Consistent && p.Examined<=1);cursor=p.Next;Check(++count<100);}while(cursor is not null);
+            Check(f.Operations().Any(o=>o.SourceId==f.Death));
+        },events:true);
+        Case("a caller can restart pagination from zero without lost or duplicated sources",f=>{
+            f.Telemetry();var page=f.Reconciler.ReconcilePage(f.Binding,1);Check(page.Committed && page.Next is not null);
+            var first=f.Operations().Select(o=>o.OperationId).ToArray();f.Pass(1);
+            Check(first.All(id=>f.Operations().Any(o=>o.OperationId==id)) && f.Operations().Select(o=>o.SourceKey).Distinct().Count()==f.Operations().Length);
+        },events:true);
+        Case("cursor is scoped to the same owner installation generation and origin",f=>{
+            var cursor=f.Reconciler.ReconcilePage(f.Binding,1).Next!;
+            var bad=f.Reconciler.ReconcilePage(new(f.Owner,Id(),1),1,cursor);
+            Check(!bad.Committed && bad.Diagnostics.ContainsKey("INVALID_RECONCILIATION_CURSOR"));
+        });
+        Case("rejected queue state remains visible until explicit review",f=>{
+            f.Pass();var row=f.Queue.Reserve(f.Binding).Single();f.Queue.Reject(f.Owner,row.OperationId,row.LeaseId!,row.Attempts,"invalid_fact");
+            var pages=f.Pass();Check(pages.Any(p=>p.Diagnostics.ContainsKey("PERMANENT_FAILURE_REQUIRES_REVIEW")) &&
+                f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.PermanentFailure);
+        });
+        Case("legacy dependency omission is reported without editing previously captured rows",f=>{
+            f.Telemetry();f.Queue.RegisterInstallation(f.Binding);
+            f.Queue.Capture(new(Id(),f.Binding,new(SyncFactKind.GameplayEvent,f.Death)));
+            var before=f.Operations().Single();var pages=f.Pass();
+            Check(pages.Any(p=>p.Diagnostics.ContainsKey("DEPENDENCY_COVERAGE_INCOMPLETE")) && f.Queue.Get(f.Owner,before.OperationId)==before);
+        },events:true);
+        Case("a last clean audit page cannot hide a conflict from an earlier capture page",f=>{
+            f.Pass();f.Sql("UPDATE saved_games SET content_version='contradiction';");var pages=f.Pass(1);
+            Check(pages.Last().Completed && !pages.Last().Consistent && pages.Last().Diagnostics.ContainsKey("PRIOR_PAGE_REQUIRES_REVIEW"));
+        });
+        Case("legacy session event duplication is diagnosed without deleting earlier queue rows",f=>{
+            var events=new GameplayEventService(f.Db);string session=Id(),eventId=Id();
+            events.RecordEvent(new(eventId,f.Owner,session,GameplayEventKind.SESSION_STARTED,Time,0));
+            f.Queue.RegisterInstallation(f.Binding);var old=f.Queue.Capture(new(Id(),f.Binding,new(SyncFactKind.GameplayEvent,eventId))).Operation;
+            var pages=f.Pass();Check(pages.Any(p=>p.Diagnostics.ContainsKey("LEGACY_SESSION_EVENT_DUPLICATE")) && f.Queue.Get(f.Owner,old.OperationId)==old);
+        },events:true);
+        Case("failure after confirmed closure cannot change final or historical progress",f=>{
+            f.Final(true);var before=f.DomainDigest();
+            var page=new SyntheticOutboxReconciler(f.Db,()=>Time,()=>throw new SaveException("TEST_FAILURE")).ReconcilePage(f.Binding);
+            Check(!page.Committed && before==f.DomainDigest() && f.Save.LoadGame(f.Owner,f.Game).Game.Status=="completed" && f.Operations().Length==0);
+        });
+        Case("inconsistent source cannot leave partial child dependencies and scan still diagnoses independent facts",f=>{
+            f.Telemetry();f.Sql("UPDATE environmental_state SET state_kind='degraded' WHERE biome_id='ocean';");
+            var before=f.DomainDigest();var pages=f.Pass();Check(pages.Any(p=>p.Diagnostics.ContainsKey("SOURCE_CONTENT_CONFLICT")) && before==f.DomainDigest());
+            Check(f.Operations().All(o=>o.Type=="session.report") && f.Number("SELECT count(*) FROM pragma_foreign_key_check;")==0);
+        },events:true);
+        Case("schema versions and checksums are unchanged by reconciliation",f=>{
+            long migrationCount=f.Number("SELECT count(*) FROM schema_migrations;");
+            f.Pass();Check(SchemaManager.ReadVersion(f.Db)==2 && migrationCount==f.Number("SELECT count(*) FROM schema_migrations;"));
+            SyncOutboxSchema.Verify(f.Db);GameplayEventSchema.Verify(f.Db);
+        },events:true);
+        Case("prepared same-transaction page never claims commit and rolls back together with a synthetic source",f=>{
+            string session=Id();
+            using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false)){
+                var r=new SQLiteRepository(c,tx);
+                r.Execute("INSERT INTO gameplay_sessions VALUES($s,$p,$at,'open',NULL,NULL);",("$s",session),("$p",f.Owner),("$at",Time.ToString("O")));
+                var prepared=SyntheticOutboxReconciler.PrepareSyntheticPage(r,f.Binding,Time);
+                Check(!prepared.Committed && prepared.Inserted==2);tx.Rollback();
+            }
+            Check(f.Operations().Length==0 && f.Number("SELECT count(*) FROM gameplay_sessions;")==0 && f.Number("SELECT count(*) FROM sync_installations;")==0);
+        },events:true);
+        Case("sanitized diagnostic never contains display name payload paths or local IDs",f=>{
+            f.Pass();var page=f.Reconciler.ReconcilePage(f.Binding);
+            foreach(string secret in new[]{f.Owner,f.Game,f.Installation,f.Db.Path,"Synthetic private display name","payload","credential"})
+                Check(!page.DiagnosticSummary.Contains(secret,StringComparison.OrdinalIgnoreCase));
+        });
+        Case("assembly introduces no HTTP Atlas JWT or Godot dependency",f=>{
+            Check(typeof(SyntheticOutboxReconciler).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "System.Net.Http" and not "GodotSharp" &&
+                !(a.Name??"").Contains("Mongo") && !(a.Name??"").Contains("Jwt")));
+        });
+        await AsyncCase("independent process reconciles and another restart preserves operation IDs",async f=>{
+            f.Telemetry();Check(await Child(f,"reconcile")==0);var before=f.Operations();
+            Check(await Child(f,"reconcile")==0 && before.SequenceEqual(f.Operations()));
+        });
+        await AsyncCase("abrupt process exit during reconciliation page leaves sources intact and recovers",async f=>{
+            f.Telemetry();var before=f.DomainDigest();Check(await Child(f,"crash")==74);
+            Check(f.DomainDigest()==before && f.Operations().Length==0);Check(await Child(f,"reconcile")==0);
+            Check(f.Pass().All(p=>p.Consistent));
+        });
+        await AsyncCase("two processes reconcile same source set without duplicate operations",async f=>{
+            f.Telemetry();var codes=await Task.WhenAll(Child(f,"reconcile"),Child(f,"reconcile"));
+            Check(codes.All(c=>c is 0 or 75) && codes.Any(c=>c==0));Check(await Child(f,"reconcile")==0);
+            var ops=f.Operations();Check(ops.Select(o=>o.SourceKey).Distinct().Count()==ops.Length && f.Pass().All(p=>p.Consistent));
+        });
+        Console.WriteLine(_count+" reconciliation checks passed; synthetic only, no HTTP/Atlas/runtime activation.");return 0;
+    }
+}
+

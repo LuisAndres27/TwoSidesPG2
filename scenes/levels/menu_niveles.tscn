@@ -1,0 +1,110 @@
+[gd_scene format=3 uid="uid://bxw8mxlhurrf8"]
+
+[ext_resource type="Script" uid="uid://c0i5hetprvqe4" path="res://scripts/MenuNiveles.cs" id="1_a2jc8"]
+[ext_resource type="Script" uid="uid://cdboj737qmhu0" path="res://scripts/TarjetaNivel.cs" id="2_d5446"]
+[ext_resource type="Texture2D" uid="uid://c4fthwoyrm7e" path="res://assets/sprites/ui/TABLERO1.png" id="2_q8sr8"]
+[ext_resource type="PackedScene" uid="uid://dgjaeeca1cs4l" path="res://scenes/levels/DesicionNieve.tscn" id="3_xhmyl"]
+[ext_resource type="PackedScene" uid="uid://djv7h4apd40ge" path="res://scenes/levels/DesicionMono.tscn" id="4_8q0kq"]
+[ext_resource type="PackedScene" uid="uid://djuwmdhoubd2k" path="res://scenes/levels/DesicionDelfin.tscn" id="4_i01ny"]
+[ext_resource type="Texture2D" uid="uid://bqgobv7rtberq" path="res://assets/sprites/ui/TARJETAS_0001.png" id="4_q8sr8"]
+[ext_resource type="Texture2D" uid="uid://cs6g7qwh8arro" path="res://assets/sprites/ui/TARJETAS_0002.png" id="5_2ls6u"]
+[ext_resource type="Texture2D" uid="uid://cg4d8iprspbro" path="res://assets/sprites/ui/TARJETAS_0009.png" id="5_03q5t"]
+[ext_resource type="Texture2D" uid="uid://bo6k0x4r5f888" path="res://assets/sprites/ui/TARJETAS_0007.png" id="5_51b4h"]
+[ext_resource type="Texture2D" uid="uid://ccvusfgffkfqc" path="res://assets/sprites/ui/TARJETAS_0010.png" id="6_380w7"]
+[ext_resource type="Texture2D" uid="uid://hnkxf1j1n2hk" path="res://assets/sprites/ui/TARJETAS_0008.png" id="6_e33pw"]
+[ext_resource type="Script" uid="uid://d27kpos4abex5" path="res://scripts/EfectoBoton.cs" id="7_7q7ak"]
+[ext_resource type="PackedScene" uid="uid://caljlgt26vvaf" path="res://scenes/levels/DesicionRataCanguro.tscn" id="7_i01ny"]
+[ext_resource type="Texture2D" uid="uid://dlgcn837e7r4c" path="res://assets/sprites/ui/TARJETAS_0005.png" id="8_03q5t"]
+[ext_resource type="Texture2D" uid="uid://b2foqu7xgo8hj" path="res://assets/sprites/ui/TARJETAS_0006.png" id="9_380w7"]
+[ext_resource type="PackedScene" uid="uid://dxrqxgdvue7rt" path="res://scenes/levels/DesicionZorro.tscn" id="10_7q7ak"]
+[ext_resource type="Texture2D" uid="uid://bavp5maqadbs" path="res://assets/sprites/ui/TARJETAS_0003.png" id="11_tp36f"]
+[ext_resource type="Texture2D" uid="uid://cqhcbdv81dpf2" path="res://assets/sprites/ui/TARJETAS_0004.png" id="12_436ey"]
+[ext_resource type="Script" uid="uid://c7mqg7asc8bxd" path="res://scripts/MusicaFondo.cs" id="19_380w7"]
+[ext_resource type="AudioStream" uid="uid://038lj14r1503" path="res://assets/sprites/fondos/Music/Menu y finales/Pixel Nature Main Theme (Take 2).wav" id="20_7q7ak"]
+
+[node name="MenuNiveles" type="Control" unique_id=1259632344]
+layout_mode = 3
+anchors_preset = 0
+offset_right = 40.0
+offset_bottom = 40.0
+script = ExtResource("1_a2jc8")
+
+[node name="TextureRect" type="TextureRect" parent="." unique_id=265499471]
+layout_mode = 0
+offset_left = -14.0
+offset_top = -18.0
+offset_right = 655.0
+offset_bottom = 374.0
+texture = ExtResource("2_q8sr8")
+
+[node name="GridContainer" type="GridContainer" parent="." unique_id=1419279801]
+layout_mode = 0
+offset_left = 59.0
+offset_top = 94.0
+offset_right = 606.0
+offset_bottom = 254.0
+columns = 5
+
+[node name="TarjetaOceano" type="TextureButton" parent="GridContainer" unique_id=464466397]
+layout_mode = 2
+script = ExtResource("2_d5446")
+EscenaNivel = ExtResource("4_i01ny")
+TexturaNoJugado = ExtResource("5_03q5t")
+TexturaBuenEstado = ExtResource("5_03q5t")
+TexturaMalEstado = ExtResource("6_380w7")
+
+[node name="Efecto" type="Node" parent="GridContainer/TarjetaOceano" unique_id=362457294]
+script = ExtResource("7_7q7ak")
+
+[node name="TarjetaSelva" type="TextureButton" parent="GridContainer" unique_id=1191353836]
+layout_mode = 2
+script = ExtResource("2_d5446")
+Nivel = 1
+EscenaNivel = ExtResource("4_8q0kq")
+TexturaNoJugado = ExtResource("5_51b4h")
+TexturaBuenEstado = ExtResource("5_51b4h")
+TexturaMalEstado = ExtResource("6_e33pw")
+
+[node name="Efecto" type="Node" parent="GridContainer/TarjetaSelva" unique_id=1700950360]
+script = ExtResource("7_7q7ak")
+
+[node name="TarjetaDesierto" type="TextureButton" parent="GridContainer" unique_id=1492487184]
+layout_mode = 2
+script = ExtResource("2_d5446")
+Nivel = 2
+EscenaNivel = ExtResource("7_i01ny")
+TexturaNoJugado = ExtResource("8_03q5t")
+TexturaBuenEstado = ExtResource("8_03q5t")
+TexturaMalEstado = ExtResource("9_380w7")
+
+[node name="Efecto" type="Node" parent="GridContainer/TarjetaDesierto" unique_id=124901485]
+script = ExtResource("7_7q7ak")
+
+[node name="TarjetaBosque" type="TextureButton" parent="GridContainer" unique_id=285408904]
+layout_mode = 2
+script = ExtResource("2_d5446")
+Nivel = 3
+EscenaNivel = ExtResource("10_7q7ak")
+TexturaNoJugado = ExtResource("11_tp36f")
+TexturaBuenEstado = ExtResource("11_tp36f")
+TexturaMalEstado = ExtResource("12_436ey")
+
+[node name="Efecto" type="Node" parent="GridContainer/TarjetaBosque" unique_id=1130943761]
+script = ExtResource("7_7q7ak")
+
+[node name="TarjetaTundra" type="TextureButton" parent="GridContainer" unique_id=1892603581]
+layout_mode = 2
+script = ExtResource("2_d5446")
+Nivel = 4
+EscenaNivel = ExtResource("3_xhmyl")
+TexturaNoJugado = ExtResource("4_q8sr8")
+TexturaBuenEstado = ExtResource("4_q8sr8")
+TexturaMalEstado = ExtResource("5_2ls6u")
+
+[node name="Efecto" type="Node" parent="GridContainer/TarjetaTundra" unique_id=380089581]
+script = ExtResource("7_7q7ak")
+
+[node name="MusicaFondo" type="AudioStreamPlayer" parent="." unique_id=1171255858]
+script = ExtResource("19_380w7")
+MusicaBuena = ExtResource("20_7q7ak")
+MusicaMala = ExtResource("20_7q7ak")

@@ -1,0 +1,248 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+
+// B73: read-only inspector of the PRODUCTION save (<LocalAppData>\TwoSides\PlayerData\save.sqlite3).
+//   SaveInspector inspect --db <path> [--snapshot <file.json>]
+//   SaveInspector compare <before.json> <after.json>
+// Guarantees: the original database is only read as bytes (FileShare.ReadWrite|Delete, never written); SQLite works on a private COPY with
+// Mode=ReadOnly + query_only. The store is refused unless its ownership manifest, file identity and SQLite header are those of the production store,
+// so the developer's historical store (other purpose / other folder) can never be inspected. Player-identifying values are not printed: ids become
+// 8-hex tags of their SHA-256 and the display name is reported only as a length.
+internal sealed class Refused : Exception { public string Code { get; } public Refused(string code) : base(code) { Code = code; } }
+
+internal sealed record Ownership(int Format, string Copy, string Purpose, string FileIdentity, bool Ready);
+internal sealed record FileFacts(long Size, string Sha256, int ApplicationId, int UserVersion, bool SourceUnchanged, string[] Sidecars);
+internal sealed record Integrity(string QuickCheck, int ForeignKeyViolations);
+internal sealed record TableFacts(string Name, long Rows);
+internal sealed record ProfileFacts(int Count, string Tag, string RegistrationStatus, int DisplayNameLength, long Revision);
+internal sealed record GameFacts(string Tag, string Status, bool IsCurrent, long Revision, string ResumeKind, string? CurrentBiome, string? Ending, string RulesVersion, string SavedAt);
+internal sealed record BiomeFacts(string GameTag, string Biome, string Status, string? Result, int Attempt, string UpdatedAt);
+internal sealed record DecisionFacts(string GameTag, string Biome, string Key, string Option, long Order, string State, string IdTag, string OccurredAt);
+internal sealed record EnvFacts(string GameTag, string Biome, string? State, string? LastDecisionTag);
+internal sealed record ContinuationFacts(string GameTag, long CapturedRevision, int PayloadVersion);
+internal sealed record Snapshot(int SchemaVersion, string TakenAt, FileFacts File, Integrity Integrity, int[] Migrations, List<TableFacts> Tables,
+    ProfileFacts? Profile, List<GameFacts> Games, List<BiomeFacts> Biomes, List<DecisionFacts> Decisions, List<EnvFacts> Environments,
+    Dictionary<string, long> Operations, List<string> SettingKeys, List<ContinuationFacts> Continuations);
+
+internal static class Program
+{
+    private const string StoreId = "two-sides-player-save-v1", Purpose = "player-production-save";
+    private const int ApplicationId = 0x54535044, UserVersion = 2;
+    private static readonly string[] Allowed = { "save.sqlite3", "ownership.json", "store.lease", "save.sqlite3-journal", "save.sqlite3-wal", "save.sqlite3-shm" };
+    private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
+
+    public static int Main(string[] args)
+    {
+        try
+        {
+            if (args.Length >= 3 && args[0] == "inspect" && args[1] == "--db")
+            {
+                string? snapshot = null;
+                if (args.Length == 5 && args[3] == "--snapshot") snapshot = args[4];
+                else if (args.Length != 3) throw new Refused("USAGE");
+                return Inspect(args[2], snapshot);
+            }
+            if (args.Length == 3 && args[0] == "compare") return Compare(args[1], args[2]);
+            Console.WriteLine("usage: SaveInspector inspect --db <path> [--snapshot <file.json>] | compare <before.json> <after.json>");
+            return 64;
+        }
+        catch (Refused r) { Console.WriteLine("REFUSED " + r.Code); return 2; }
+        catch (SqliteException e) { Console.WriteLine("INSPECT_FAILED sqlite " + e.SqliteErrorCode); return 3; }
+        catch (IOException e) { Console.WriteLine("INSPECT_FAILED io " + e.GetType().Name); return 3; }
+        catch (UnauthorizedAccessException) { Console.WriteLine("INSPECT_FAILED access"); return 3; }
+    }
+
+    // ---------- guards ----------
+    private static string Hex(byte[] b) => Convert.ToHexString(b);
+    private static string Tag(string id) => Hex(SHA256.HashData(Encoding.UTF8.GetBytes(id)))[..8];
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Info { public uint Attributes; public System.Runtime.InteropServices.ComTypes.FILETIME C, A, W; public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle, out Info info);
+
+    private static string Identity(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        if (!GetFileInformationByHandle(fs.SafeFileHandle, out var i)) throw new Refused("IO_ERROR");
+        return $"{i.Volume:x8}:{i.IndexHigh:x8}{i.IndexLow:x8}";
+    }
+
+    private static string Guard(string db)
+    {
+        if (!Path.IsPathFullyQualified(db)) throw new Refused("UNSAFE_PATH");
+        string full = Path.GetFullPath(db), dir = Path.GetDirectoryName(full)!;
+        string[] parts = full.Split(Path.DirectorySeparatorChar);
+        if (!string.Equals(Path.GetFileName(full), "save.sqlite3", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(Path.GetFileName(dir), "PlayerData", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(Path.GetFileName(Path.GetDirectoryName(dir)!), "TwoSides", StringComparison.OrdinalIgnoreCase)) throw new Refused("NOT_PRODUCTION_PATH");
+        if (parts.Any(p => p.Equals("runtime-game", StringComparison.OrdinalIgnoreCase) || p.Equals(".work", StringComparison.OrdinalIgnoreCase)
+            || p.StartsWith("OneDrive", StringComparison.OrdinalIgnoreCase))) throw new Refused("UNSAFE_PATH");
+        if (!File.Exists(full) || !Directory.Exists(dir)) throw new Refused("STORE_MISSING");
+        if ((File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0 || (File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0) throw new Refused("UNSAFE_PATH");
+        foreach (string entry in Directory.GetFileSystemEntries(dir))
+        {
+            if (!Allowed.Contains(Path.GetFileName(entry), StringComparer.Ordinal) || Directory.Exists(entry)
+                || (File.GetAttributes(entry) & FileAttributes.ReparsePoint) != 0) throw new Refused("UNKNOWN_FILE");
+        }
+        string manifest = Path.Combine(dir, "ownership.json");
+        if (!File.Exists(manifest) || new FileInfo(manifest).Length > 1024) throw new Refused("OWNERSHIP_MISSING");
+        Ownership? owner;
+        try { owner = JsonSerializer.Deserialize<Ownership>(File.ReadAllText(manifest)); } catch (JsonException) { throw new Refused("OWNERSHIP_INVALID"); }
+        if (owner is null || owner.Format != 1 || owner.Copy != StoreId || owner.Purpose != Purpose || !owner.Ready) throw new Refused("OWNERSHIP_INVALID");
+        if (!string.Equals(owner.FileIdentity, Identity(full), StringComparison.Ordinal)) throw new Refused("IDENTITY_MISMATCH");
+        byte[] head = new byte[100];
+        using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            if (fs.Read(head, 0, 100) != 100) throw new Refused("NOT_SQLITE");
+        if (Encoding.ASCII.GetString(head, 0, 15) != "SQLite format 3" || head[15] != 0) throw new Refused("NOT_SQLITE");
+        int appId = (head[68] << 24) | (head[69] << 16) | (head[70] << 8) | head[71], userVersion = (head[60] << 24) | (head[61] << 16) | (head[62] << 8) | head[63];
+        if (appId != ApplicationId) throw new Refused("APPLICATION_ID_MISMATCH");
+        if (userVersion != UserVersion) throw new Refused("SCHEMA_VERSION_UNSUPPORTED");
+        return full;
+    }
+
+    private static string HashFile(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return Hex(SHA256.HashData(fs));
+    }
+
+    // ---------- inspect ----------
+    private static int Inspect(string dbArg, string? snapshotPath)
+    {
+        string db = Guard(dbArg);
+        if (snapshotPath is not null)
+        {
+            string sp = Path.GetFullPath(snapshotPath);
+            if (sp.StartsWith(Path.GetDirectoryName(db)! + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new Refused("SNAPSHOT_INSIDE_STORE");
+        }
+        string tmp = Path.Combine(Path.GetTempPath(), "TwoSidesInspect-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmp);
+        try
+        {
+            string before = HashFile(db);
+            string copy = Path.Combine(tmp, "copy.sqlite3");
+            var sidecars = new List<string>();
+            CopyShared(db, copy);
+            foreach (string suffix in new[] { "-journal", "-wal" })
+                if (File.Exists(db + suffix)) { sidecars.Add(suffix + ":" + new FileInfo(db + suffix).Length); CopyShared(db + suffix, copy + suffix); }
+            string after = HashFile(db);
+            Snapshot snap = Read(copy, new FileFacts(new FileInfo(db).Length, before, ApplicationId, UserVersion, before == after, sidecars.ToArray()));
+            Print(snap);
+            if (snapshotPath is not null) { File.WriteAllText(snapshotPath, JsonSerializer.Serialize(snap, Json), new UTF8Encoding(false)); Console.WriteLine("snapshot written: " + snapshotPath); }
+            return snap.Integrity.QuickCheck == "ok" && snap.Integrity.ForeignKeyViolations == 0 && snap.File.SourceUnchanged ? 0 : 5;
+        }
+        finally
+        {
+            foreach (string f in Directory.EnumerateFiles(tmp)) File.Delete(f);
+            Directory.Delete(tmp);
+        }
+    }
+
+    private static void CopyShared(string from, string to)
+    {
+        using var src = new FileStream(from, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var dst = new FileStream(to, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        src.CopyTo(dst);
+    }
+
+    private static List<object?[]> Rows(SqliteConnection c, string sql)
+    {
+        using var cmd = c.CreateCommand(); cmd.CommandText = sql;
+        using var r = cmd.ExecuteReader(); var list = new List<object?[]>();
+        while (r.Read()) { var row = new object?[r.FieldCount]; for (int i = 0; i < row.Length; i++) row[i] = r.IsDBNull(i) ? null : r.GetValue(i); list.Add(row); }
+        return list;
+    }
+    private static string S(object? o) => Convert.ToString(o, System.Globalization.CultureInfo.InvariantCulture) ?? "";
+    private static long L(object? o) => Convert.ToInt64(o, System.Globalization.CultureInfo.InvariantCulture);
+
+    private static Snapshot Read(string copy, FileFacts file)
+    {
+        var cs = new SqliteConnectionStringBuilder { DataSource = copy, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString();
+        using var c = new SqliteConnection(cs); c.Open();
+        using (var q = c.CreateCommand()) { q.CommandText = "PRAGMA query_only=ON;"; q.ExecuteNonQuery(); }
+        string quick = S(Rows(c, "PRAGMA quick_check;").FirstOrDefault()?[0]);
+        int fk = Rows(c, "PRAGMA foreign_key_check;").Count;
+        int[] migrations = Rows(c, "SELECT version FROM schema_migrations ORDER BY version;").Select(r => (int)L(r[0])).ToArray();
+        var tables = new List<TableFacts>();
+        foreach (var t in Rows(c, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"))
+            tables.Add(new TableFacts(S(t[0]), L(Rows(c, "SELECT count(*) FROM \"" + S(t[0]).Replace("\"", "\"\"") + "\";")[0][0])));
+        ProfileFacts? profile = null;
+        var pr = Rows(c, "SELECT local_player_id,registration_status,length(display_name),revision FROM local_profiles;");
+        if (pr.Count > 0) profile = new ProfileFacts(pr.Count, Tag(S(pr[0][0])), S(pr[0][1]), (int)L(pr[0][2]), L(pr[0][3]));
+        var games = Rows(c, "SELECT game_id,status,is_current,revision,resume_kind,current_biome_id,ending,rules_version,saved_at FROM saved_games ORDER BY created_at,game_id;")
+            .Select(r => new GameFacts(Tag(S(r[0])), S(r[1]), L(r[2]) == 1, L(r[3]), S(r[4]), r[5] is null ? null : S(r[5]), r[6] is null ? null : S(r[6]), S(r[7]), S(r[8]))).ToList();
+        var biomes = Rows(c, "SELECT game_id,biome_id,status,result,attempt_number,updated_at FROM biome_progress ORDER BY game_id,biome_id;")
+            .Select(r => new BiomeFacts(Tag(S(r[0])), S(r[1]), S(r[2]), r[3] is null ? null : S(r[3]), (int)L(r[4]), S(r[5]))).ToList();
+        var decisions = Rows(c, "SELECT game_id,biome_id,decision_key,option_id,decision_order,coalesce(json_extract(consequences_json,'$.stateKind'),''),decision_id,occurred_at FROM environmental_decisions ORDER BY game_id,decision_order;")
+            .Select(r => new DecisionFacts(Tag(S(r[0])), S(r[1]), S(r[2]), S(r[3]), L(r[4]), S(r[5]), Tag(S(r[6])), S(r[7]))).ToList();
+        var envs = Rows(c, "SELECT game_id,biome_id,state_kind,last_decision_id FROM environmental_state ORDER BY game_id,biome_id;")
+            .Select(r => new EnvFacts(Tag(S(r[0])), S(r[1]), r[2] is null ? null : S(r[2]), r[3] is null ? null : Tag(S(r[3])))).ToList();
+        var ops = Rows(c, "SELECT operation_kind,count(*) FROM local_operations GROUP BY operation_kind ORDER BY operation_kind;").ToDictionary(r => S(r[0]), r => L(r[1]));
+        var settings = Rows(c, "SELECT setting_key FROM local_settings ORDER BY setting_key;").Select(r => S(r[0])).ToList();
+        var conts = Rows(c, "SELECT game_id,captured_revision,payload_version FROM continuation_snapshots ORDER BY game_id;").Select(r => new ContinuationFacts(Tag(S(r[0])), L(r[1]), (int)L(r[2]))).ToList();
+        return new Snapshot(1, DateTimeOffset.UtcNow.ToString("O"), file, new Integrity(quick, fk), migrations, tables, profile, games, biomes, decisions, envs, ops, settings, conts);
+    }
+
+    private static void Print(Snapshot s)
+    {
+        Console.WriteLine("== SaveInspector (read-only, works on a private copy) ==");
+        Console.WriteLine($"file: {s.File.Size} bytes, sha256 {s.File.Sha256}, application_id 0x{s.File.ApplicationId:X8}, user_version {s.File.UserVersion}");
+        Console.WriteLine($"source unchanged during inspection: {s.File.SourceUnchanged}; pending sidecars: {(s.File.Sidecars.Length == 0 ? "none" : string.Join(",", s.File.Sidecars))}");
+        Console.WriteLine($"integrity: quick_check={s.Integrity.QuickCheck}, foreign_key_violations={s.Integrity.ForeignKeyViolations}; migrations: {string.Join(",", s.Migrations)}");
+        Console.WriteLine("tables: " + string.Join(", ", s.Tables.Select(t => t.Name + "=" + t.Rows)));
+        bool outbox = s.Tables.Any(t => t.Name.StartsWith("sync_", StringComparison.Ordinal)), events = s.Tables.Any(t => t.Name.StartsWith("gameplay_", StringComparison.Ordinal));
+        Console.WriteLine($"outbox tables present: {outbox}; gameplay-event tables present: {events}");
+        Console.WriteLine(s.Profile is null ? "profile: NONE" : $"profile: {s.Profile.Count} (tag {s.Profile.Tag}), status {s.Profile.RegistrationStatus}, display name length {s.Profile.DisplayNameLength}, revision {s.Profile.Revision}");
+        foreach (var g in s.Games) Console.WriteLine($"game {g.Tag}: status={g.Status} current={g.IsCurrent} revision={g.Revision} resume={g.ResumeKind} biome={g.CurrentBiome ?? "-"} ending={g.Ending ?? "-"} rules={g.RulesVersion} saved_at={g.SavedAt}");
+        foreach (var b in s.Biomes) Console.WriteLine($"  biome {b.Biome}: {b.Status} result={b.Result ?? "-"} attempts={b.Attempt} updated={b.UpdatedAt}");
+        Console.WriteLine($"decisions: {s.Decisions.Count}");
+        foreach (var d in s.Decisions) Console.WriteLine($"  #{d.Order} {d.Biome}/{d.Key}: option={d.Option} state={d.State} tag={d.IdTag} at={d.OccurredAt}");
+        foreach (var e in s.Environments) Console.WriteLine($"  environment {e.Biome}: {e.State ?? "-"} last_decision={e.LastDecisionTag ?? "-"}");
+        Console.WriteLine("operations: " + (s.Operations.Count == 0 ? "none" : string.Join(", ", s.Operations.Select(o => o.Key + "=" + o.Value))));
+        Console.WriteLine("settings keys: " + (s.SettingKeys.Count == 0 ? "none" : string.Join(",", s.SettingKeys)) + "; continuation snapshots: " + s.Continuations.Count);
+        bool delfinSaved = s.Decisions.Any(d => d.Biome == "ocean");
+        Console.WriteLine("dolphin (ocean) decision saved: " + delfinSaved);
+    }
+
+    // ---------- compare ----------
+    private static int Rank(string status) => status switch { "human_pending" => 0, "animal_pending" => 1, "completed" => 2, _ => -1 };
+
+    private static int Compare(string beforePath, string afterPath)
+    {
+        Snapshot a = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(beforePath)) ?? throw new Refused("SNAPSHOT_INVALID");
+        Snapshot b = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(afterPath)) ?? throw new Refused("SNAPSHOT_INVALID");
+        var issues = new List<string>();
+        if (a.Profile?.Tag != b.Profile?.Tag) issues.Add("profile changed or disappeared");
+        if (b.Integrity.QuickCheck != "ok" || b.Integrity.ForeignKeyViolations != 0) issues.Add("integrity check failed after");
+        foreach (var g in a.Games) { var n = b.Games.FirstOrDefault(x => x.Tag == g.Tag); if (n is null) issues.Add("game " + g.Tag + " missing"); else if (n.Revision < g.Revision) issues.Add("game " + g.Tag + " revision decreased"); }
+        foreach (var d in a.Decisions)
+        {
+            var n = b.Decisions.FirstOrDefault(x => x.GameTag == d.GameTag && x.Biome == d.Biome && x.Key == d.Key);
+            if (n is null) issues.Add("decision " + d.Biome + "/" + d.Key + " missing");
+            else if (n != d) issues.Add("decision " + d.Biome + "/" + d.Key + " changed");
+        }
+        foreach (var x in a.Biomes)
+        {
+            var n = b.Biomes.FirstOrDefault(y => y.GameTag == x.GameTag && y.Biome == x.Biome);
+            if (n is null) issues.Add("biome " + x.Biome + " missing");
+            else if (Rank(n.Status) < Rank(x.Status) && n.Attempt <= x.Attempt) issues.Add("biome " + x.Biome + " regressed " + x.Status + "->" + n.Status);
+        }
+        foreach (var o in a.Operations) if (!b.Operations.TryGetValue(o.Key, out long v) || v < o.Value) issues.Add("operations '" + o.Key + "' decreased");
+        Console.WriteLine("== SaveInspector compare ==");
+        Console.WriteLine($"decisions: {a.Decisions.Count} -> {b.Decisions.Count}; games: {a.Games.Count} -> {b.Games.Count}; biomes: {a.Biomes.Count} -> {b.Biomes.Count}");
+        foreach (var d in b.Decisions.Where(d => !a.Decisions.Any(x => x.GameTag == d.GameTag && x.Biome == d.Biome && x.Key == d.Key))) Console.WriteLine($"  added decision: {d.Biome}/{d.Key} option={d.Option} state={d.State}");
+        foreach (var x in b.Biomes) { var o = a.Biomes.FirstOrDefault(y => y.GameTag == x.GameTag && y.Biome == x.Biome); if (o is null) Console.WriteLine($"  new biome row: {x.Biome} {x.Status}"); else if (o.Status != x.Status || o.Attempt != x.Attempt) Console.WriteLine($"  biome {x.Biome}: {o.Status} -> {x.Status}"); }
+        foreach (var g in b.Games) { var o = a.Games.FirstOrDefault(y => y.Tag == g.Tag); if (o is not null && o.Revision != g.Revision) Console.WriteLine($"  game {g.Tag} revision {o.Revision} -> {g.Revision}"); }
+        foreach (string i in issues) Console.WriteLine("ISSUE: " + i);
+        Console.WriteLine(issues.Count == 0 ? "PERSISTENCE VERDICT: PRESERVED" : "PERSISTENCE VERDICT: ISSUES (" + issues.Count + ")");
+        return issues.Count == 0 ? 0 : 4;
+    }
+}

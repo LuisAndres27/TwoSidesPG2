@@ -1,0 +1,166 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class GameplayObserverChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static void Check(bool ok){if(!ok)throw new Exception("Gameplay observer assertion failed");}
+    internal sealed class Store:IGameplayTelemetryStore
+    {
+        internal readonly GameplayEventService Service;
+        internal bool Fail,LostResponse,Hang;
+        internal readonly List<GameplayEvent> Attempts=new();
+        internal readonly List<GameplayInterval> IntervalAttempts=new();
+        internal TaskCompletionSource<bool>? Gate;
+        internal Store(ISaveDatabase db)=>Service=new(db);
+        public Task<LocalSaveResult<IReadOnlyList<GameplaySession>>> ReadSessionsAsync(string owner)=>Task.FromResult(new LocalSaveResult<IReadOnlyList<GameplaySession>>(true,"SESSIONS",Service.GetSessions(owner)));
+        public async Task<LocalSaveResult<GameplayWriteReceipt>> WriteEventAsync(GameplayEvent value)
+        {
+            lock(Attempts)Attempts.Add(value);
+            if(Hang){Gate??=new();await Gate.Task;}
+            if(Fail)return new(false,"IO_ERROR");
+            try{var r=Service.RecordEvent(value);if(LostResponse){LostResponse=false;return new(false,"IO_ERROR");}return new(true,"EVENT",r);}catch(SaveException e){return new(false,e.Code);}
+        }
+        public Task<LocalSaveResult<GameplayWriteReceipt>> WriteIntervalAsync(GameplayInterval value)
+        {
+            lock(IntervalAttempts)IntervalAttempts.Add(value);
+            if(Fail)return Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(false,"IO_ERROR"));
+            try{return Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(true,"INTERVAL",Service.RecordInterval(value)));}catch(SaveException e){return Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(false,e.Code));}
+        }
+        public Task<LocalSaveResult<GameplayWriteReceipt>> InterruptAsync(string owner,string session,string eventId,DateTimeOffset discovered)
+        {try{return Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(true,"INTERRUPTED",Service.InterruptSession(owner,session,eventId,discovered)));}catch(SaveException e){return Task.FromResult(new LocalSaveResult<GameplayWriteReceipt>(false,e.Code));}}
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly string Owner=Id(),Game=Id();
+        internal readonly GameSaveService Save;
+        internal readonly Store Store;
+        internal long Now;
+        internal readonly List<string> Diagnostics=new();
+        internal LocalGameplayObserver Observer;
+        internal F()
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState());
+            Save.CreateLocalProfile(Id(),Owner,"Observador sintético");Save.CreateNewGame(new(Id(),Owner,Game));
+            for(int i=0;i<5;i++){var g=Save.LoadGame(Owner,Game).Game;Save.EnterBiome(new(Id(),Owner,Game,g.Revision,Biomes[i],"human"));g=Save.LoadGame(Owner,Game).Game;Save.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,Biomes[i],Keys[i],i%2==0?"reject":"approve",i%2==0?"healthy":"degraded",i%2==0?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));}
+            GameplayEventSchema.MigrateSynthetic(Db);Store=new(Db);Observer=NewObserver();
+        }
+        internal LocalGameplayObserver NewObserver()=>new(Store,()=>Now,()=>DateTimeOffset.UnixEpoch.AddMilliseconds(Now),s=>{lock(Diagnostics)Diagnostics.Add(s);});
+        internal async Task Start(){await Observer.InitializeAsync(Owner);await Observer.DrainAsync();}
+        internal void Animal(int i=0,string token="scene-1"){Observer.AnimalStarted(Game,Biomes[i],token);Observer.Observe(true,false,false,true);}
+        internal GameplayTotals Totals(string? biome=null)=>Store.Service.GetTotals(Owner,Game,biome);
+        internal long Count(GameplayEventKind kind)=>Store.Service.GetEvents(Owner).LongCount(e=>e.Kind==kind);
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work)
+    {using var f=new F();await work(f);await f.Observer.CloseAsync();_count++;Console.WriteLine("PASS "+name);}
+    public static async Task<int> Run()
+    {
+        await Case("one local session per execution despite repeated initialization",async f=>
+        {await f.Start();string? id=f.Observer.SessionId;await f.Observer.InitializeAsync(f.Owner);await f.Observer.DrainAsync();Check(id==f.Observer.SessionId && f.Count(GameplayEventKind.SESSION_STARTED)==1);});
+        await Case("session without active animal never creates another game",async f=>
+        {await f.Start();f.Now=30000;f.Observer.Observe(false,false,false,true);await f.Observer.DrainAsync();Check(f.Save.GetGameHistory(f.Owner).Count==1 && f.Count(GameplayEventKind.ANIMAL_SEGMENT_STARTED)==0 && f.Store.Service.GetTotals(f.Owner).EffectiveMs.Value==0);});
+        await Case("profile without active game records session without inventing one",async f=>
+        {RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);await f.Start();Check(f.Count(GameplayEventKind.SESSION_STARTED)==1 && f.Save.GetActiveGame(f.Owner) is null && f.Save.GetGameHistory(f.Owner).Count==1);});
+        for(int i=0;i<5;i++)
+        {
+            int index=i;
+            await Case("validated animal start "+Biomes[i],async f=>
+            {await f.Start();f.Animal(index);f.Now=100;f.Observer.Paused(true);await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_SEGMENT_STARTED)==1 && f.Totals(Biomes[index]).EffectiveMs.Value==100);});
+        }
+        await Case("multiple FinNivel validations of same instance start once",async f=>
+        {await f.Start();f.Animal();f.Animal();await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_SEGMENT_STARTED)==1);});
+        await Case("duplicate death notifications persist one logical death",async f=>
+        {await f.Start();f.Animal();f.Now=100;f.Observer.Died();f.Observer.Died();await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_DIED)==1 && f.Totals().EffectiveMs.Value==100);});
+        await Case("double voluntary restart retains single request ID",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.RequestRestart(false);f.Observer.RequestRestart(false);await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_RESTART_REQUESTED)==1 && f.Count(GameplayEventKind.ANIMAL_DIED)==0);});
+        await Case("Game Over retry differs from death and voluntary request",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.Died();f.Now=20;f.Observer.RequestRestart(true);f.Observer.RequestRestart(true);await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_DIED)==1 && f.Count(GameplayEventKind.ANIMAL_RETRY_REQUESTED)==1 && f.Count(GameplayEventKind.ANIMAL_RESTART_REQUESTED)==0);});
+        await Case("new scene confirms a distinct start after request not before navigation",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.RequestRestart(false);await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_SEGMENT_STARTED)==1);f.Now=20;f.Observer.AnimalStarted(f.Game,"ocean","scene-2");f.Observer.Observe(true,false,false,true);f.Now=30;f.Observer.Paused(true);await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_SEGMENT_STARTED)==2 && f.Totals().EffectiveMs.Value==20);});
+        await Case("failed navigation cannot be counted as successful restart",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.RequestRestart(false);f.Observer.NavigationFailed();f.Now=100;f.Observer.Observe(true,true,false,true);await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_SEGMENT_STARTED)==1 && f.Totals().Restarts.Value==1 && f.Count(GameplayEventKind.ANIMAL_SEGMENT_EXITED)==0 && f.Observer.Incomplete);});
+        await Case("pause and resume use disjoint intervals",async f=>
+        {await f.Start();f.Animal();f.Now=100;f.Observer.Paused(true);f.Now=200;f.Observer.Paused(false);f.Now=300;f.Observer.Leave();await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==200 && f.Totals().PausedMs.Value==100);});
+        await Case("Game Over and retry loading do not add effective time",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.Died();f.Now=500;f.Observer.Observe(true,true,false,true);f.Observer.RequestRestart(true);f.Now=1000;f.Observer.Leave();await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==10 && f.Count(GameplayEventKind.ANIMAL_DIED)==1);});
+        await Case("level menu main menu and statistics share excluded menu state",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.Leave();f.Now=30010;f.Observer.Observe(false,false,false,true);await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==10 && f.Store.Service.GetTotals(f.Owner).RecordedElapsedMs.Value==30010);});
+        await Case("free biome navigation keeps distinct effective subtotals",async f=>
+        {await f.Start();f.Animal(3);f.Now=10;f.Observer.Leave();f.Animal(0,"ocean-scene");f.Now=40;f.Observer.Leave();await f.Observer.DrainAsync();Check(f.Totals("forest").EffectiveMs.Value==10 && f.Totals("ocean").EffectiveMs.Value==30 && f.Totals().EffectiveMs.Value==40);});
+        await Case("duplicate menu notifications produce one exit",async f=>
+        {await f.Start();f.Animal();f.Observer.Leave();f.Observer.Leave();await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.ANIMAL_SEGMENT_EXITED)==1);});
+        await Case("focus loss excludes background time",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.Observe(true,false,false,false);f.Now=1010;f.Observer.Observe(true,false,false,true);f.Now=1020;f.Observer.Leave();await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==20);});
+        await Case("blocked transition never adds active time",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.Observe(true,false,true,true);f.Now=100;f.Observer.Observe(true,false,false,true);f.Now=110;f.Observer.Leave();await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==20);});
+        await Case("heartbeat confirms active time every thirty seconds",async f=>
+        {await f.Start();f.Animal();f.Now=29999;f.Observer.Observe(true,false,false,true);await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value is null);f.Now=30000;f.Observer.Observe(true,false,false,true);await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==30000);});
+        await Case("SQLite failure does not block notifications and retries same ID",async f=>
+        {await f.Start();f.Animal();await f.Observer.DrainAsync();f.Store.Fail=true;f.Now=10;f.Observer.Died();await f.Observer.DrainAsync();Check(f.Observer.Incomplete && f.Observer.Pending>0);var interval=f.Store.IntervalAttempts.Last();f.Store.Fail=false;f.Now=5010;f.Observer.Observe(true,true,false,true);await f.Observer.DrainAsync();Check(f.Totals().Deaths.Value==1 && f.Store.IntervalAttempts.Count(i=>i.IntervalId==interval.IntervalId)>=2 && f.Diagnostics.Count>0);});
+        await Case("lost commit response retries identical event without duplication",async f=>
+        {f.Store.LostResponse=true;await f.Start();var first=f.Store.Attempts.First();f.Now=5000;f.Observer.Observe(false,false,false,true);await f.Observer.DrainAsync();Check(f.Count(GameplayEventKind.SESSION_STARTED)==1 && f.Store.Attempts.Count(e=>e==first)>=2);});
+        await Case("slow telemetry never makes gameplay notifications wait",async f=>
+        {await f.Start();f.Store.Hang=true;f.Animal();f.Now=10;f.Observer.Died();await Task.Delay(20);Check(f.Observer.Pending>0 && f.Store.Gate is not null);f.Store.Hang=false;f.Store.Gate!.SetResult(true);await f.Observer.DrainAsync();Check(f.Totals().Deaths.Value==1);});
+        await Case("normal close commits remaining time once",async f=>
+        {await f.Start();f.Animal();f.Now=10;await f.Observer.CloseAsync();await f.Observer.CloseAsync();Check(f.Count(GameplayEventKind.SESSION_ENDED)==1 && f.Store.Service.GetSessions(f.Owner).Single().Status=="closed" && f.Totals().EffectiveMs.Value==10);});
+        await Case("successive executions keep the same game and separate sessions",async f=>
+        {await f.Start();f.Animal();f.Now=10;await f.Observer.CloseAsync();f.Observer=f.NewObserver();await f.Start();f.Animal(0,"new-process-scene");f.Now=20;await f.Observer.CloseAsync();Check(f.Store.Service.GetSessions(f.Owner).Count==2 && f.Save.GetActiveGame(f.Owner)?.Game.GameId==f.Game && f.Totals().EffectiveMs.Value==20);});
+        await Case("unexpected prior execution closes as interrupted without inventing last time",async f=>
+        {await f.Start();f.Animal();f.Now=30000;f.Observer.Observe(true,false,false,true);await f.Observer.DrainAsync();f.Now=30500;/* simulate process loss without Close */f.Observer=f.NewObserver();f.Now=40000;await f.Start();var sessions=f.Store.Service.GetSessions(f.Owner);Check(sessions.Count==2 && sessions.Count(s=>s.Status=="interrupted")==1 && f.Store.Service.GetTotals(f.Owner).SessionDurationMs.State==StatisticsAvailability.Unknown && f.Totals().EffectiveMs.Value==30000);});
+        await Case("all telemetry leaves decisions consequences revisions and receipts unchanged",async f=>
+        {string before=SaveValidation.Digest(f.Save.LoadGame(f.Owner,f.Game));await f.Start();f.Animal();f.Now=10;f.Observer.Died();f.Observer.RequestRestart(true);f.Animal(1,"next-instance");f.Now=20;f.Observer.RequestRestart(false);f.Observer.Leave();await f.Observer.CloseAsync();Check(SaveValidation.Digest(f.Save.LoadGame(f.Owner,f.Game))==before && f.Save.GetGameHistory(f.Owner).Count==1);});
+        await Case("invalid owner disables only telemetry with safe diagnostic",async f=>
+        {await f.Observer.InitializeAsync("invalid");Check(!f.Observer.Ready && f.Observer.Incomplete && f.Diagnostics.Contains("TELEMETRY_INITIALIZATION_FAILED") && f.Save.GetActiveGame(f.Owner) is not null);});
+        // ---- F3.1 (B48): heartbeat 30 s. The decisions, completions, pauses, focus changes and close still confirm time at the exact moment; only the idle heartbeat is longer. ----
+        await Case("F3.1 constants: thirty second heartbeat, five second write retry",f=>
+        {Check(LocalGameplayObserver.HeartbeatMs==30000 && LocalGameplayObserver.RetryDelayMs==5000);return Task.CompletedTask;});
+        await Case("F3.1 no interval is written before thirty seconds of an unchanged state and exactly one at thirty",async f=>
+        {await f.Start();f.Animal();await f.Observer.DrainAsync();int before=f.Store.IntervalAttempts.Count;
+         for(long t=1000;t<30000;t+=1000){f.Now=t;f.Observer.Observe(true,false,false,true);}
+         await f.Observer.DrainAsync();Check(f.Store.IntervalAttempts.Count==before && f.Totals().EffectiveMs.Value is null);
+         f.Now=30000;f.Observer.Observe(true,false,false,true);await f.Observer.DrainAsync();
+         Check(f.Store.IntervalAttempts.Count==before+1 && f.Totals().EffectiveMs.Value==30000);});
+        await Case("F3.1 menu pause and background heartbeats are observed time but never effective time",async f=>
+        {await f.Start();f.Now=30000;f.Observer.Observe(false,false,false,true);await f.Observer.DrainAsync();                      // menu
+         f.Animal();f.Now=30100;f.Observer.Paused(true);f.Now=60100;f.Observer.Observe(true,true,false,true);await f.Observer.DrainAsync();   // 100 ms active, 30 s paused
+         f.Now=60200;f.Observer.Paused(false);f.Now=60300;f.Observer.Observe(true,false,false,false);f.Now=90300;f.Observer.Observe(true,false,false,false);await f.Observer.DrainAsync();   // 30 s background
+         f.Now=90400;f.Observer.Observe(true,false,false,true);f.Now=90500;f.Observer.Leave();await f.Observer.DrainAsync();
+         var t=f.Totals();Check(t.EffectiveMs.Value==300);
+         Check(t.PausedMs.Value==30100 && f.Store.Service.GetTotals(f.Owner).RecordedElapsedMs.Value==90500);});
+        await Case("F3.1 focus loss minimize pause and normal close confirm the open interval immediately, with no heartbeat needed",async f=>
+        {await f.Start();f.Animal();f.Now=10;f.Observer.Observe(true,false,false,false);await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==10);            // minimize
+         f.Now=20;f.Observer.Observe(true,false,false,true);f.Now=30;f.Observer.Paused(true);await f.Observer.DrainAsync();Check(f.Totals().EffectiveMs.Value==20);        // 10 more ms after refocus
+         f.Now=40;f.Observer.Paused(false);f.Now=55;await f.Observer.CloseAsync();Check(f.Totals().EffectiveMs.Value==35 && f.Store.Service.GetSessions(f.Owner).Single().Status=="closed");});
+        await Case("F3.1 a completed biome is durable in SQLite at once and its event is persisted without waiting for a heartbeat",async f=>
+        {await f.Start();f.Animal();f.Now=10;
+         var receipt=f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,f.Save.LoadGame(f.Owner,f.Game).Game.Revision,"ocean","good"));
+         Check(f.Save.LoadGame(f.Owner,f.Game).Biomes.Single(b=>b.BiomeId=="ocean").Status=="completed");                                  // before any telemetry
+         f.Now=20;f.Observer.CompletionConfirmed(receipt.OperationId,f.Game,"ocean");await f.Observer.DrainAsync();
+         Check(f.Count(GameplayEventKind.ANIMAL_SEGMENT_COMPLETED)==1 && f.Totals().EffectiveMs.Value==20 && f.Store.IntervalAttempts.Count>=1);});
+        await Case("F3.1 pending telemetry survives a failing store and is delivered later with the same identifiers (nothing is lost, nothing is renumbered)",async f=>
+        {await f.Start();f.Animal();await f.Observer.DrainAsync();f.Store.Fail=true;f.Now=10;f.Observer.Died();await f.Observer.DrainAsync();
+         var interval=f.Store.IntervalAttempts.Last();Check(f.Observer.Pending>0 && f.Observer.Incomplete);
+         f.Store.Fail=false;f.Now=5010;f.Observer.Observe(true,true,false,true);await f.Observer.DrainAsync();
+         Check(f.Totals().Deaths.Value==1 && f.Store.IntervalAttempts.Count(i=>i.IntervalId==interval.IntervalId)>=2 && f.Observer.Pending==0 &&
+               f.Store.Service.GetEvents(f.Owner).Count(e=>e.Kind==GameplayEventKind.ANIMAL_DIED)==1);});
+
+        // Static hook inspection supplements pure coordinator tests; not a Godot signal execution.
+        string root=Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!;
+        var over=File.ReadAllText(Path.Combine(root,"assets/sprites/ui/GameOver.cs"));var pause=File.ReadAllText(Path.Combine(root,"assets/sprites/ui/MenuPausa.cs"));
+        Check(over.Contains("Telemetry.Died()") && over.Contains("Telemetry.RequestRestart(true)") && pause.Contains("Telemetry.RequestRestart(false)") && pause.Contains("Telemetry.Paused(true)") && pause.Contains("Telemetry.Paused(false)"));
+        Check(typeof(IGameplayTelemetryStore).GetMethods().Length==4 && typeof(LocalGameplayObserver).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "GodotSharp" and not "System.Net.Http" && !(a.Name??"").Contains("Mongo")));
+        _count++;Console.WriteLine("PASS single local hooks and no HTTP MongoDB motor completion or decision capabilities");
+        Console.WriteLine($"Gameplay observer: {_count} passed, 0 failed; controlled clocks and synthetic SQLite, not Godot runtime.");return 0;
+    }
+}

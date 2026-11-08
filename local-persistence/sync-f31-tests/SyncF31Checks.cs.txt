@@ -1,0 +1,280 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+
+// F3.1 (B49): the synchronization client budgets, WITHOUT any server process. The HTTP side is an in-process HttpMessageHandler that speaks just enough of
+// Sync v2 (registration, session, batches, receipts/query); the databases are disposable synthetic SQLite. No Express, no Caddy, no Atlas, no real saves.
+internal static class SyncF31Checks
+{
+    private static int _count;
+    private static readonly DateTimeOffset Start=DateTimeOffset.Parse("2026-10-27T12:00:00.000Z",CultureInfo.InvariantCulture);
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok,string label="check"){if(!ok)throw new Exception("F3.1 assertion failed: "+label);}
+
+    // ---- disposable game database with N independent pending operations (one open-session report each; no dependencies) ----
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly string Owner=Id(),Game=Id(),Installation=Id();
+        internal readonly GameSaveService Save;
+        internal DateTimeOffset Clock=Start;
+        internal SyncBinding Binding=>new(Owner,Installation,1);
+        internal SyncOutboxService Queue=>new(Db,()=>Clock,()=>0);
+        internal F()
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState(),()=>Start);
+            Save.CreateLocalProfile(Id(),Owner,"Synthetic F3.1");Save.CreateNewGame(new(Id(),Owner,Game));
+            GameplayEventSchema.MigrateSynthetic(Db);SyncOutboxSchema.MigrateSynthetic(Db);Queue.RegisterInstallation(Binding);
+        }
+        internal List<string> CaptureSessions(int n)
+        {
+            var ids=new List<string>();var events=new GameplayEventService(Db);
+            for(int i=0;i<n;i++)
+            {
+                string session=Id();
+                events.RecordEvent(new(Id(),Owner,session,GameplayEventKind.SESSION_STARTED,Start,0));
+                events.RecordEvent(new(Id(),Owner,session,GameplayEventKind.SESSION_ENDED,Start.AddSeconds(1),1000,SessionEnd:GameplaySessionEnd.Normal));
+                ids.Add(Queue.Capture(new(Id(),Binding,new(SyncFactKind.SessionReport,session,Phase:"open"))).Operation.OperationId);
+            }
+            return ids;
+        }
+        internal OutboxOperation Op(string id)=>Queue.Get(Owner,id)!;
+        private static string Snake(OutboxDeliveryState state)=>string.Concat(state.ToString().Select((ch,i)=>i>0&&char.IsUpper(ch)?"_"+char.ToLowerInvariant(ch):char.ToLowerInvariant(ch).ToString()));
+        internal int Count(OutboxDeliveryState state)=>Convert.ToInt32(Number("SELECT count(*) FROM sync_outbox WHERE state='"+Snake(state)+"';"));
+        internal long Number(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+        public void Dispose()=>Sandbox.Dispose();
+    }
+
+    private sealed class Ticks{internal long Ms;}
+    internal enum BatchMode{Normal,Status503NoBody,HangUntilCancelled,CommitThenDrop,Status503WithDeferred}
+    private sealed record Request(string Path,JsonElement Body);
+
+    // Speaks the Sync v2 subset the client uses. `PerOpMs` advances the fake clock by that much per operation of a batch (the dispatcher's own stopwatch).
+    private sealed class FakeServer:HttpMessageHandler
+    {
+        private readonly SyncBinding _binding;private readonly Ticks _ticks;
+        internal BatchMode Mode=BatchMode.Normal;
+        internal long PerOpMs;
+        internal readonly List<Request> Requests=new();
+        internal readonly Dictionary<string,JsonElement> Receipts=new();     // committed operations (the "database" of the fake server)
+        internal readonly List<string> Committed=new();
+        internal FakeServer(SyncBinding binding,Ticks ticks){_binding=binding;_ticks=ticks;}
+        internal IEnumerable<Request> Batches=>Requests.Where(r=>r.Path.EndsWith("/sync/batches",StringComparison.Ordinal));
+        internal IEnumerable<Request> Queries=>Requests.Where(r=>r.Path.EndsWith("/sync/receipts/query",StringComparison.Ordinal));
+        internal static string[] OperationIds(Request r)=>r.Body.GetProperty("operations").EnumerateArray().Select(o=>o.GetProperty("operationId").GetString()!).ToArray();
+        private static HttpResponseMessage Json(HttpStatusCode status,object body)=>new(status){Content=new StringContent(JsonSerializer.Serialize(body),new UTF8Encoding(false),"application/json")};
+        private JsonElement Commit(JsonElement op)
+        {
+            string id=op.GetProperty("operationId").GetString()!;
+            if(Receipts.TryGetValue(id,out var existing))return existing;
+            var receipt=JsonSerializer.SerializeToElement(new{receiptVersion=1,operationContractVersion=1,technicalAccountId=Id(),operationId=id,localPlayerId=_binding.LocalPlayerId,
+                installationId=_binding.InstallationId,bindingGeneration=1,payloadHash=op.GetProperty("payloadHash").GetString(),receiptId=Id(),committedAtUtc="2026-10-27T12:00:00.000Z",acceptedAs="committed"});
+            Receipts[id]=receipt;Committed.Add(id);return receipt;
+        }
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken cancellation)
+        {
+            string path=request.RequestUri!.AbsolutePath;
+            JsonElement body=default;
+            if(request.Content is not null){var bytes=await request.Content.ReadAsByteArrayAsync(cancellation);using var doc=JsonDocument.Parse(bytes);body=doc.RootElement.Clone();}
+            Requests.Add(new(path,body));
+            if(path.EndsWith("/technical/registrations",StringComparison.Ordinal))return Json(HttpStatusCode.Created,new{schemaVersion=2,technicalAccountId=Id()});
+            if(path.EndsWith("/technical/sessions",StringComparison.Ordinal))return Json(HttpStatusCode.OK,new{schemaVersion=2,accessToken="synthetic-token",expiresIn=900});
+            if(path.EndsWith("/sync/receipts/query",StringComparison.Ordinal))
+            {
+                var results=body.GetProperty("attempts").EnumerateArray().Select(a=>
+                {
+                    string id=a.GetProperty("operationId").GetString()!;
+                    return Receipts.TryGetValue(id,out var r)?(object)new{operationId=id,status="found",receipt=r,attempt=new{leaseId=a.GetProperty("leaseId").GetString(),attempt=a.GetProperty("attempt").GetInt32()}}
+                                                              :new{operationId=id,status="not_found"};
+                }).ToArray();
+                return Json(HttpStatusCode.OK,new{schemaVersion=2,requestId=Id(),results});
+            }
+            if(path.EndsWith("/sync/batches",StringComparison.Ordinal))
+            {
+                var ops=body.GetProperty("operations").EnumerateArray().ToArray();
+                _ticks.Ms+=PerOpMs*ops.Length;
+                if(Mode==BatchMode.HangUntilCancelled){await Task.Delay(Timeout.Infinite,cancellation);}
+                if(Mode==BatchMode.CommitThenDrop){foreach(var op in ops)Commit(op);throw new HttpRequestException("response lost after commit");}
+                if(Mode==BatchMode.Status503NoBody)return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+                if(Mode==BatchMode.Status503WithDeferred)
+                {
+                    var deferred=ops.Select((o,i)=>new{index=i,operationId=o.GetProperty("operationId").GetString(),status="deferred",httpStatus=503,error=new{code="storage_unavailable",retryable=true,retryAfterSeconds=1}}).ToArray();
+                    return Json(HttpStatusCode.ServiceUnavailable,new{schemaVersion=2,batchId=body.GetProperty("batchId").GetString(),requestId=Id(),outcome="none_accepted",results=deferred});
+                }
+                var normal=ops.Select((o,i)=>
+                {
+                    bool again=Receipts.ContainsKey(o.GetProperty("operationId").GetString()!);var receipt=Commit(o);
+                    return new{index=i,operationId=o.GetProperty("operationId").GetString(),status=again?"duplicate":"committed",httpStatus=again?200:201,receipt,
+                        attempt=new{leaseId=o.GetProperty("leaseId").GetString(),attempt=o.GetProperty("attempt").GetInt32()}};
+                }).ToArray();
+                return Json(HttpStatusCode.OK,new{schemaVersion=2,batchId=body.GetProperty("batchId").GetString(),requestId=Id(),outcome="all_accepted",results=normal});
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        }
+    }
+
+    private sealed class Client:IDisposable
+    {
+        internal readonly Ticks Time=new();
+        internal readonly FakeServer Server;
+        internal readonly SyncHttpTransport Transport;
+        internal readonly SyncSessionManager Session;
+        internal readonly SyncOutboxDispatcher Dispatcher;
+        internal Client(F f,TimeSpan? timeout=null,int initialBatch=SyncHttpOptions.InitialBatchOperations)
+        {
+            Server=new FakeServer(f.Binding,Time);
+            var options=new SyncHttpOptions(new Uri("http://127.0.0.1:9/"),timeout,allowLoopbackHttp:true);
+            Transport=new(options,Server);
+            Session=new(Transport,f.Binding,new InMemorySyncSecretStore());
+            Dispatcher=new(f.Queue,Session,f.Binding,initialBatch,SyncHttpOptions.MaxBatchOperationsLimit,()=>Time.Ms);
+        }
+        internal Task<SyncPassSummary> Pass()=>Dispatcher.RunPassAsync(CancellationToken.None);
+        public void Dispose()=>Transport.Dispose();
+    }
+
+    private static async Task Case(string label,Func<F,Task> body){using var f=new F();await body(f);_count++;Console.WriteLine("PASS "+label);}
+    private static async Task Case(string label,Action<F> body){using var f=new F();body(f);_count++;Console.WriteLine("PASS "+label);await Task.CompletedTask;}
+
+    public static async Task<int> Run()
+    {
+        // ---------------------------------------------------------------- configured values
+        await Case("F3.1 defaults: request timeout 15 s, initial batch 5, cap 8, lease 60 s, heartbeat 30 s",f=>{
+            var options=new SyncHttpOptions(new Uri("https://api.example.invalid/"));
+            Check(options.RequestTimeout==TimeSpan.FromSeconds(15) && SyncHttpOptions.DefaultRequestTimeout==TimeSpan.FromSeconds(15),"timeout");
+            Check(SyncHttpOptions.InitialBatchOperations==5 && SyncHttpOptions.MaxBatchOperationsLimit==8 && options.MaxBatchOperations==8,"batch");
+            Check(SyncOutboxService.DefaultLease==TimeSpan.FromSeconds(60),"lease");
+            Check(LocalGameplayObserver.HeartbeatMs==30_000,"heartbeat");
+            using var transport=new SyncHttpTransport(options);
+            var dispatcher=new SyncOutboxDispatcher(f.Queue,new SyncSessionManager(transport,f.Binding,new InMemorySyncSecretStore()),f.Binding);
+            Check(dispatcher.CurrentBatchSize==5 && dispatcher.MaxBatchSize==8,"dispatcher defaults");
+        });
+        await Case("F3.1 limits: a batch of more than 8 (or fewer than 1) is refused at every entry point; a custom timeout still works",f=>{
+            var uri=new Uri("https://api.example.invalid/");
+            foreach(int bad in new[]{0,9,25,100}){
+                bool refused=false;try{_=new SyncHttpOptions(uri,null,bad);}catch(SaveException){refused=true;}Check(refused,"options "+bad);
+                refused=false;using var t=new SyncHttpTransport(new SyncHttpOptions(uri));
+                try{_=new SyncOutboxDispatcher(f.Queue,new SyncSessionManager(t,f.Binding),f.Binding,bad);}catch(SaveException){refused=true;}Check(refused,"dispatcher "+bad);
+            }
+            Check(new SyncHttpOptions(uri,TimeSpan.FromSeconds(20),8).RequestTimeout==TimeSpan.FromSeconds(20),"custom timeout");
+        });
+
+        // ---------------------------------------------------------------- batch size
+        await Case("F3.1 the first pass sends exactly 5 operations (not 25); the rest stay pending",async f=>{
+            var ids=f.CaptureSessions(20);using var c=new Client(f);c.Server.PerOpMs=300;
+            var pass=await c.Pass();
+            Check(pass.Reserved==5 && pass.Confirmed==5 && pass.Code=="SYNC_OK",pass.DiagnosticSummary);
+            var batch=c.Server.Batches.Single();Check(FakeServer.OperationIds(batch).Length==5,"5 in the request");
+            Check(f.Count(OutboxDeliveryState.Confirmed)==5 && f.Count(OutboxDeliveryState.Pending)==15 && ids.Count==20,"15 still pending");
+        });
+        await Case("F3.1 a fast server grows the batch one at a time 5-6-7-8 and never beyond 8",async f=>{
+            f.CaptureSessions(40);using var c=new Client(f);c.Server.PerOpMs=300;
+            var sizes=new List<int>();
+            for(int i=0;i<7;i++){var p=await c.Pass();sizes.Add(p.Reserved);}
+            Check(sizes.Take(5).SequenceEqual(new[]{5,6,7,8,8}),"sizes "+string.Join(",",sizes));
+            Check(sizes.All(s=>s<=8) && c.Dispatcher.CurrentBatchSize==8,"cap 8");
+            Check(c.Server.Batches.All(b=>FakeServer.OperationIds(b).Length<=8),"no request over 8");
+        });
+        await Case("F3.1 a slow server (1.5 s per operation) stays at 5: the next size would not fit in 6 s",async f=>{
+            f.CaptureSessions(30);using var c=new Client(f);c.Server.PerOpMs=1500;
+            for(int i=0;i<3;i++){var p=await c.Pass();Check(p.Reserved==5 && p.Confirmed==5,p.DiagnosticSummary);}
+            Check(c.Dispatcher.CurrentBatchSize==5,"stays 5");
+        });
+        await Case("F3.1 a batch slower than 8 s shrinks the next one, one at a time, never below 1",async f=>{
+            f.CaptureSessions(30);using var c=new Client(f);c.Server.PerOpMs=9000;      // even one operation takes 9 s (>= 8 s)
+            var sizes=new List<int>();for(int i=0;i<6;i++){var p=await c.Pass();sizes.Add(p.Reserved);}
+            Check(sizes.SequenceEqual(new[]{5,4,3,2,1,1}),"sizes "+string.Join(",",sizes));
+            Check(c.Dispatcher.CurrentBatchSize==1,"floor 1");
+        });
+        await Case("F3.1 a 503 answer with deferred operations shrinks the batch and keeps every operation retryable",async f=>{
+            f.CaptureSessions(10);using var c=new Client(f);c.Server.Mode=BatchMode.Status503WithDeferred;
+            var p=await c.Pass();
+            Check(p.Reserved==5 && p.Confirmed==0 && p.Retried==5 && c.Dispatcher.CurrentBatchSize==4,p.DiagnosticSummary);
+            Check(f.Count(OutboxDeliveryState.RetryableFailure)==5 && f.Count(OutboxDeliveryState.Confirmed)==0,"nothing confirmed");
+        });
+
+        // ---------------------------------------------------------------- timeout
+        await Case("F3.1 the effective request deadline is 15 s with the default options (real wait)",async f=>{
+            f.CaptureSessions(1);using var c=new Client(f);                   // default options
+            c.Server.Mode=BatchMode.HangUntilCancelled;
+            var clock=Stopwatch.StartNew();var p=await c.Pass();clock.Stop();
+            Check(clock.Elapsed>=TimeSpan.FromSeconds(14.5) && clock.Elapsed<=TimeSpan.FromSeconds(18),"elapsed "+clock.Elapsed.TotalSeconds.ToString("F1",CultureInfo.InvariantCulture));
+            Check(p.Transport==SyncHttpFailure.Timeout && p.Retried==1,p.DiagnosticSummary);
+        });
+        await Case("F3.1 a timeout keeps the operation, shrinks the batch and the retry reuses the same identifiers",async f=>{
+            var ids=f.CaptureSessions(6);using var c=new Client(f,TimeSpan.FromMilliseconds(300));c.Server.Mode=BatchMode.HangUntilCancelled;
+            var before=ids.ToDictionary(i=>i,i=>(f.Op(i).PayloadHash,f.Op(i).CanonicalEnvelope));
+            var p=await c.Pass();Check(p.Transport==SyncHttpFailure.Timeout && p.Retried==5 && c.Dispatcher.CurrentBatchSize==4,p.DiagnosticSummary);
+            var firstIds=FakeServer.OperationIds(c.Server.Batches.Single());
+            Check(firstIds.All(ids.Contains) && f.Count(OutboxDeliveryState.RetryableFailure)==5,"kept");
+            c.Server.Mode=BatchMode.Normal;f.Clock+=TimeSpan.FromMinutes(20);             // past the retry delay
+            var again=await c.Pass();
+            Check(again.Reserved==4 && again.Code is "SYNC_OK" or "SYNC_PARTIAL","retry pass");
+            var sent=c.Server.Batches.SelectMany(FakeServer.OperationIds).ToList();
+            Check(sent.All(ids.Contains),"no operation id outside the captured set");
+            foreach(var id in ids){Check(f.Op(id).PayloadHash==before[id].PayloadHash && f.Op(id).CanonicalEnvelope==before[id].CanonicalEnvelope,"payload untouched");}
+        });
+        await Case("F3.1 a response lost AFTER the commit is reconciled by the receipt query and the operation is never sent twice",async f=>{
+            var ids=f.CaptureSessions(5);using var c=new Client(f);c.Server.Mode=BatchMode.CommitThenDrop;
+            var lost=await c.Pass();Check(lost.Confirmed==0 && lost.Retried==5 && c.Server.Committed.Count==5,lost.DiagnosticSummary);
+            c.Server.Mode=BatchMode.Normal;f.Clock+=TimeSpan.FromMinutes(20);
+            int batchesBefore=c.Server.Batches.Count();
+            var recovered=await c.Pass();
+            Check(recovered.Reconciled==5 && recovered.Confirmed==5,recovered.DiagnosticSummary);
+            Check(c.Server.Batches.Count()==batchesBefore,"no second batch for already committed operations");
+            Check(c.Server.Queries.Single().Body.GetProperty("attempts").EnumerateArray().Select(a=>a.GetProperty("operationId").GetString()).OrderBy(x=>x).SequenceEqual(ids.OrderBy(x=>x)),"query by the same ids");
+            Check(f.Count(OutboxDeliveryState.Confirmed)==5 && c.Server.Committed.Count==5,"one commit per operation");
+        });
+        await Case("F3.1 errors never delete or renumber pending operations (503 without body, then success)",async f=>{
+            var ids=f.CaptureSessions(5);using var c=new Client(f);c.Server.Mode=BatchMode.Status503NoBody;
+            var snapshot=ids.ToDictionary(i=>i,i=>f.Op(i).PayloadHash);
+            var failed=await c.Pass();Check(failed.Confirmed==0 && failed.Retried==5 && f.Count(OutboxDeliveryState.RetryableFailure)==5,failed.DiagnosticSummary);
+            Check(Convert.ToInt32(f.Number("SELECT count(*) FROM sync_outbox;"))==5,"no row lost");
+            c.Server.Mode=BatchMode.Normal;f.Clock+=TimeSpan.FromMinutes(20);
+            var ok=await c.Pass();Check(ok.Confirmed>=1,ok.DiagnosticSummary);
+            foreach(var id in ids)Check(f.Op(id).PayloadHash==snapshot[id],"hash stable");
+            Check(c.Server.Batches.SelectMany(FakeServer.OperationIds).Distinct().All(ids.Contains),"only captured ids ever sent");
+        });
+
+        // ---------------------------------------------------------------- lease and identity
+        await Case("F3.1 the outbox reserves with a 60 s lease and keeps it through a 45 s pass",f=>{
+            f.CaptureSessions(2);
+            var reserved=f.Queue.Reserve(f.Binding);Check(reserved.Count==2 && reserved.All(o=>o.LeaseUntilUnixMs!.Value-f.Clock.ToUnixTimeMilliseconds()==60000),"60 s");
+            f.Clock+=TimeSpan.FromSeconds(45);Check(f.Queue.RecoverExpired(f.Binding)==0,"still alive at 45 s");
+            foreach(var o in reserved)f.Queue.Retry(f.Owner,o.OperationId,o.LeaseId!,o.Attempts,"network_unavailable");
+        });
+        await Case("F3.1 Sync v2 compatibility: registration, session and batch wire shapes are unchanged",async f=>{
+            f.CaptureSessions(2);using var c=new Client(f);c.Server.PerOpMs=100;await c.Pass();
+            var reg=c.Server.Requests.First(r=>r.Path.EndsWith("/technical/registrations",StringComparison.Ordinal)).Body;
+            Check(reg.EnumerateObject().Select(p=>p.Name).OrderBy(x=>x).SequenceEqual(new[]{"bindingGeneration","credential","installationId","localPlayerId","registrationId","schemaVersion"}),"registration fields");
+            Check(reg.GetProperty("schemaVersion").GetInt32()==2 && reg.GetProperty("bindingGeneration").GetInt32()==1,"v2 / generation 1");
+            var ses=c.Server.Requests.First(r=>r.Path.EndsWith("/technical/sessions",StringComparison.Ordinal)).Body;
+            Check(ses.EnumerateObject().Select(p=>p.Name).OrderBy(x=>x).SequenceEqual(new[]{"credential","installationId","localPlayerId","schemaVersion","technicalAccountId"}),"session fields");
+            var batch=c.Server.Batches.Single().Body;
+            Check(batch.EnumerateObject().Select(p=>p.Name).OrderBy(x=>x).SequenceEqual(new[]{"batchId","operations","schemaVersion"}) && batch.GetProperty("schemaVersion").GetInt32()==2,"batch fields");
+            var op=batch.GetProperty("operations")[0];
+            Check(op.EnumerateObject().Select(p=>p.Name).OrderBy(x=>x).SequenceEqual(new[]{"attempt","canonicalEnvelope","dependencies","leaseId","operationId","payloadHash"}),"operation fields");
+            Check(c.Server.Requests.All(r=>r.Path.StartsWith("/api/v2/",StringComparison.Ordinal)),"only /api/v2 paths");
+        });
+        await Case("F3.1 the technical identity is created once per installation and reused by later passes",async f=>{
+            f.CaptureSessions(12);using var c=new Client(f);c.Server.PerOpMs=100;
+            for(int i=0;i<3;i++)await c.Pass();
+            Check(c.Server.Requests.Count(r=>r.Path.EndsWith("/technical/registrations",StringComparison.Ordinal))==1 &&
+                  c.Server.Requests.Count(r=>r.Path.EndsWith("/technical/sessions",StringComparison.Ordinal))==1,"one registration, one session");
+        });
+
+        Console.WriteLine($"F3.1 sync client checks: {_count} passed, 0 failed; in-process fake Sync v2 server, synthetic SQLite only, no Express/Caddy/Atlas.");
+        return 0;
+    }
+}

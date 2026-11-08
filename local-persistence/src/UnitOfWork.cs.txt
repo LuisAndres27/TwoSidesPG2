@@ -1,0 +1,59 @@
+using System;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+public interface ITransactionalSaveExtension
+{
+    // B05 may add its outbox command using THIS connection/transaction; never HTTP here.
+    void BeforeCommit(SqliteConnection connection, SqliteTransaction transaction, SaveReceipt receipt);
+}
+
+public sealed class UnitOfWork
+{
+    private readonly ISaveDatabase _database;
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly ITransactionalSaveExtension? _extension;
+    public UnitOfWork(ISaveDatabase database, Func<DateTimeOffset>? clock = null, ITransactionalSaveExtension? extension = null)
+    { _database=database; _clock=clock??(()=>DateTimeOffset.UtcNow); _extension=extension; }
+    public T Read<T>(Func<SQLiteRepository,T> read)
+    {
+        try
+        {
+            using var c=_database.Open(); using var tx=c.BeginTransaction(deferred:true);
+            var repository=new SQLiteRepository(c,tx);
+            SaveValidation.Require(repository.Number("PRAGMA user_version;")==SchemaManager.CurrentVersion,"UNSUPPORTED_SCHEMA");
+            var result=read(repository); tx.Commit(); return result;
+        }
+        catch(SqliteException error) { throw StorageErrors.Map(error); }
+    }
+    public SaveReceipt Write(string operationId, string owner, string kind, object payload,
+        Func<SQLiteRepository,Func<string?,long?,SaveReceipt>,SaveReceipt> mutate)
+    {
+        SaveValidation.Id(operationId); SaveValidation.Id(owner); var digest=SaveValidation.Digest(payload);
+        try
+        {
+            using var c=_database.Open(); using var tx=c.BeginTransaction(deferred:false);
+            var repository=new SQLiteRepository(c,tx);
+            SaveValidation.Require(repository.Number("PRAGMA user_version;")==SchemaManager.CurrentVersion,"UNSUPPORTED_SCHEMA");
+            var previous=repository.Receipt(operationId);
+            if(previous is not null)
+            {
+                SaveValidation.Require(previous.LocalPlayerId==owner && previous.OperationKind==kind && previous.PayloadDigest==digest,"OPERATION_CONFLICT");
+                tx.Commit(); return previous;
+            }
+            SaveReceipt? inserted=null;
+            SaveReceipt Record(string? game,long? revision)
+            {
+                SaveValidation.Require(inserted is null);
+                inserted=new SaveReceipt(operationId,owner,game,kind,digest,revision,SaveValidation.Timestamp(_clock()));
+                repository.InsertReceipt(inserted); return inserted;
+            }
+            var result=mutate(repository,Record);
+            SaveValidation.Require(inserted is not null && inserted==result);
+            _extension?.BeforeCommit(c,tx,result);
+            tx.Commit(); return result;
+        }
+        catch(SqliteException error) { throw StorageErrors.Map(error); }
+    }
+}

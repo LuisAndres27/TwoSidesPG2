@@ -1,0 +1,137 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class AnimalRestartChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static void Check(bool ok){if(!ok)throw new Exception("Animal restart assertion failed");}
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly RuntimeMenuChecks.Store Store;
+        internal readonly LocalGameState State;
+        internal readonly LocalAnimalRestart Restart=new();
+        internal readonly string Owner=Id(),Game=Id(),Biome,Scene;
+        internal F(int index=0,bool healthy=true,bool decision=true)
+        {
+            Biome=Biomes[index];Scene=LocalBiomeSelection.AnimalSceneFor(Biome)!;
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Store=new(Db,new RuntimeMenuChecks.Failure());
+            Store.Service.CreateLocalProfile(Id(),Owner,"Reinicio sintético");
+            Store.Service.CreateNewGame(new(Id(),Owner,Game));
+            if(decision)Decide(index,healthy);
+            State=new(Store,"owned-fixture");
+        }
+        internal void Decide(int index,bool healthy)
+        {
+            var g=Store.Service.LoadGame(Owner,Game).Game;
+            Store.Service.EnterBiome(new(Id(),Owner,Game,g.Revision,Biomes[index],"human"));
+            g=Store.Service.LoadGame(Owner,Game).Game;
+            Store.Service.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,Biomes[index],Keys[index],healthy?"reject":"approve",healthy?"healthy":"degraded",healthy?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));
+        }
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        internal Task<bool> Run(Func<LocalAnimalContext,string,Task<bool>> navigate,Func<string,bool>? exists=null,string? scene=null)
+            =>Restart.RestartAsync(State,scene??Scene,exists??(_=>true),navigate);
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work,int index=0,bool healthy=true,bool decision=true)
+    {
+        using var f=new F(index,healthy,decision);await f.State.InitializeAsync();
+        try{await work(f);}finally{await f.State.DisposeAsync();}
+        _count++;Console.WriteLine("PASS "+name);
+    }
+    public static async Task<int> Probe(string path,string owner,string game,string scene)
+    {
+        var store=new RuntimeMenuChecks.Store(new RuntimeMenuChecks.ReadOnlyFixture(path),new RuntimeMenuChecks.Failure());
+        await using var state=new LocalGameState(store,"owned-fixture");await state.InitializeAsync();
+        var restart=new LocalAnimalRestart();
+        return await restart.RestartAsync(state,scene,_=>true,(c,d)=>Task.FromResult(c.GameId==game && c.LocalPlayerId==owner && d==scene && !state.CanStartNewGame))?0:51;
+    }
+    public static async Task<int> Run()
+    {
+        for(int i=0;i<5;i++)foreach(bool healthy in new[]{true,false})
+            await Case("original animal restart "+Biomes[i]+" "+(healthy?"reject":"approve"),async f=>
+            {
+                string hash=f.Hash();var before=f.Store.Service.LoadGame(f.Owner,f.Game);
+                bool paused=true,environment=!healthy;int navigations=0;
+                Check(await f.Run((confirmed,scene)=>
+                {
+                    Check(confirmed.LocalPlayerId==f.Owner && confirmed.GameId==f.Game && confirmed.BiomeId==f.Biome);
+                    environment=confirmed.Healthy;paused=false;
+                    Check(environment==healthy && !paused && scene==f.Scene && !scene.Contains("Desicion"));
+                    navigations++;return Task.FromResult(true);
+                }));
+                var after=f.Store.Service.LoadGame(f.Owner,f.Game);
+                Check(navigations==1 && !paused && f.Restart.Code=="RESTARTED" && f.State.ActiveGame?.Game.GameId==f.Game && !f.State.CanStartNewGame);
+                Check(before.Game==after.Game && before.Decisions.SequenceEqual(after.Decisions) && before.Environments.SequenceEqual(after.Environments) && before.Biomes.SequenceEqual(after.Biomes));
+                Check(after.Biomes.Single(b=>b.BiomeId==f.Biome).Status=="animal_pending" && f.Hash()==hash && f.Store.EntryCalls==0);
+            },i,healthy);
+        await Case("SQLite failure has no projection or transition",async f=>
+        {
+            f.Store.ReadFailure=true;string hash=f.Hash();int calls=0;
+            Check(!await f.Run((_,_)=>{calls++;return Task.FromResult(true);}));
+            Check(calls==0 && f.Restart.Code=="IO_ERROR" && !f.Restart.Busy && f.Hash()==hash);
+        });
+        await Case("missing packed scene leaves old level intact",async f=>
+        {
+            string hash=f.Hash();int calls=0;Check(!await f.Run((_,_)=>{calls++;return Task.FromResult(true);},_=>false));
+            Check(calls==0 && f.Restart.Code=="SCENE_UNAVAILABLE" && f.Hash()==hash);
+        });
+        await Case("human scene cannot be a restart destination",async f=>
+        {string hash=f.Hash();Check(!await f.Run((_,_)=>throw new Exception(),scene:LocalBiomeSelection.HumanSceneFor(f.Biome)));Check(f.Restart.Code=="INVALID_BIOME_SCENE" && f.Hash()==hash);});
+        await Case("completed biome rejected without another completion",async f=>
+        {
+            // Fixture setup only: no production restart path has this mutation capability.
+            var g=f.Store.Service.LoadGame(f.Owner,f.Game).Game;
+            f.Store.Service.CompleteBiome(new(Id(),f.Owner,f.Game,g.Revision,f.Biome,"good"));
+            string hash=f.Hash();Check(!await f.Run((_,_)=>throw new Exception()));
+            Check(f.Restart.Code=="BIOME_COMPLETED" && f.Hash()==hash);
+        });
+        await Case("missing active game is not recreated",async f=>
+        {RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);string hash=f.Hash();Check(!await f.Run((_,_)=>throw new Exception()));Check(f.Restart.Code=="GAME_NOT_ACTIVE" && f.Hash()==hash);});
+        await Case("no confirmed decision cannot restart animal",async f=>
+        {string hash=f.Hash();Check(!await f.Run((_,_)=>throw new Exception()));Check(f.Restart.Code=="DECISION_REQUIRED" && f.Hash()==hash);},decision:false);
+        await Case("double click permits only one restart transition",async f=>
+        {
+            string hash=f.Hash();int calls=0;var gate=new TaskCompletionSource<bool>();
+            var first=f.Run((_,_)=>{calls++;return gate.Task;});Check(f.Restart.Busy);
+            Check(!await f.Run((_,_)=>{calls++;return Task.FromResult(true);}));gate.SetResult(true);
+            Check(await first && calls==1 && f.Hash()==hash);
+        });
+        await Case("failed navigation permits read-only retry",async f=>
+        {
+            string hash=f.Hash();Check(!await f.Run((_,_)=>Task.FromResult(false)) && f.Restart.Code=="NAVIGATION_FAILED");
+            Check(await f.Run((_,_)=>Task.FromResult(true)) && f.Hash()==hash);
+        });
+        await Case("SQLite change during destination validation rejects stale context",async f=>
+        {
+            int calls=0;
+            Check(!await f.Run((_,_)=>{calls++;return Task.FromResult(true);},_=>{f.Decide(1,false);return true;}));
+            Check(calls==0 && f.Restart.Code=="REVISION_CONFLICT");
+        });
+        await Case("four confirmed biomes retain independent consequences on restart",async f=>
+        {
+            f.Decide(1,false);f.Decide(2,true);f.Decide(3,false);string hash=f.Hash();
+            for(int i=0;i<4;i++){int index=i;Check(await f.Run((c,_)=>Task.FromResult(c.BiomeId==Biomes[index] && c.Healthy==(index%2==0)),scene:LocalBiomeSelection.AnimalSceneFor(Biomes[i])));}
+            Check(f.Hash()==hash);
+        });
+        await Case("new process reads same restart decision and receipts readonly",async f=>
+        {
+            string hash=f.Hash();Check(await f.Run((_,_)=>Task.FromResult(true)));
+            var start=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false};
+            foreach(string arg in new[]{"--animal-restart-probe",f.Db.Path,f.Owner,f.Game,f.Scene})start.ArgumentList.Add(arg);
+            using var child=Process.Start(start)!;await child.WaitForExitAsync();Check(child.ExitCode==0 && f.Hash()==hash);
+        });
+        Console.WriteLine($"Animal restart: {_count} passed, 0 failed; synthetic SQLite and navigation callbacks, not Godot runtime.");
+        return 0;
+    }
+}

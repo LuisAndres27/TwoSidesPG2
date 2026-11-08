@@ -1,0 +1,41 @@
+[gd_scene format=3 uid="uid://caaee3e7h0x7d"]
+
+[ext_resource type="Script" uid="uid://wpslpv41v06u" path="res://scripts/AvisoEstadoBioma.cs" id="1_ot4ml"]
+
+[node name="AvisoEstadoBioma" type="CanvasLayer" unique_id=1056732071]
+script = ExtResource("1_ot4ml")
+
+[node name="Fondo" type="ColorRect" parent="." unique_id=23899621]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.14117648, 0.14117648, 0.14117648, 0.6117647)
+
+[node name="Centro" type="CenterContainer" parent="." unique_id=1899886695]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Tablero" type="PanelContainer" parent="Centro" unique_id=1209666746]
+custom_minimum_size = Vector2(611.61, 0)
+layout_mode = 2
+
+[node name="Margen" type="MarginContainer" parent="Centro/Tablero" unique_id=2092463334]
+layout_mode = 2
+
+[node name="Contenido" type="VBoxContainer" parent="Centro/Tablero/Margen" unique_id=1748101742]
+layout_mode = 2
+
+[node name="Titulo" type="Label" parent="Centro/Tablero/Margen/Contenido" unique_id=768779695]
+layout_mode = 2
+
+[node name="Mensaje" type="Label" parent="Centro/Tablero/Margen/Contenido" unique_id=401585534]
+layout_mode = 2
+
+[node name="BotonContinuar" type="Button" parent="Centro/Tablero/Margen/Contenido" unique_id=456491910]
+layout_mode = 2
+text = "Continuar"

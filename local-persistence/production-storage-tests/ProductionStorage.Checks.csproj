@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- B68: checks of the per-user production save path. No Express, no Caddy, no Atlas, no Godot. Disposable simulated LocalAppData roots only; the developer historical store and the real production folder are never opened. Same recipe as sync-f54-tests; the
+       assembly name is the one named by InternalsVisibleTo in CopyGameDatabase. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>TwoSides.Production.Checks</AssemblyName>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <RuntimeFrameworkVersion>8.0.30</RuntimeFrameworkVersion>
+    <TargetLatestRuntimePatch>false</TargetLatestRuntimePatch>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../src/TwoSides.LocalPersistence.csproj" />
+    <ProjectReference Include="../sync-http/TwoSides.SyncHttp.csproj" />
+    <Compile Include="*.cs.txt" />
+    <Compile Include="../../integration/sqlite/LocalGameState.cs" Link="LocalGameState.cs" />
+    <Compile Include="../../integration/sqlite/LocalGameplayObserver.cs" Link="LocalGameplayObserver.cs" />
+    <Compile Include="../../integration/sqlite/LocalStatisticsScreenState.cs" Link="LocalStatisticsScreenState.cs" />
+    <Compile Include="../../integration/sqlite/GamePersistenceAdapter.cs" Link="GamePersistenceAdapter.cs" />
+    <Compile Include="../../integration/sqlite/RealGameCatalog.cs" Link="RealGameCatalog.cs" />
+    <Compile Include="../../integration/sqlite/GameTestStorage.cs" Link="GameTestStorage.cs" />
+  </ItemGroup>
+</Project>

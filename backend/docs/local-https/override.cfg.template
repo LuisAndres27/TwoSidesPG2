@@ -1,0 +1,5 @@
+# override.cfg — per-machine Godot project-setting override for the FIRST controlled HTTPS test (B23). Copy to <project>\override.cfg (ignored by Git). Remove it after the test.
+# project.godot is NOT modified. Confirm the exact override.cfg format with the Godot 4.6 documentation before use.
+[two_sides]
+
+sync/main_api_url="https://localhost:8443/"

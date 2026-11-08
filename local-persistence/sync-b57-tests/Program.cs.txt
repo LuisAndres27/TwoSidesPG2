@@ -1,0 +1,125 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+using TwoSides.LocalPersistence;
+
+internal static class Program
+{
+    static int _checks;
+    static void Check(bool ok,string label){if(!ok)throw new InvalidOperationException(label);_checks++;Console.WriteLine("PASS B57 "+label);}
+    static readonly string[] Https={SyncLocalMode.HttpsFlag,SyncTestStorageMode.Flag};
+    sealed class Echo:HttpMessageHandler
+    {
+        internal Uri? LastUri;
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct)
+        {LastUri=request.RequestUri;return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent("{\"schemaVersion\":2}")});}
+    }
+    static async Task Modes()
+    {
+        Check(SyncLocalMode.FromArguments(Array.Empty<string>()) is null&&SyncTestStorageMode.FromArguments(Array.Empty<string>())==SyncTestStorageRequest.None,"no test flags preserves normal storage selection");
+        Check(SyncMainMode.FromConfiguration("",Array.Empty<string>()) is null&&SyncMainMode.FromConfiguration("https://api.example.invalid/",Array.Empty<string>())?.BaseUri.Host=="api.example.invalid","normal HTTPS configuration unchanged / absent stays disabled");
+        var http=SyncLocalMode.FromArguments(new[]{SyncLocalMode.Flag});
+        Check(http?.BaseUri.AbsoluteUri=="http://127.0.0.1:3000/"&&SyncTestStorageMode.FromArguments(new[]{SyncLocalMode.Flag})==SyncTestStorageRequest.None,"legacy HTTP flag unchanged");
+        Check(SyncTestStorageMode.FromArguments(new[]{SyncLocalMode.Flag,SyncTestStorageMode.Flag})==SyncTestStorageRequest.Sandbox,"legacy HTTP sandbox unchanged");
+        var https=SyncLocalMode.FromArguments(Https);
+        Check(https?.BaseUri.AbsoluteUri=="https://localhost:8443/"&&SyncTestStorageMode.FromArguments(Https)==SyncTestStorageRequest.Sandbox,"HTTPS flag selects only fixed localhost with sandbox");
+        Check(SyncMainMode.FromConfiguration("https://api.example.invalid/",Https) is null,"synthetic mode never selects configured main profile");
+        Check(SyncLocalMode.FromArguments(new[]{SyncLocalMode.HttpsFlag}) is null&&SyncTestStorageMode.FromArguments(new[]{SyncLocalMode.HttpsFlag})==SyncTestStorageRequest.Invalid,"HTTPS without sandbox fails before normal storage selection");
+        string[][] invalid={
+            new[]{SyncLocalMode.HttpsFlag,SyncLocalMode.Flag,SyncTestStorageMode.Flag},
+            new[]{SyncLocalMode.HttpsFlag,SyncLocalMode.HttpsFlag,SyncTestStorageMode.Flag},
+            new[]{SyncLocalMode.HttpsFlag,SyncTestStorageMode.Flag,SyncTestStorageMode.Flag},
+            new[]{SyncLocalMode.HttpsFlag,"--two-sides-test-storage=runtime"},
+            new[]{SyncLocalMode.HttpsFlag,"--two-sides-test-storage=../runtime-game"},
+            new[]{SyncLocalMode.HttpsFlag,"--two-sides-test-storage=C:\\arbitrary.sqlite3"},
+            new[]{SyncLocalMode.HttpsFlag,SyncTestStorageMode.Flag,"--two-sides-sync-url=https://external.invalid"},
+            new[]{SyncLocalMode.HttpsFlag+"=https://external.invalid",SyncTestStorageMode.Flag},
+            new[]{SyncLocalMode.HttpsFlag.ToUpperInvariant()},
+            new[]{SyncLocalMode.HttpsFlag+"=http://localhost:8443"},
+            new[]{SyncLocalMode.HttpsFlag+"-unknown"},
+            new[]{SyncTestStorageMode.Flag}
+        };
+        foreach(var args in invalid)
+        {
+            Check(SyncLocalMode.FromArguments(args) is null&&SyncTestStorageMode.FromArguments(args)==SyncTestStorageRequest.Invalid,"invalid mode rejected");
+            bool rejected=false;try{using var forbidden=GameTestStorage.FromArguments(args);}catch(InvalidOperationException){rejected=true;}
+            Check(rejected,"invalid request throws instead of returning normal storage");
+        }
+        var handler=new Echo();using var transport=new SyncHttpTransport(https!,handler);
+        Check((await transport.SendAsync(HttpMethod.Get,"/api/health",null,null,CancellationToken.None)).Ok&&handler.LastUri?.AbsoluteUri=="https://localhost:8443/api/health","real Sync v2 transport uses selected HTTPS origin with in-memory HTTP double");
+        Check(https!.RequestTimeout==TimeSpan.FromSeconds(15)&&https.MaxBatchOperations==8,"F3.1 request timeout and batch ceiling preserved");
+    }
+    static async Task Sandbox()
+    {
+        string path;
+        using(var storage=GameTestStorage.FromArguments(Https)!)
+        {
+            path=storage.Database.Path;
+            string prefix=Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","databases")+Path.DirectorySeparatorChar;
+            Check(path.StartsWith(prefix,StringComparison.OrdinalIgnoreCase)&&Path.GetExtension(path)==".sqlite3","only a newly owned disposable database");
+            Check((File.GetAttributes(path)&FileAttributes.ReparsePoint)==0,"synthetic database is a normal file");
+            await using var adapter=storage.CreateAdapter();
+            // Only rejected strings; no inspection, hashes or opening of real files.
+            foreach(string rejectedPath in new[]{GamePersistenceAdapter.RuntimeStoragePath,GamePersistenceAdapter.StoragePath,path,"",@"C:\Users\luis2\AppData\Roaming\Godot\app_userdata\TwoSides\save.sqlite3"})
+                Check(!(await adapter.OpenAsync(rejectedPath)).Success,"adapter rejects every path except its synthetic capability token");
+            Check((await adapter.OpenAsync(GameTestStorage.OpenPath)).Success&&adapter.SyncStorage is not null,"synthetic capability opens only the created database");
+            await adapter.DrainOutboxAsync(TimeSpan.FromSeconds(1));
+            Check(adapter.SyncStorage is null,"closed synthetic adapter cannot keep syncing");
+        }
+        Check(!File.Exists(path)&&!Directory.Exists(Path.GetDirectoryName(path)!),"only this sandbox removed at disposal");
+        using var a=GameTestStorage.FromArguments(Https)!;using var b=GameTestStorage.FromArguments(Https)!;
+        Check(a.Database.Path!=b.Database.Path,"each test run gets fresh independent storage");
+    }
+    static async Task RejectInvalidCertificate()
+    {
+        // TLS server double, in RAM on an ephemeral loopback port. No Caddy/CA installation or trust bypass.
+        using var key=RSA.Create(2048);
+        var req=new CertificateRequest("CN=localhost",key,HashAlgorithmName.SHA256,RSASignaturePadding.Pkcs1);
+        var san=new SubjectAlternativeNameBuilder();san.AddDnsName("localhost");req.CertificateExtensions.Add(san.Build());
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false,false,0,true));
+        using var cert=req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1),DateTimeOffset.UtcNow.AddMinutes(5));
+        using var chain=new X509Chain();chain.ChainPolicy.RevocationMode=X509RevocationMode.NoCheck;
+        Check(!chain.Build(cert),"self-signed certificate is not trusted by OS");
+        var listener=new TcpListener(IPAddress.Loopback,0);listener.Start();
+        using var limit=new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        try
+        {
+            int port=((IPEndPoint)listener.LocalEndpoint).Port;
+            var server=Task.Run(async()=>{
+                using var tcp=await listener.AcceptTcpClientAsync(limit.Token);
+                using var tls=new SslStream(tcp.GetStream(),false);
+                try{await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions{ServerCertificate=cert,EnabledSslProtocols=SslProtocols.Tls12|SslProtocols.Tls13},limit.Token);}
+                catch(AuthenticationException){}catch(IOException){}
+            });
+            using var transport=new SyncHttpTransport(new SyncHttpOptions(new Uri($"https://localhost:{port}/"),TimeSpan.FromSeconds(5)));
+            var response=await transport.SendAsync(HttpMethod.Get,"/api/health",null,null,limit.Token);
+            Check(response.Status==0&&response.Failure==SyncHttpFailure.NetworkUnavailable,"production HttpClient rejects invalid certificate without TLS callback");
+            await server;
+        }
+        finally{listener.Stop();}
+    }
+    public static async Task<int> Main(string[] args)
+    {
+        try
+        {
+            if(args.Length!=0)throw new InvalidOperationException("No external arguments accepted");
+            await Modes();await Sandbox();await RejectInvalidCertificate();
+            Console.WriteLine($"B57 mode/storage/TLS checks passed: {_checks}");
+            if(await SyncF31Checks.Run()!=0)return 1;
+            // Empty arguments explicitly exclude the optional Express cases in B54.
+            if(await SyncF54Checks.Run(Array.Empty<string>())!=0)return 1;
+            Console.WriteLine("B57_RESULT=PASS; fake servers only; no real saves, Atlas, Caddy or installed CA");return 0;
+        }
+        catch(Exception error){Console.Error.WriteLine("B57_RESULT=FAIL "+error.GetType().Name+": "+error.Message);return 1;}
+    }
+}

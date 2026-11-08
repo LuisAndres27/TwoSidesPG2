@@ -1,0 +1,446 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class GameSaveChecks
+{
+    private const string FixtureName="Prueba local B04.2B.2B.2A",Renamed="Prueba José local";
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok,string name){if(!ok)throw new Exception(name);_count++;Console.WriteLine("PASS "+name);}
+    private static void Reject(Action action,string code,string name)
+    {
+        try{action();throw new Exception("Unexpected success: "+name);}
+        catch(SaveException e){Check(e.Code==code,name);}
+    }
+    private static string Hash(string path)=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+    private sealed class FailingExtension:ITransactionalSaveExtension
+    {
+        public void BeforeCommit(SqliteConnection c,SqliteTransaction tx,SaveReceipt receipt)=>throw new SaveException("TEST_ROLLBACK");
+    }
+    private sealed class ReadOnlyDatabase:ISaveDatabase
+    {
+        private readonly ISaveDatabase _database;
+        public ReadOnlyDatabase(ISaveDatabase database){_database=database;}
+        public SqliteConnection Open(){var c=_database.Open();using var cmd=c.CreateCommand();cmd.CommandText="PRAGMA query_only=ON;";cmd.ExecuteNonQuery();return c;}
+    }
+    private static async Task<int> Probe(string owner,string active)
+    {
+        await using var a=new GamePersistenceAdapter();
+        if(!(await a.OpenAsync(GamePersistenceAdapter.StoragePath)).Success)return 10;
+        var p=await a.GetLocalProfileAsync();var g=await a.GetActiveGameAsync(owner);var h=await a.GetGameHistoryAsync(owner);
+        return p.Data?.LocalPlayerId==owner && g.Data?.Game.GameId==active && h.Data?.Count>=2?0:11;
+    }
+    public static async Task<int> Main(string[] args)
+    {
+        try
+        {
+            if(args.Length==1 && args[0]=="--outbox-bounded-close")return await OutboxBoundedCloseChecks.Run();
+            if(args.Length==1 && args[0]=="--outbox-shutdown-recovery")return await OutboxShutdownRecoveryChecks.Run();
+            if(args.Length==1 && args[0]=="--outbox")return await OutboxChecks.Run();
+            if(args.Length==1 && args[0]=="--outbox-activation")return await OutboxActivationChecks.Run();
+            if(args.Length==1 && args[0]=="--reconciliation")return await ReconciliationChecks.Run();
+            if(args.Length==5 && args[0]=="--reconcile-probe")return ReconciliationChecks.Probe(args.Skip(1).ToArray());
+            if(args.Length==7 && args[0]=="--outbox-probe")return OutboxChecks.Probe(args.Skip(1).ToArray());
+            if(args.Length==1 && args[0]=="--local-finals")return await LocalFinalChecks.Run();
+            if(args.Length==5 && args[0]=="--final-probe")return LocalFinalChecks.Probe(args[1],args[2],args[3],args[4]);
+            if(args.Length==1 && args[0]=="--biome-completion")return await LocalBiomeCompletionChecks.Run();
+            if(args.Length==4 && args[0]=="--completion-probe")return LocalBiomeCompletionChecks.Probe(args[1],args[2],args[3]);
+            if(args.Length==1 && args[0]=="--activity-statistics")return await ActivityStatisticsChecks.Run();
+            if(args.Length==1 && args[0]=="--gameplay-observer")return await GameplayObserverChecks.Run();
+            if(args.Length==1 && args[0]=="--gameplay-events")return await GameplayEventChecks.Run();
+            if(args.Length==4 && args[0]=="--gameplay-events-probe")return GameplayEventChecks.Probe(args[1],args[2],args[3]);
+            if(args.Length==1 && args[0]=="--statistics-screen")return await StatisticsScreenChecks.Run();
+            if(args.Length==3 && args[0]=="--statistics-screen-probe")return await StatisticsScreenChecks.Probe(args[1],args[2]);
+            if(args.Length==1 && args[0]=="--local-statistics")return await LocalStatisticsChecks.Run();
+            if(args.Length==1 && args[0]=="--game-over-navigation")return await GameOverNavigationChecks.Run();
+            if(args.Length==1 && args[0]=="--animal-restart")return await AnimalRestartChecks.Run();
+            if(args.Length==5 && args[0]=="--animal-restart-probe")return await AnimalRestartChecks.Probe(args[1],args[2],args[3],args[4]);
+            if(args.Length==1 && args[0]=="--menu-return")return await MenuReturnChecks.Run();
+            if(args.Length==4 && args[0]=="--menu-return-probe")return await MenuReturnChecks.Probe(args[1],args[2],args[3]);
+            if(args.Length==1 && args[0]=="--animal-entry")return await AnimalEntryChecks.Run();
+            if(args.Length==5 && args[0]=="--animal-entry-probe")return await AnimalEntryChecks.Probe(args[1],args[2],args[3],args[4]);
+            if(args.Length==1 && args[0]=="--decisions")return await DecisionIntegrationChecks.Run();
+            if(args.Length==5 && args[0]=="--decision-probe")return await DecisionIntegrationChecks.Probe(args[1],args[2],args[3],args[4]);
+            if(args.Length==1 && args[0]=="--biome-selection")return await BiomeSelectionChecks.Run();
+            if(args.Length==4 && args[0]=="--biome-selection-probe")return await BiomeSelectionChecks.Probe(args[1],args[2],args[3]);
+            if(args.Length==3 && args[0]=="--single-game-probe")return RuntimeMenuChecks.Probe(args[1],args[2]);
+            if(args.Length>0 && args[0]=="--runtime-menu")return await RuntimeMenuChecks.Run();
+            if(args.Length>0 && args[0]=="--progress")return await BiomeProgressChecks.Run(args.Skip(1).ToArray());
+            if(args.Length==3 && args[0]=="--probe")return await Probe(args[1],args[2]);
+            if(args.Length==0){Console.Error.WriteLine("Historical durable writer suite disabled: protected store and superseded replacement policy. Use --runtime-menu or --progress with fresh fixtures.");return 2;}
+            Check(typeof(GamePersistenceAdapter).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "System.Net.Http" and not "GodotSharp" && !(a.Name??"").Contains("Mongo")),"scene-free adapter has no HTTP MongoDB or Godot runtime reference");
+            string output=Path.Combine(Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!,"integration","sqlite",".work","bin","Debug");
+            using(var stream=File.OpenRead(Path.Combine(output,"TwoSides.dll")))using(var pe=new PEReader(stream))
+            {
+                var md=pe.GetMetadataReader();
+                Check(md.TypeDefinitions.Select(h=>md.GetString(md.GetTypeDefinition(h).Name)).Contains("GamePersistenceAdapter"),"basic adapter compiled into Godot project");
+                Check(md.AssemblyReferences.Select(h=>md.GetString(md.GetAssemblyReference(h).Name)).Count(n=>n=="TwoSides.LocalPersistence")==1,"Godot project references library exactly once");
+            }
+            Reject(()=>CopyGameDatabase.OpenOrCreate("save.sqlite3"),"UNSAFE_PATH","relative path rejected");
+            Reject(()=>CopyGameDatabase.OpenOrCreate(DurableTestDatabase.AuthorizedPath),"UNSAFE_PATH","synthetic path rejected before access");
+            Reject(()=>GamePersistenceAdapter.PrepareProfileCreation("\u202einvalid"),"INVALID_NAME","bidi name rejected");
+            Reject(()=>GamePersistenceAdapter.PrepareProfileCreation(" "),"INVALID_NAME","empty name rejected");
+            string owner,firstGame,active;int historyCount;
+            await using(var a=new GamePersistenceAdapter())
+            {
+                Check((await a.OpenAsync(GamePersistenceAdapter.StoragePath)).Success,"game store opens at exclusive durable path");
+                Check(!(await a.OpenAsync(GamePersistenceAdapter.StoragePath)).Success,"second open does not replace capability");
+                var initial=await a.GetLocalProfileAsync();Check(initial.Success,"profile query does not create a replacement");
+                if(initial.Data is null)
+                {
+                    var request=GamePersistenceAdapter.PrepareProfileCreation(FixtureName);
+                    var r=await Task.WhenAll(a.CreateLocalProfileAsync(request),a.CreateLocalProfileAsync(request));
+                    Check(r.All(x=>x.Success)&&r[0].Receipt==r[1].Receipt,"first profile and concurrent retry create one identity");
+                    owner=r[0].Data!.LocalPlayerId;
+                    Check((await a.GetActiveGameAsync(owner)).Data is null,"profile does not implicitly create game");
+                }
+                else
+                {
+                    Check(initial.Data.DisplayName is FixtureName or Renamed,"existing retained fixture recognized; other profile stops suite");
+                    owner=initial.Data.LocalPlayerId;
+                }
+                Check((await a.GetLocalProfileAsync()).Data?.LocalPlayerId==owner,"singleton profile recovered");
+                var another=await a.CreateLocalProfileAsync(GamePersistenceAdapter.PrepareProfileCreation(FixtureName));
+                Check(!another.Success&&another.Code=="PROFILE_ALREADY_EXISTS","second profile rejected without replacement");
+                var p=(await a.GetLocalProfileAsync()).Data!;string renameId=Id();
+                var rename=await a.UpdateDisplayNameAsync(renameId,owner,p.Revision,"  Prueba Jose\u0301 local  ");
+                Check(rename.Success&&rename.Data?.DisplayName==Renamed&&rename.Data.LocalPlayerId==owner,"NFC rename preserves identity");
+                var retry=await a.UpdateDisplayNameAsync(renameId,owner,p.Revision,Renamed);
+                Check(retry.Success&&retry.Receipt==rename.Receipt,"rename retry keeps receipt and revision");
+                var invalid=await a.UpdateDisplayNameAsync(Id(),owner,rename.Data!.Revision,"\u0000bad");
+                Check(!invalid.Success&&invalid.Code=="INVALID_NAME","invalid rename does not write");
+                var prior=(await a.GetActiveGameAsync(owner)).Data;int oldCount=(await a.GetGameHistoryAsync(owner)).Data!.Count;
+                Check(oldCount<40,"fixture capacity checked without deleting games");
+                var command=GamePersistenceAdapter.PrepareNewGame(owner,prior?.Game);
+                var created=await Task.WhenAll(a.CreateNewGameAsync(command),a.CreateNewGameAsync(command));
+                Check(created.All(x=>x.Success)&&created[0].Receipt==created[1].Receipt,"concurrent new-game retry creates one game");
+                var g=created[0].Data!;firstGame=g.Game.GameId;
+                Check(firstGame!=prior?.Game.GameId&&g.Game.LocalPlayerId==owner,"game ID independent and associated with owner");
+                Check(g.Game.Revision==0&&g.Game.Status=="in_progress"&&g.Game.IsCurrent&&g.Game.CurrentBiomeId is null&&g.Game.ResumeKind=="menu"&&g.Game.CheckpointKey is null,"confirmed initial game without biome order");
+                Check(g.Biomes.Count==5&&g.Biomes.All(b=>b.Status=="human_pending"&&b.Result is null&&b.AttemptNumber==0&&b.HumanCompletedAt is null&&b.AnimalCompletedAt is null),"five biome rows initialized without invented results");
+                Check(g.Environments.Count==5&&g.Environments.All(e=>e.StateKind is null&&e.LastDecisionId is null&&e.ExtensionsJson=="{}"),"no initial environmental consequences");
+                Check(g.Decisions.Count==0&&g.Objectives.Count==0&&g.Snapshot.SnapshotJson==GameSaveService.BoundarySnapshot&&g.Snapshot.CapturedRevision==0,"initial boundary has no resources decisions or objectives");
+                var nextCommand=GamePersistenceAdapter.PrepareNewGame(owner,g.Game);var next=await a.CreateNewGameAsync(nextCommand);
+                Check(next.Success,"explicit new game archives without deletion");active=next.Data!.Game.GameId;
+                var h=await a.GetGameHistoryAsync(owner);historyCount=h.Data!.Count;
+                Check(h.Success&&historyCount==oldCount+2&&h.Data.Count(x=>x.IsCurrent)==1,"history retains every game and one active");
+                Check((await a.GetActiveGameAsync(owner)).Data?.Game.GameId==active,"active game identified");
+                var archived=await a.LoadGameAsync(owner,firstGame);
+                Check(archived.Success&&archived.Data?.Game.Status=="archived"&&archived.Data.Game.Revision==1&&!archived.Data.Game.IsCurrent,"archived aggregate recovered");
+                Check((await a.CreateNewGameAsync(nextCommand)).Success&&(await a.GetGameHistoryAsync(owner)).Data!.Count==historyCount,"committed retry creates no duplicate history");
+                var stale=await a.CreateNewGameAsync(GamePersistenceAdapter.PrepareNewGame(owner,g.Game));
+                Check(!stale.Success&&stale.Code=="REVISION_CONFLICT","stale replacement rejected");
+                var noConsent=await a.CreateNewGameAsync(GamePersistenceAdapter.PrepareNewGame(owner));
+                Check(!noConsent.Success&&noConsent.Code=="REVISION_CONFLICT","replacement requires current ID and revision");
+                Check((await a.GetGameHistoryAsync(owner,0,1)).Data!.Count==1,"history pagination bounded");
+                Check(!(await a.GetGameHistoryAsync(owner,-1)).Success&&!(await a.GetGameHistoryAsync(owner,0,101)).Success,"invalid history boundaries rejected");
+                Check(!(await a.LoadGameAsync(Id(),active)).Success&&!(await a.GetActiveGameAsync(Id())).Success,"foreign owner rejected");
+                Check((await a.GetGameHistoryAsync(owner)).Data!.Count==historyCount,"failed writes and reads do not create games");
+                await a.CloseAsync();Check(!(await a.GetLocalProfileAsync()).Success,"closed adapter returns controlled error");
+                Check((await a.OpenAsync(GamePersistenceAdapter.StoragePath)).Success&&(await a.GetActiveGameAsync(owner)).Data?.Game.GameId==active,"connection reopen preserves active game");
+            }
+            using(var db=CopyGameDatabase.OpenOrCreate(CopyGameDatabase.AuthorizedPath))
+            {
+                var normal=new GameSaveService(db,RealGameCatalog.InitialState());var current=normal.GetActiveGame(owner)!;
+                var failing=new GameSaveService(db,RealGameCatalog.InitialState(),extension:new FailingExtension());
+                Reject(()=>failing.CreateNewGame(GamePersistenceAdapter.PrepareNewGame(owner,current.Game)),"TEST_ROLLBACK","precommit failure rolls back archive game and receipt");
+                Check(normal.GetActiveGame(owner)!.Game.GameId==active&&normal.GetGameHistory(owner).Count==historyCount,"rollback preserves active and history");
+                var readOnly=new GameSaveService(new ReadOnlyDatabase(db),RealGameCatalog.InitialState());
+                Reject(()=>readOnly.UpdateDisplayName(Id(),owner,normal.GetLocalProfile()!.Revision,"No debe guardarse"),"ACCESS_DENIED","read-only SQLite mapped without ACL edits");
+                Check(normal.GetLocalProfile()!.DisplayName==Renamed,"SQLite write failure preserves profile");
+                using var c=db.Open();using var cmd=c.CreateCommand();cmd.CommandText="SELECT count(*) FROM local_profiles;";
+                Check(Convert.ToInt32(cmd.ExecuteScalar())==1,"exactly one profile stored");
+                cmd.CommandText="SELECT count(*) FROM local_profiles WHERE registration_status!='LOCAL_ONLY' OR registration_id IS NOT NULL OR technical_account_id IS NOT NULL OR internal_email IS NOT NULL OR credential_ref IS NOT NULL;";
+                Check(Convert.ToInt32(cmd.ExecuteScalar())==0,"no remote credentials or identity generated");
+                cmd.CommandText="PRAGMA foreign_keys;";Check(Convert.ToInt32(cmd.ExecuteScalar())==1,"foreign keys enabled");
+                cmd.CommandText="PRAGMA application_id;";Check(Convert.ToInt32(cmd.ExecuteScalar())==0x54534743,"game marker differs from infrastructure marker");SchemaManager.Verify(db);
+            }
+            var info=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true};
+            foreach(string arg in new[]{"--probe",owner,active})info.ArgumentList.Add(arg);
+            using(var child=Process.Start(info)){child!.WaitForExit();Check(child.ExitCode==0,"new process recovers profile active game and history offline");}
+            string manifest=Path.Combine(CopyGameDatabase.AuthorizedDirectory,"ownership.json"),held=Path.Combine(CopyGameDatabase.AuthorizedDirectory,"ownership.test-held");
+            Check(!File.Exists(held),"ownership test destination vacant");string hash=Hash(CopyGameDatabase.AuthorizedPath);File.Move(manifest,held);
+            try{Reject(()=>CopyGameDatabase.OpenOrCreate(CopyGameDatabase.AuthorizedPath),"UNKNOWN_DATABASE","unrecognized database rejected");}
+            finally{File.Move(held,manifest);}
+            Check(hash==Hash(CopyGameDatabase.AuthorizedPath),"unrecognized file not modified");
+            Console.WriteLine($"Basic save: {_count} passed, 0 failed. Retained fixture: {historyCount} games. No games deleted.");return 0;
+        }
+        catch(Exception e){Console.Error.WriteLine("FAIL "+e.GetType().Name+": "+e.Message);return 1;}
+    }
+}
+
+// B04.2B.2B.2B: all writes are confined to newly created SyntheticSandbox fixtures.
+internal static class BiomeProgressChecks
+{
+    private static int _passed,_failed;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Require(bool value){if(!value)throw new Exception("Assertion failed");}
+    private static string Error(Action action)
+    {
+        try{action();return "OK";}catch(SaveException e){return e.Code;}
+    }
+    private sealed class UnknownPolicy:IBiomeAvailabilityPolicy { public BiomeAvailability Evaluate(GameAggregate game,string biome)=>BiomeAvailability.Unknown; }
+    private sealed class FixturePolicy:IBiomeAvailabilityPolicy
+    {
+        public BiomeAvailability Evaluate(GameAggregate game,string biome)=>biome switch
+        {"ocean"=>BiomeAvailability.Available,"jungle"=>BiomeAvailability.Unavailable,_=>BiomeAvailability.Unknown};
+    }
+    private sealed class RejectCommit:ITransactionalSaveExtension
+    {
+        public void BeforeCommit(SqliteConnection c,SqliteTransaction t,SaveReceipt r)=>throw new SaveException("TEST_ROLLBACK");
+    }
+    private sealed class FailingSqlWrite:ITransactionalSaveExtension
+    {
+        public void BeforeCommit(SqliteConnection c,SqliteTransaction t,SaveReceipt receipt)
+        {
+            using var cmd=c.CreateCommand();cmd.Transaction=t;
+            cmd.CommandText="INSERT INTO biome_progress VALUES($g,'ocean','human_pending',NULL,0,NULL,NULL,'fixture');";
+            cmd.Parameters.AddWithValue("$g",Id());cmd.ExecuteNonQuery();
+        }
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly GameSaveService S;
+        internal readonly string Owner=Id();
+        internal string Game;
+        internal F()
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);
+            S=new GameSaveService(Db,RealGameCatalog.InitialState(),availability:new FixturePolicy());
+            S.CreateLocalProfile(Id(),Owner,"Fixture progreso");Game=Id();S.CreateNewGame(new(Id(),Owner,Game));
+        }
+        internal long Revision=>S.LoadGame(Owner,Game).Game.Revision;
+        internal RecordDecisionCommand Decision(string biome="ocean",string option="reject",EnvironmentalClassification? classification=null)=>
+            new(Id(),Id(),Owner,Game,Revision,biome,biome=="ocean"?"ocean_waste_disposal":"jungle_transport_route",option,
+                "healthy","{\"stateKind\":\"healthy\"}",classification);
+        internal CompleteBiomeCommand Completion()=>new(Id(),Owner,Game,Revision,"ocean","good");
+        internal EnterBiomeCommand Entry(string biome="ocean",string perspective="human")=>new(Id(),Owner,Game,Revision,biome,perspective);
+        internal string State()=>System.Text.Json.JsonSerializer.Serialize(S.LoadGame(Owner,Game));
+        internal void Finish(){S.RecordDecision(Decision());S.CompleteBiome(Completion());}
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static void Case(string name,Action<F> test)
+    {
+        try{using var f=new F();test(f);_passed++;Console.WriteLine("PASS "+name);}
+        catch(Exception e){_failed++;Console.WriteLine("FAIL "+name+": "+(e is SaveException s?s.Code:e.GetType().Name));}
+    }
+    private static async Task AsyncCase(string name,Func<F,Task> test)
+    {
+        try{using var f=new F();await test(f);_passed++;Console.WriteLine("PASS "+name);}
+        catch(Exception e){_failed++;Console.WriteLine("FAIL "+name+": "+(e is SaveException s?s.Code:e.GetType().Name));}
+    }
+    private sealed class ReadOnlyFixture:ISaveDatabase
+    {
+        private readonly string _path;
+        internal ReadOnlyFixture(string path)
+        {
+            string root=System.IO.Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","databases");
+            string parent=System.IO.Path.GetDirectoryName(path)!;
+            Require(System.IO.Path.IsPathFullyQualified(path)&&System.IO.Path.GetDirectoryName(parent)==root
+                &&Guid.TryParseExact(System.IO.Path.GetFileName(parent),"N",out _)
+                &&Guid.TryParseExact(System.IO.Path.GetFileNameWithoutExtension(path),"N",out _)
+                &&System.IO.Path.GetExtension(path)==".sqlite3");
+            foreach(string p in new[]{SyntheticSandbox.AuthorizedProjectRoot,System.IO.Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work"),root,parent,path})
+                Require((File.GetAttributes(p)&FileAttributes.ReparsePoint)==0);
+            _path=path;
+        }
+        public SqliteConnection Open()
+        {
+            var c=new SqliteConnection(new SqliteConnectionStringBuilder{DataSource=_path,Mode=SqliteOpenMode.ReadOnly,Pooling=false,ForeignKeys=true}.ToString());c.Open();return c;
+        }
+    }
+    public static async Task<int> Run(string[] args)
+    {
+        if(args.Length==4&&args[0]=="--setprobe")
+        {
+            try { var s=new GameSaveService(new ReadOnlyFixture(args[1]),RealGameCatalog.InitialState());return s.AreAllCanonicalBiomesCompleted(args[2],args[3])?0:4; } catch { return 5; }
+        }
+        if(args.Length==4&&args[0]=="--probe")
+        {
+            try
+            {
+                var s=new GameSaveService(new ReadOnlyFixture(args[1]),RealGameCatalog.InitialState());
+                var a=s.GetBiomeAccess(args[2],args[3],"ocean");var d=s.GetDecisions(args[2],args[3]);
+                return a.Progress.Status=="completed"&&!a.CanReplay&&!a.CanEnterHuman&&!a.CanEnterAnimal&&d.Count==1&&s.GetEnvironment(args[2],args[3],"ocean").StateKind=="healthy"?0:2;
+            }
+            catch{return 3;}
+        }
+        Case("initial progress keeps persistent stages and separate availability",f=>{
+            var all=f.S.GetGameProgress(f.Owner,f.Game);Require(all.Count==5&&all.All(b=>b.Progress.Status=="human_pending")&&all.Single(b=>b.Progress.BiomeId=="ocean").CanEnterHuman);
+        });
+        Case("valid entry uses explicit fixture policy and commits resume point",f=>{
+            var cmd=f.Entry();var r=f.S.EnterBiome(cmd);Require(r.ResultRevision==1&&f.S.ContinueGame(f.Owner).ResumeKind=="human_decision"&&f.S.GetBiomeAccess(f.Owner,f.Game,"ocean").Activity=="in_progress"&&f.S.EnterBiome(cmd)==r);
+        });
+        Case("unavailable biome rejects entry without writes",f=>{var before=f.State();Require(Error(()=>f.S.EnterBiome(f.Entry("jungle")))=="BIOME_UNAVAILABLE"&&f.State()==before);});
+        Case("explicit unknown policy never grants entry",f=>{
+            var s=new GameSaveService(f.Db,RealGameCatalog.InitialState(),availability:new UnknownPolicy());Require(!s.GetBiomeAccess(f.Owner,f.Game,"ocean").CanReplay&&Error(()=>s.EnterBiome(f.Entry()))=="AVAILABILITY_UNDEFINED");
+        });
+        Case("confirmed advance retained without inventing resources",f=>{
+            f.S.RecordDecision(f.Decision());f.S.EnterBiome(f.Entry(perspective:"animal"));Require(f.S.ContinueGame(f.Owner).ResumeKind=="animal_start"&&f.S.LoadGame(f.Owner,f.Game).Snapshot.SnapshotJson==GameSaveService.BoundarySnapshot);
+        });
+        Case("completion commits result timestamp snapshot and receipt together",f=>{
+            f.S.RecordDecision(f.Decision());var cmd=f.Completion();var receipt=f.S.CompleteBiome(cmd);var a=f.S.LoadGame(f.Owner,f.Game);
+            Require(a.Biomes.Single(b=>b.BiomeId=="ocean") is {Status:"completed",Result:"good",AnimalCompletedAt:not null}&&a.Snapshot.CapturedRevision==receipt.ResultRevision&&a.Game.ResumeKind=="menu");
+        });
+        Case("completed biome blocks entry and replay query",f=>{f.Finish();Require(!f.S.GetBiomeAccess(f.Owner,f.Game,"ocean").CanReplay&&Error(()=>f.S.EnterBiome(f.Entry()))=="BIOME_COMPLETED");});
+        Case("another perspective cannot reopen completed biome",f=>{f.Finish();Require(Error(()=>f.S.EnterBiome(f.Entry(perspective:"animal")))=="BIOME_COMPLETED");});
+        Case("new service preserves completed lock",f=>{f.Finish();var s=new GameSaveService(f.Db,RealGameCatalog.InitialState(),availability:new FixturePolicy());Require(!s.GetBiomeAccess(f.Owner,f.Game,"ocean").CanEnterHuman&&s.GetCompletedBiomes(f.Owner,f.Game).Count==1);});
+        Case("new game does not inherit block from completed historical fixture",f=>{
+            f.Finish();string previous=f.Game;var current=f.S.LoadGame(f.Owner,previous).Game;RuntimeMenuChecks.SeedTerminal(f.Db,previous);f.Game=Id();f.S.CreateNewGame(new(Id(),f.Owner,f.Game));
+            Require(f.S.GetCompletedBiomes(f.Owner,f.Game).Count==0&&f.S.GetBiomeAccess(f.Owner,f.Game,"ocean").CanEnterHuman&&f.S.GetCompletedBiomes(f.Owner,previous).Count==1);
+        });
+        Case("completed history decisions and completion remain readable immutable",f=>{
+            f.Finish();string old=f.Game;var current=f.S.LoadGame(f.Owner,old).Game;RuntimeMenuChecks.SeedTerminal(f.Db,old);f.Game=Id();f.S.CreateNewGame(new(Id(),f.Owner,f.Game));
+            string before=System.Text.Json.JsonSerializer.Serialize(f.S.LoadGame(f.Owner,old));
+            Require(Error(()=>f.S.CompleteBiome(new(Id(),f.Owner,old,current.Revision,"ocean","good")))=="REVISION_CONFLICT"&&before==System.Text.Json.JsonSerializer.Serialize(f.S.LoadGame(f.Owner,old))&&f.S.GetDecisions(f.Owner,old).Count==1);
+        });
+        Case("decision preserves v1 receipt shape without classification inference",f=>{
+            var c=f.Decision();var r=f.S.RecordDecision(c);var d=f.S.GetDecisions(f.Owner,f.Game).Single();
+            var oldDigest=SaveValidation.Digest(new {c.OperationId,c.DecisionId,c.LocalPlayerId,c.GameId,c.ExpectedRevision,c.BiomeId,c.DecisionKey,c.OptionId,c.ResolvedEnvironment,c.ConsequencesJson});
+            Require(r.PayloadDigest==oldDigest&&d.Classification is null&&d.ConsequencesVersion==1&&f.S.GetEnvironment(f.Owner,f.Game,"ocean").LastDecisionId==d.DecisionId);
+        });
+        Case("same operation returns receipt without duplicate consequence",f=>{var c=f.Decision();var r=f.S.RecordDecision(c);string state=f.State();Require(f.S.RecordDecision(c)==r&&f.State()==state&&f.S.GetDecisions(f.Owner,f.Game).Count==1);});
+        Case("different option for same logical instance conflicts",f=>{f.S.RecordDecision(f.Decision());var before=f.State();Require(Error(()=>f.S.RecordDecision(f.Decision(option:"approve")))=="DECISION_CONFLICT"&&f.State()==before);});
+        Case("different operation and occurrence UUID cannot duplicate logical decision",f=>{f.S.RecordDecision(f.Decision());Require(Error(()=>f.S.RecordDecision(f.Decision()))=="DECISION_CONFLICT"&&f.S.GetDecisions(f.Owner,f.Game).Count==1);});
+        Case("declared classification and version round-trip in payload2",f=>{
+            f.S.RecordDecision(f.Decision(classification:new("favorable","fixture-v1")));var d=f.S.GetDecisions(f.Owner,f.Game).Single();Require(d.Classification==new EnvironmentalClassification("favorable","fixture-v1")&&d.ConsequencesVersion==2&&f.S.LoadGame(f.Owner,f.Game).Decisions.Count==1);
+        });
+        Case("new decisions forbidden after completion but original retry allowed",f=>{
+            var c=f.Decision();var receipt=f.S.RecordDecision(c);f.S.CompleteBiome(f.Completion());string before=f.State();Require(Error(()=>f.S.RecordDecision(f.Decision()))=="BIOME_COMPLETED"&&f.S.RecordDecision(c)==receipt&&f.State()==before);
+        });
+        Case("injected precommit failure rolls back decision all projections and receipt",f=>{
+            var s=new GameSaveService(f.Db,RealGameCatalog.InitialState(),extension:new RejectCommit());string before=f.State();Require(Error(()=>s.RecordDecision(f.Decision()))=="TEST_ROLLBACK"&&f.State()==before);
+            using var c=f.Db.Open();using var cmd=c.CreateCommand();cmd.CommandText="SELECT count(*) FROM local_operations WHERE operation_kind='decision';";Require(Convert.ToInt32(cmd.ExecuteScalar())==0);
+        });
+        Case("actual SQLite write failure rolls back entire decision transaction",f=>{
+            var s=new GameSaveService(f.Db,RealGameCatalog.InitialState(),extension:new FailingSqlWrite());string before=f.State();
+            Require(Error(()=>s.RecordDecision(f.Decision()))=="INVALID_DATA"&&f.State()==before);
+            using var c=f.Db.Open();using var cmd=c.CreateCommand();cmd.CommandText="SELECT count(*) FROM local_operations WHERE operation_kind='decision';";Require(Convert.ToInt32(cmd.ExecuteScalar())==0);
+        });
+        Case("foreign key prevents progress for nonexistent game",f=>{
+            using var c=f.Db.Open();using var cmd=c.CreateCommand();cmd.CommandText="INSERT INTO biome_progress VALUES($g,'ocean','human_pending',NULL,0,NULL,NULL,'fixture');";cmd.Parameters.AddWithValue("$g",Id());
+            try{cmd.ExecuteNonQuery();Require(false);}catch(SqliteException e){Require(e.SqliteErrorCode==19);}
+        });
+        Case("same logical local key is independent in another game",f=>{
+            f.S.RecordDecision(f.Decision());var previous=f.S.LoadGame(f.Owner,f.Game).Game;var key=f.S.GetDecisions(f.Owner,f.Game).Single().DecisionKey;
+            RuntimeMenuChecks.SeedTerminal(f.Db,previous.GameId);f.Game=Id();f.S.CreateNewGame(new(Id(),f.Owner,f.Game));f.S.RecordDecision(f.Decision(option:"approve"));
+            Require(f.S.GetDecisions(f.Owner,f.Game).Single().DecisionKey==key&&f.S.GetDecisions(f.Owner,previous.GameId).Single().OptionId=="reject");
+        });
+        Case("invalid biome option state and classification rejected",f=>{
+            Require(Error(()=>f.S.EnterBiome(null!))=="INVALID_DATA"&&Error(()=>f.S.CompleteBiome(null!))=="INVALID_DATA"&&Error(()=>f.S.RecordDecision(null!))=="INVALID_DATA"&&Error(()=>f.S.EnterBiome(f.Entry() with {BiomeId=null!}))=="UNKNOWN_BIOME");
+            Require(Error(()=>f.S.RecordDecision(f.Decision() with {OptionId="invented"}))!="OK"&&Error(()=>f.S.RecordDecision(f.Decision() with {ResolvedEnvironment="unknown"}))!="OK"
+                &&Error(()=>f.S.RecordDecision(f.Decision(classification:new("invented","v1"))))!="OK"&&Error(()=>f.S.EnterBiome(f.Entry("invented")))=="UNKNOWN_BIOME");
+        });
+        Case("offline services have no network execution dependency",f=>{Require(typeof(GameSaveService).Assembly.GetReferencedAssemblies().All(a=>!(a.Name??"").Contains("Http")&&!(a.Name??"").Contains("Mongo")));f.S.RecordDecision(f.Decision());});
+        Case("fixture path is fresh and disjoint from both protected durable stores",f=>{
+            Require(f.Db.Path.StartsWith(Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","databases")+Path.DirectorySeparatorChar,StringComparison.Ordinal)&&f.Db.Path!=CopyGameDatabase.AuthorizedPath&&f.Db.Path!=DurableTestDatabase.AuthorizedPath);
+        });
+        Case("all progress decision access and environment queries are read-only",f=>{
+            f.Finish();string hash=Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Db.Path)));var date=File.GetLastWriteTimeUtc(f.Db.Path);
+            _=f.S.GetGameProgress(f.Owner,f.Game);_=f.S.GetBiomeAccess(f.Owner,f.Game,"ocean");_=f.S.GetDecisions(f.Owner,f.Game);_=f.S.GetEnvironment(f.Owner,f.Game,"ocean");_=f.S.GetCompletedBiomes(f.Owner,f.Game);
+            Require(hash==Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Db.Path)))&&date==File.GetLastWriteTimeUtc(f.Db.Path));
+        });
+        await AsyncCase("concurrent identical decisions return same committed receipt",async f=>{
+            var c=f.Decision();var r=await Task.WhenAll(Task.Run(()=>f.S.RecordDecision(c)),Task.Run(()=>f.S.RecordDecision(c)));Require(r[0]==r[1]&&f.S.GetDecisions(f.Owner,f.Game).Count==1);
+        });
+        await AsyncCase("concurrent different decisions have one winner and no overwrite",async f=>{
+            var a=f.Decision();var b=f.Decision(option:"approve");var r=await Task.WhenAll(Task.Run(()=>Error(()=>f.S.RecordDecision(a))),Task.Run(()=>Error(()=>f.S.RecordDecision(b))));
+            Require(r.Count(x=>x=="OK")==1&&r.All(x=>x is "OK" or "REVISION_CONFLICT" or "DECISION_CONFLICT")&&f.S.GetDecisions(f.Owner,f.Game).Count==1);
+        });
+        await AsyncCase("concurrent identical completion is idempotent",async f=>{
+            f.S.RecordDecision(f.Decision());var c=f.Completion();var r=await Task.WhenAll(Task.Run(()=>f.S.CompleteBiome(c)),Task.Run(()=>f.S.CompleteBiome(c)));Require(r[0]==r[1]&&f.S.GetCompletedBiomes(f.Owner,f.Game).Count==1);
+        });
+        await AsyncCase("concurrent different completion operations retain terminal state",async f=>{
+            f.S.RecordDecision(f.Decision());var a=f.Completion();var b=a with {OperationId=Id()};var r=await Task.WhenAll(Task.Run(()=>Error(()=>f.S.CompleteBiome(a))),Task.Run(()=>Error(()=>f.S.CompleteBiome(b))));
+            Require(r.Count(x=>x=="OK")==1&&r.All(x=>x is "OK" or "REVISION_CONFLICT" or "BIOME_COMPLETED")&&f.S.GetCompletedBiomes(f.Owner,f.Game).Count==1);
+        });
+        Case("legacy update cannot regress completed progress",f=>{
+            f.Finish();var b=f.S.GetBiomeProgress(f.Owner,f.Game).Single(x=>x.BiomeId=="ocean");string before=f.State();
+            Require(Error(()=>f.S.UpdateBiomeProgress(Id(),f.Owner,f.Game,f.Revision,b with {Status="animal_pending",Result=null,AnimalCompletedAt=null}))=="BIOME_COMPLETED"&&f.State()==before);
+        });
+        Case("legacy checkpoint save cannot reopen completed biome",f=>{f.Finish();Require(Error(()=>f.S.SaveCurrentGame(new(Id(),f.Owner,f.Game,f.Revision,"ocean","animal_start","segment-start",GameSaveService.BoundarySnapshot)))=="BIOME_COMPLETED");});
+        Case("completed environment cannot be changed by new operation",f=>{f.Finish();Require(Error(()=>f.S.UpdateEnvironment(Id(),f.Owner,f.Game,f.Revision,f.S.GetEnvironment(f.Owner,f.Game,"ocean")))=="BIOME_COMPLETED");});
+        Case("completion retry after later archive returns original receipt",f=>{
+            f.S.RecordDecision(f.Decision());var c=f.Completion();var receipt=f.S.CompleteBiome(c);var g=f.S.LoadGame(f.Owner,f.Game).Game;RuntimeMenuChecks.SeedTerminal(f.Db,g.GameId);f.S.CreateNewGame(new(Id(),f.Owner,Id()));Require(f.S.CompleteBiome(c)==receipt);
+        });
+        Case("completion failure rolls back terminal flag and receipt",f=>{
+            f.S.RecordDecision(f.Decision());var s=new GameSaveService(f.Db,RealGameCatalog.InitialState(),extension:new RejectCommit());string before=f.State();Require(Error(()=>s.CompleteBiome(f.Completion()))=="TEST_ROLLBACK"&&f.State()==before);
+        });
+        Case("wrong stage perspective and asserted outcome rejected",f=>{
+            Require(Error(()=>f.S.EnterBiome(f.Entry(perspective:"animal")))=="INVALID_STAGE"&&Error(()=>f.S.CompleteBiome(f.Completion()))=="INVALID_STAGE");
+            f.S.RecordDecision(f.Decision());Require(Error(()=>f.S.CompleteBiome(f.Completion() with {ConfirmedResult="bad"}))=="INVALID_DATA");
+        });
+        Case("repository rejects duplicate logical decisions and completed overwrite",f=>{
+            f.Finish();var d=f.S.GetDecisions(f.Owner,f.Game).Single();using var c=f.Db.Open();using var t=c.BeginTransaction();var r=new SQLiteRepository(c,t);
+            Require(Error(()=>r.InsertDecision(d with {DecisionId=Id()}))=="DECISION_CONFLICT"&&Error(()=>r.PutBiome(f.S.GetCompletedBiomes(f.Owner,f.Game).Single()))=="BIOME_COMPLETED");t.Rollback();
+        });
+        await AsyncCase("new process restores completed lock decision and consequence read-only",async f=>{
+            f.Finish();var p=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true};
+            foreach(string arg in new[]{"--progress","--probe",f.Db.Path,f.Owner,f.Game})p.ArgumentList.Add(arg);
+            using var child=Process.Start(p);await child!.WaitForExitAsync();Require(child.ExitCode==0);
+        });
+        await AsyncCase("adapter exposes progress operations without opening protected store",async f=>{
+            await using var a=new GamePersistenceAdapter();var r=await a.GetGameProgressAsync(f.Owner,f.Game);Require(!r.Success&&r.Code=="STORAGE_CLOSED");
+            string output=Path.Combine(Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!,"integration","sqlite",".work","bin","Debug","TwoSides.dll");
+            using var stream=File.OpenRead(output);using var pe=new PEReader(stream);var md=pe.GetMetadataReader();var type=md.TypeDefinitions.Select(h=>md.GetTypeDefinition(h)).Single(t=>md.GetString(t.Name)=="GamePersistenceAdapter");
+            var methods=type.GetMethods().Select(h=>md.GetString(md.GetMethodDefinition(h).Name)).ToArray();Require(new[]{"EnterBiomeAsync","CompleteBiomeAsync","RecordDecisionAsync","GetGameProgressAsync"}.All(methods.Contains));
+        });
+        Case("free policy initially grants all five without sequential prerequisites",f=>{
+            var s=new GameSaveService(f.Db,RealGameCatalog.InitialState());
+            Require(s.GetGameProgress(f.Owner,f.Game).All(b=>b.CanEnterHuman&&b.Availability=="available"));
+            foreach(var biome in FreeBiomeAvailabilityPolicy.CanonicalBiomes)
+            {
+                var c=new EnterBiomeCommand(Id(),f.Owner,f.Game,s.LoadGame(f.Owner,f.Game).Game.Revision,biome,"human");
+                s.EnterBiome(c);Require(s.GetBiomeAccess(f.Owner,f.Game,biome).Activity=="in_progress");
+            }
+            Require(!s.AreAllCanonicalBiomesCompleted(f.Owner,f.Game));
+        });
+        Case("decision permits continuation and completion blocks only its biome",f=>{
+            var s=new GameSaveService(f.Db,RealGameCatalog.InitialState());s.RecordDecision(f.Decision());
+            Require(s.GetBiomeAccess(f.Owner,f.Game,"ocean").CanEnterAnimal&&!s.AreAllCanonicalBiomesCompleted(f.Owner,f.Game));
+            s.EnterBiome(f.Entry(perspective:"animal"));s.CompleteBiome(f.Completion());
+            Require(s.GetGameProgress(f.Owner,f.Game).Where(b=>b.Progress.BiomeId!="ocean").All(b=>b.CanEnterHuman)
+                &&!s.GetBiomeAccess(f.Owner,f.Game,"ocean").CanEnterAnimal&&!s.GetBiomeAccess(f.Owner,f.Game,"ocean").CanEnterHuman);
+        });
+        Case("four completed is false five is true without selecting an ending",f=>{
+            var s=new GameSaveService(f.Db,RealGameCatalog.InitialState());int n=0;
+            foreach(var biome in FreeBiomeAvailabilityPolicy.CanonicalBiomes.Reverse())
+            {
+                var g=s.LoadGame(f.Owner,f.Game);var key=RealGameCatalog.InitialState();
+                var keys=new System.Collections.Generic.Dictionary<string,string>{{"ocean","ocean_waste_disposal"},{"jungle","jungle_transport_route"},{"desert","desert_cat_abandonment"},{"forest","forest_industrial_pesticides"},{"tundra","tundra_fossil_extraction"}};
+                s.RecordDecision(new(Id(),Id(),f.Owner,f.Game,g.Game.Revision,biome,keys[biome],"reject","healthy","{\"stateKind\":\"healthy\"}"));
+                Require(!s.AreAllCanonicalBiomesCompleted(f.Owner,f.Game));
+                s.CompleteBiome(new(Id(),f.Owner,f.Game,s.LoadGame(f.Owner,f.Game).Game.Revision,biome,"good"));n++;
+                Require(s.AreAllCanonicalBiomesCompleted(f.Owner,f.Game)==(n==5));
+            }
+            var probe=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true};
+            foreach(string arg in new[]{"--progress","--setprobe",f.Db.Path,f.Owner,f.Game})probe.ArgumentList.Add(arg);
+            using(var child=Process.Start(probe)){child!.WaitForExit();Require(child.ExitCode==0);}
+            var completed=s.LoadGame(f.Owner,f.Game);Require(completed.Game.Ending is null&&completed.Game.Status=="in_progress");
+            Require(Error(()=>s.CreateNewGame(new(Id(),f.Owner,Id(),f.Game,completed.Game.Revision)))=="GAME_IN_PROGRESS");
+            RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);var newGame=Id();s.CreateNewGame(new(Id(),f.Owner,newGame));
+            Require(s.AreAllCanonicalBiomesCompleted(f.Owner,f.Game)&&!s.AreAllCanonicalBiomesCompleted(f.Owner,newGame)
+                &&s.GetGameProgress(f.Owner,newGame).All(b=>b.CanEnterHuman)&&s.GetGameProgress(f.Owner,f.Game).All(b=>!b.CanReplay));
+        });
+        Case("canonical completion query readonly rejects unknown owner and game",f=>{
+            var s=new GameSaveService(f.Db,RealGameCatalog.InitialState());var before=f.State();
+            string hash=Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Db.Path)));var date=File.GetLastWriteTimeUtc(f.Db.Path);
+            Require(!s.AreAllCanonicalBiomesCompleted(f.Owner,f.Game)&&before==f.State()
+                &&hash==Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Db.Path)))&&date==File.GetLastWriteTimeUtc(f.Db.Path)
+                &&Error(()=>s.AreAllCanonicalBiomesCompleted(Id(),f.Game))=="NOT_FOUND"&&Error(()=>s.AreAllCanonicalBiomesCompleted(f.Owner,Id()))=="NOT_FOUND");
+        });
+        Console.WriteLine($"Biome progress: {_passed} passed, {_failed} failed; free default policy approved; explicit fixtures remain isolated.");
+        return _failed==0?0:1;
+    }
+}

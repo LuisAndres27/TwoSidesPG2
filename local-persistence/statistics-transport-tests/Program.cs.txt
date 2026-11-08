@@ -1,0 +1,145 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+
+internal static class Program
+{
+ static int checks;static string Id()=>Guid.NewGuid().ToString("D");
+ static void Check(bool ok,string label){if(!ok)throw new Exception(label);checks++;Console.WriteLine("PASS "+label);}
+ sealed class Credentials:IStatisticsCredentials {
+  public StatisticsCredential? Value;
+  public Task<StatisticsCredential?> GetAsync(CancellationToken c)=>Task.FromResult(Value);
+ }
+ sealed class Handler:HttpMessageHandler {
+  public int Calls;public Func<HttpRequestMessage,CancellationToken,Task<HttpResponseMessage>> Respond=null!;
+  protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage r,CancellationToken c){Calls++;return Respond(r,c);}
+ }
+ sealed class Fixture:IAsyncDisposable {
+  public readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);public readonly SyntheticDatabase Db;public GamePersistenceAdapter Adapter;
+  public readonly string Owner=Id(),Game=Id();public long Now=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();public readonly Credentials Credentials=new();
+  public Fixture(){Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Adapter=GamePersistenceAdapter.CreateSyntheticStatisticsAdapter(Db);}
+  public long N(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+  public string Text(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return (string)q.ExecuteScalar()!;}
+  public async Task Start(){
+   if(!(await Adapter.OpenAsync("owned-outbox-fixture")).Success)throw new Exception("fixture open");
+   await Adapter.CreateLocalProfileAsync(new(Id(),Owner,"PRIVATE-SYNTHETIC-B79"));await Adapter.CreateNewGameAsync(new(Id(),Owner,Game));
+   long Rev()=>(Adapter.LoadGameAsync(Owner,Game).GetAwaiter().GetResult().Data!).Game.Revision;
+   await Adapter.EnterBiomeAsync(new(Id(),Owner,Game,Rev(),"ocean","human"));
+   await Adapter.RecordDecisionAsync(new(Id(),Id(),Owner,Game,Rev(),"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}"));
+   await Adapter.CompleteBiomeAsync(new(Id(),Owner,Game,Rev(),"ocean","good"));
+   Credentials.Value=new(Text("SELECT installation_id FROM statistics_installation;"),new string('A',43),"https://localhost:8443",Now+3600000);
+  }
+  public StatisticsTransport Worker(Handler handler)=>new(Adapter,Credentials,new Uri("https://localhost:8443/"),syntheticLoopback:true,testHandler:handler,now:()=>Now,random:()=>0.5);
+  public async ValueTask DisposeAsync(){await Adapter.DisposeAsync();Sandbox.Dispose();}
+ }
+ static async Task<HttpResponseMessage> Reply(HttpRequestMessage req,Func<List<Dictionary<string,string>>,List<Dictionary<string,string>>>? transform=null){
+  string text=await req.Content!.ReadAsStringAsync();using var body=JsonDocument.Parse(text);var receipts=new List<Dictionary<string,string>>();
+  Check(body.RootElement.GetProperty("Contract").GetString()==StatisticsTransport.Contract,"wire contract explicit");
+  Check(body.RootElement.GetProperty("Events").GetArrayLength()<=5,"wire batch bounded");
+  foreach(var item in body.RootElement.GetProperty("Events").EnumerateArray()){
+   using var e=JsonDocument.Parse(item.GetProperty("EventJson").GetString()!);
+   receipts.Add(new(){{"EventId",e.RootElement.GetProperty("EventId").GetString()!},{"PayloadHash",item.GetProperty("PayloadHash").GetString()!},{"Status","accepted"},{"Code","ok"}});
+  }
+  Check(!text.Contains("PRIVATE-SYNTHETIC")&&!text.Contains("display_name")&&!text.Contains("game.report"),"wire has no profile/save payload");
+  return new(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(new{Contract=StatisticsTransport.Contract,Receipts=transform?.Invoke(receipts)??receipts}),Encoding.UTF8,"application/json")};
+ }
+ static async Task Receipts(){
+  foreach(string mode in new[]{"all","reverse","partial","empty","wrong-id","wrong-hash","duplicate","permanent","malformed"}){
+   await using var f=new Fixture();await f.Start();var h=new Handler();h.Respond=async(r,c)=>mode=="malformed"?new(HttpStatusCode.OK){Content=new StringContent("{}")}:await Reply(r,items=>{
+    if(mode=="reverse")items.Reverse();if(mode=="partial")return items.Take(1).ToList();if(mode=="empty")return new();
+    if(mode=="wrong-id")items[0]["EventId"]=Id();if(mode=="wrong-hash")items[0]["PayloadHash"]=new string('0',64);if(mode=="duplicate")items[1]=new(items[0]);
+    if(mode=="permanent"){items[0]["Status"]="rejected";items[0]["Code"]="event_expired";}return items;
+   });await using var w=f.Worker(h);await w.TickAsync();
+   long expected=mode is "all" or "reverse"?5:mode=="partial"?1:mode=="permanent"?4:0;
+   Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed';")==expected,"individual receipts: "+mode);
+   Check(f.N("SELECT count(*) FROM statistics_events;")==5,"sending never creates events: "+mode);
+   if(mode=="permanent"){Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='permanent_failure';")==1,"permanent rejection retained");Check(f.Text("SELECT last_error_code FROM statistics_outbox WHERE state='permanent_failure';")=="event_expired","permanent reason persisted without free text");}
+  }
+ }
+ static async Task Errors(){
+  foreach(int status in new[]{401,403,400,404,429,500,503,302}){
+   await using var f=new Fixture();await f.Start();var h=new Handler{Respond=(r,c)=>{var response=new HttpResponseMessage((HttpStatusCode)status);if(status==429)response.Headers.RetryAfter=new RetryConditionHeaderValue(TimeSpan.FromSeconds(240));return Task.FromResult(response);}};
+   await using var w=f.Worker(h);await w.TickAsync();Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed';")==0,"HTTP "+status+" never acknowledges");
+   Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='retryable_failure';")==5,"HTTP failure retains five pending");
+   if(status==429)Check(f.N("SELECT min(next_attempt_ms) FROM statistics_outbox;")>=f.Now+240000,"Retry-After respected");
+   if(status==401){await w.TickAsync();Check(h.Calls==1,"auth failure pauses without loop");await w.ResumeAuthenticationAsync();h.Respond=(r,c)=>Reply(r);await w.TickAsync();Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed';")==5,"explicit auth renewal resumes same IDs");}
+  }
+  foreach(string fault in new[]{"network","timeout","cancel","tls"}){
+   await using var f=new Fixture();await f.Start();var h=new Handler{Respond=async(r,c)=>{if(fault=="cancel")await Task.Delay(10000,c);if(fault=="timeout")throw new TaskCanceledException();throw new HttpRequestException("synthetic failure");}};
+   await using var w=f.Worker(h);using var cancel=new CancellationTokenSource();if(fault=="cancel")cancel.CancelAfter(30);await w.TickAsync(cancel.Token);
+   Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed';")==0,"failure not acknowledged: "+fault);
+   Check(f.N("SELECT count(*) FROM statistics_events;")==5,"durable source retained: "+fault);
+  }
+  await using(var f=new Fixture()){
+   await f.Start();var h=new Handler{Respond=(r,c)=>Task.FromException<HttpResponseMessage>(new HttpRequestException())};await using var w=f.Worker(h);
+   await w.TickAsync();long first=f.N("SELECT min(next_attempt_ms) FROM statistics_outbox;")-f.Now;f.Now+=first+1;await w.TickAsync();long second=f.N("SELECT min(next_attempt_ms) FROM statistics_outbox;")-f.Now;
+   Check(second>first,"exponential bounded backoff");await w.TickAsync();Check(h.Calls==2,"future retries do not spin HTTP");
+  }
+ }
+ static async Task Concurrency(){
+  await using var f=new Fixture();await f.Start();TaskCompletionSource<bool> entered=new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),release=new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+  var h=new Handler{Respond=async(r,c)=>{entered.TrySetResult(true);await release.Task.WaitAsync(c);return await Reply(r);}};await using var w=f.Worker(h);
+  var tick=w.TickAsync();await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));Check(await w.TickAsync()=="STATISTICS_TRANSPORT_BUSY","one concurrent transport pass");
+  var save=f.Adapter.UpdateDisplayNameAsync(Id(),f.Owner,0,"Another synthetic name");Check((await save.WaitAsync(TimeSpan.FromSeconds(2))).Success,"HTTP does not hold the gameplay storage gate");
+  release.SetResult(true);await tick;Check(h.Calls==1,"single HTTP request for concurrent ticks");
+  Check(!f.Credentials.Value!.ToString().Contains(f.Credentials.Value.Token),"credential diagnostics redacted");
+ }
+ static async Task Configuration(){
+  await using var f=new Fixture();await f.Start();var h=new Handler{Respond=(r,c)=>Reply(r)};
+  foreach(var uri in new[]{"http://example.invalid/","https://localhost:8443/?query=1","https://user:password@localhost:8443/","https://localhost:8443/other"}){
+   try{await using var unused=new StatisticsTransport(f.Adapter,f.Credentials,new Uri(uri));throw new Exception("unsafe endpoint accepted");}catch(ArgumentException){Check(true,"unsafe endpoint rejected before request");}
+  }
+  f.Credentials.Value=null;await using(var w=f.Worker(h)){await w.TickAsync();Check(h.Calls==0&&f.N("SELECT count(*) FROM statistics_outbox WHERE state='pending';")==5,"missing credential never reserves or transmits");}
+  f.Credentials.Value=new(f.Text("SELECT installation_id FROM statistics_installation;"),new string('A',43),"https://other.invalid",f.Now+1000);
+  await using(var w=f.Worker(h)){await w.TickAsync();Check(h.Calls==0,"credential cannot follow a different audience");}
+  f.Credentials.Value=new(f.Text("SELECT installation_id FROM statistics_installation;"),new string('A',43),"https://localhost:8443",f.Now-1);
+  await using(var w=f.Worker(h)){await w.TickAsync();Check(h.Calls==0,"expired credential never sent");}
+  f.Credentials.Value=new(Id(),new string('A',43),"https://localhost:8443",f.Now+1000);
+  await using(var w=f.Worker(h)){await w.TickAsync();Check(h.Calls==0&&f.N("SELECT count(*) FROM statistics_outbox WHERE state='retryable_failure';")==5,"foreign installation pauses without reassigning events");}
+  string host=File.ReadAllText("integration/sqlite/GameSyncHost.cs");Check(host.Contains("ConfigureStatisticsForAuthorizedRun(bool consent")&&host.Contains("if(!_testStorage){options=null;mainOptions=null;}"),"Godot retains default-disabled isolated activation");
+ }
+ sealed class Server:IAsyncDisposable {
+  readonly Process process;public readonly Uri Base;public readonly string Token;
+  public Server(string directory,string installation,bool drop){
+   var start=new ProcessStartInfo("node"){RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,UseShellExecute=false,CreateNoWindow=true};
+   start.ArgumentList.Add("--import");start.ArgumentList.Add(new Uri(Path.GetFullPath("backend/tests/jwt/env-guard.js")).AbsoluteUri);start.ArgumentList.Add(Path.GetFullPath("backend/tests/statistics/e2e-server.js"));start.ArgumentList.Add(directory);start.ArgumentList.Add(installation);start.ArgumentList.Add(drop?"drop-once":"normal");
+   process=Process.Start(start)!;Token=Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_');
+   process.StandardInput.WriteLine(JsonSerializer.Serialize(new{token=Token}));
+   string? line=process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+   if(line is null)throw new Exception("Synthetic server bootstrap failed");using var json=JsonDocument.Parse(line);Base=new("http://127.0.0.1:"+json.RootElement.GetProperty("port").GetInt32()+"/");
+  }
+  public async Task<long> Total(){await process.StandardInput.WriteLineAsync("summary");using var json=JsonDocument.Parse((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)))!);return json.RootElement.TryGetProperty("all|events",out var value)?value.GetInt64():0;}
+  public async ValueTask DisposeAsync(){if(!process.HasExited){await process.StandardInput.WriteLineAsync("close");await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));}Check(process.ExitCode==0,"loopback server closed normally");process.Dispose();}
+ }
+ static async Task EndToEnd(){
+  await using var f=new Fixture();await f.Start();string installation=f.Text("SELECT installation_id FROM statistics_installation;"),directory=Path.Combine(Path.GetTempPath(),"twosides-b79-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(directory);
+  try{
+   await using(var server=new Server(directory,installation,true)){
+    f.Credentials.Value=new(installation,server.Token,server.Base.GetLeftPart(UriPartial.Authority),f.Now+900000);
+    await using var w=new StatisticsTransport(f.Adapter,f.Credentials,server.Base,syntheticLoopback:true,now:()=>f.Now,random:()=>0.5);
+    await w.TickAsync();Check(await server.Total()==5,"Express committed all five before response loss");Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed';")==0,"lost response leaves client unconfirmed");
+   }
+   await f.Adapter.DisposeAsync();f.Adapter=GamePersistenceAdapter.CreateSyntheticStatisticsAdapter(f.Db);await f.Adapter.OpenAsync("owned-outbox-fixture");f.Now+=120000;
+   await using(var server=new Server(directory,installation,false)){
+    f.Credentials.Value=new(installation,server.Token,server.Base.GetLeftPart(UriPartial.Authority),f.Now+900000);
+    await using var w=new StatisticsTransport(f.Adapter,f.Credentials,server.Base,syntheticLoopback:true,now:()=>f.Now,random:()=>0.5);
+    await w.TickAsync();Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed';")==5,"real Express replay receipts confirm same five");Check(await server.Total()==5,"new Node process retains dedup and never recounts");
+    Check((await f.Adapter.LoadGameAsync(f.Owner,f.Game)).Data!.Biomes.Single(b=>b.BiomeId=="ocean").Status=="completed","game progress unchanged by transport and reopening");
+   }
+  }finally{if(Path.GetDirectoryName(directory)!=Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar)||!Path.GetFileName(directory).StartsWith("twosides-b79-",StringComparison.Ordinal))throw new Exception("unsafe cleanup");foreach(var file in Directory.GetFiles(directory))File.Delete(file);Directory.Delete(directory);}
+ }
+ public static async Task<int> Main(){try{await Receipts();await Errors();await Concurrency();await Configuration();await EndToEnd();Console.WriteLine("B79 CLIENT AND EXPRESS CHECKS PASS "+checks);return 0;}catch(Exception e){Console.WriteLine("B79 FAIL "+e.GetType().Name+" "+e.Message);return 1;}}
+}

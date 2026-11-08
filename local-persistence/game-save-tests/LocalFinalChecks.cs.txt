@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class LocalFinalChecks
+{
+    private static int _count;
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool value,string label){if(!value)throw new Exception(label);_count++;Console.WriteLine("PASS "+label);}
+    private static void Reject(Action action,string label)
+    {try{action();throw new Exception("Unexpected success: "+label);}catch(SaveException){Check(true,label);}}
+    private static FinalDecision[] Input(string game,int rejects)=>Biomes.Select((b,i)=>new FinalDecision(game,b,i<rejects?"reject":"approve",i<rejects?"healthy":"degraded",i<rejects?"good":"bad",true)).ToArray();
+    private sealed class Store:ILocalMenuStore,ILocalFinalStore
+    {
+        internal readonly RuntimeMenuChecks.Failure Failure=new();
+        internal readonly RuntimeMenuChecks.Store Menu;
+        internal bool LostPrepare,LostClose;
+        internal TaskCompletionSource<bool>? Gate;
+        internal Store(ISaveDatabase db)=>Menu=new(db,Failure);
+        public Task<LocalSaveResult<LocalProfile>> OpenAsync(string p)=>Menu.OpenAsync(p);
+        public Task<LocalSaveResult<LocalProfile>> GetLocalProfileAsync()=>Menu.GetLocalProfileAsync();
+        public Task<LocalSaveResult<LocalProfile>> CreateLocalProfileAsync(ProfileCreationRequest r)=>Menu.CreateLocalProfileAsync(r);
+        public Task<LocalSaveResult<bool>> HasUnfinishedGamesAsync(string o)=>Menu.HasUnfinishedGamesAsync(o);
+        public Task<LocalSaveResult<GameAggregate>> GetActiveGameAsync(string o)=>Menu.GetActiveGameAsync(o);
+        public Task<LocalSaveResult<GameAggregate>> LoadGameAsync(string o,string g)=>Menu.LoadGameAsync(o,g);
+        public Task<LocalSaveResult<GameAggregate>> CreateNewGameAsync(NewGameCommand c)=>Menu.CreateNewGameAsync(c);
+        public Task<LocalSaveResult<IReadOnlyList<BiomeAccess>>> GetGameProgressAsync(string o,string g)=>Menu.GetGameProgressAsync(o,g);
+        public async Task<LocalSaveResult<SaveReceipt>> PrepareFinalAsync(PrepareFinalCommand c)
+        {
+            if(Gate is not null)await Gate.Task;
+            try{var r=Menu.Service.PrepareFinal(c);if(LostPrepare){LostPrepare=false;return new(false,"IO_ERROR");}return new(true,"FINAL_PREPARED",r,r);}
+            catch(SaveException e){return new(false,e.Code);}
+        }
+        public Task<LocalSaveResult<SaveReceipt>> CloseGameAsync(CloseGameCommand c)
+        {
+            try{var r=Menu.Service.CloseGame(c);if(LostClose){LostClose=false;return Task.FromResult(new LocalSaveResult<SaveReceipt>(false,"IO_ERROR"));}return Task.FromResult(new LocalSaveResult<SaveReceipt>(true,"CLOSED",r,r));}
+            catch(SaveException e){return Task.FromResult(new LocalSaveResult<SaveReceipt>(false,e.Code));}
+        }
+        public ValueTask DisposeAsync()=>ValueTask.CompletedTask;
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly Store Store;
+        internal readonly string Owner=Id(),Game=Id();
+        internal GameSaveService Save=>Store.Menu.Service;
+        internal F(int rejects=5,bool complete=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Store=new(Db);
+            Save.CreateLocalProfile(Id(),Owner,"Final sintético");Save.CreateNewGame(new(Id(),Owner,Game));
+            foreach(int i in new[]{3,0,4,1,2})
+            {
+                bool healthy=i<rejects;string env=healthy?"healthy":"degraded";
+                Save.EnterBiome(new(Id(),Owner,Game,Current.Game.Revision,Biomes[i],"human"));
+                Save.RecordDecision(new(Id(),Id(),Owner,Game,Current.Game.Revision,Biomes[i],Keys[i],healthy?"reject":"approve",env,"{\"stateKind\":\""+env+"\"}"));
+                if(complete)Save.CompleteBiome(new(Id(),Owner,Game,Current.Game.Revision,Biomes[i],healthy?"good":"bad"));
+            }
+        }
+        internal GameAggregate Current=>Save.LoadGame(Owner,Game);
+        internal PrepareFinalCommand Prepare()=>new(Id(),Owner,Game,Current.Game.Revision);
+        internal CloseGameCommand Close()=>new(Id(),Owner,Game,Current.Game.Revision,Current.Game.Ending!);
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    public static int Probe(string path,string owner,string game,string ending)
+    {
+        var service=new GameSaveService(new RuntimeMenuChecks.ReadOnlyFixture(path),RealGameCatalog.InitialState());
+        var g=service.LoadGame(owner,game);return g.Game.Ending==ending&&g.Game.EndingRulesVersion==LocalFinalEvaluator.Version&&g.Biomes.All(b=>b.Status=="completed")?0:91;
+    }
+    private static async Task Child(F f)
+    {
+        using var p=Process.Start(new ProcessStartInfo(Environment.ProcessPath!,"--final-probe \""+f.Db.Path+"\" "+f.Owner+" "+f.Game+" "+f.Current.Game.Ending){UseShellExecute=false,CreateNoWindow=true})!;
+        await p.WaitForExitAsync();Check(p.ExitCode==0,"new process recovers persisted ending "+f.Current.Game.Status);
+    }
+    public static async Task<int> Run()
+    {
+        string game=Id();
+        for(int n=0;n<=5;n++)Check(LocalFinalEvaluator.Evaluate(game,Input(game,n)).Ending==(n==5?"good":n>=3?"medium":"bad"),n+" reject authorized result");
+        for(int mask=0;mask<32;mask++)
+        {
+            var values=Biomes.Select((b,i)=>{bool good=(mask&(1<<i))!=0;return new FinalDecision(game,b,good?"reject":"approve",good?"healthy":"degraded",good?"good":"bad",true);}).ToArray();
+            int n=values.Count(d=>d.OptionId=="reject");var result=LocalFinalEvaluator.Evaluate(game,values);
+            Check(result.Ending==(n==5?"good":n>=3?"medium":"bad")&&result==LocalFinalEvaluator.Evaluate(game,values.Reverse().ToArray()),"exhaustive combination and order "+mask);
+        }
+        var input=Input(game,5);
+        Reject(()=>LocalFinalEvaluator.Evaluate(game,input.Take(4).ToArray()),"missing decision rejected");
+        var altered=input.ToArray();altered[4]=altered[0];Reject(()=>LocalFinalEvaluator.Evaluate(game,altered),"duplicate biome rejected");
+        foreach(var change in new[]{input[0] with {BiomeId="unknown"},input[0] with {OptionId="invalid"},input[0] with {Completed=false},input[0] with {GameId=Id()},input[0] with {Environment="degraded"},input[0] with {Result="bad"}})
+        {var bad=input.ToArray();bad[0]=change;Reject(()=>LocalFinalEvaluator.Evaluate(game,bad),"contradictory/incomplete/foreign input rejected");}
+        Check(LocalFinalEvaluator.Evaluate(game,input)==LocalFinalEvaluator.Evaluate(game,input),"pure deterministic evaluation repeated");
+        foreach(int rejects in new[]{5,3,0})using(var f=new F(rejects))
+        {
+            var before=f.Current;var command=f.Prepare();var receipt=f.Save.PrepareFinal(command);var final=f.Current;
+            Check(final.Game.Status=="final_pending"&&final.Game.IsCurrent&&final.Game.Ending==(rejects==5?"good":rejects==3?"medium":"bad"),"persist final "+rejects);
+            Check(final.Game.EndingRulesVersion==LocalFinalEvaluator.Version&&final.Game.RulesVersion==before.Game.RulesVersion&&final.Game.CompletedAt is not null,"separate ending rules version without rewriting decisions");
+            Check(final.Decisions.SequenceEqual(before.Decisions)&&final.Environments.SequenceEqual(before.Environments)&&final.Biomes.SequenceEqual(before.Biomes),"prepare preserves all decisions consequences progress");
+            Check(f.Save.PrepareFinal(command)==receipt&&f.Current.Game.Revision==final.Game.Revision,"same prepare operation replays receipt");
+            f.Save.PrepareFinal(f.Prepare());Check(f.Current.Game.Revision==final.Game.Revision,"new prepare ID preserves existing result and revision");
+            Reject(()=>f.Save.PrepareFinal(command with {ExpectedRevision=999}),"same prepare ID contradicting payload rejected");
+            Reject(()=>f.Save.CloseGame(f.Close() with {ConfirmedEnding=final.Game.Ending=="bad"?"good":"bad"}),"contradictory ending cannot close or overwrite");
+            Check(f.Current.Game==final.Game&&f.Save.HasUnfinishedGames(f.Owner),"failed close preserves result and blocks new game");
+            await Child(f);
+            var reopened=new GameSaveService(f.Db,RealGameCatalog.InitialState());
+            Check(reopened.GetActiveGame(f.Owner)!.Game.Ending==final.Game.Ending,"reopen during presentation retains final pending");
+            var close=f.Close();var closed=f.Save.CloseGame(close);var history=f.Current;
+            Check(history.Game.Status=="completed"&&!history.Game.IsCurrent&&history.Game.ArchivedAt is not null&&history.Game.CompletedAt==final.Game.CompletedAt,"explicit exit closes globally and preserves prepared date");
+            Check(f.Save.CloseGame(close)==closed,"same close ID replays receipt");
+            f.Save.CloseGame(f.Close());Check(f.Current.Game.Revision==history.Game.Revision,"new close ID recognizes logical closed state");
+            Check(history.Decisions.SequenceEqual(before.Decisions)&&history.Environments.SequenceEqual(before.Environments)&&history.Biomes.SequenceEqual(before.Biomes),"closure preserves immutable history");
+            var stats=new StatisticsService(f.Db,RealGameCatalog.InitialState()).GetPlayerStatistics(f.Owner);
+            Check(stats.CompletedGames.Value==1&&stats.HistoricalGames.Single().Ending.Kind==final.Game.Ending,"statistics recognize distinct local ending version");
+            await Child(f);
+            string newGame=Id();f.Save.CreateNewGame(new(Id(),f.Owner,newGame));var active=f.Save.GetActiveGame(f.Owner)!;
+            Check(active.Game.GameId==newGame&&active.Decisions.Count==0&&active.Environments.All(e=>e.StateKind is null)&&active.Biomes.All(b=>b.Status=="human_pending"),"explicit new game starts independent clean state");
+            Check(f.Save.GetGameProgress(f.Owner,newGame).All(b=>b.Availability=="available")&&f.Save.GetGameHistory(f.Owner).Count==2&&f.Current.Game==history.Game&&f.Current.Decisions.SequenceEqual(history.Decisions),"five biomes available and earlier game preserved");
+            Reject(()=>f.Save.CreateNewGame(new(Id(),f.Owner,Id(),newGame,active.Game.Revision)),"second active game rejected");
+        }
+        using(var f=new F(5,false))
+        {
+            Reject(()=>f.Save.PrepareFinal(f.Prepare()),"five decisions without physical completions cannot produce ending");
+            Check(f.Current.Game.Ending is null&&f.Current.Game.Status=="in_progress","failed evaluation never defaults to bad");
+        }
+        using(var f=new F())
+        {
+            var command=f.Prepare();var before=f.Current;f.Store.Failure.Enabled=true;
+            Reject(()=>f.Save.PrepareFinal(command),"injected prepare failure rolls back");
+            Check(f.Current.Game==before.Game,"no persisted result before commit");
+            f.Store.Failure.Enabled=false;f.Save.PrepareFinal(command);var close=f.Close();var pending=f.Current;f.Store.Failure.Enabled=true;
+            Reject(()=>f.Save.CloseGame(close),"injected close failure rolls back");
+            Check(f.Current.Game==pending.Game&&f.Save.HasUnfinishedGames(f.Owner),"failed exit cannot unlock new game");
+            f.Store.Failure.Enabled=false;f.Save.CloseGame(close);Check(!f.Save.HasUnfinishedGames(f.Owner),"same close resolves after storage recovers");
+        }
+        using(var f=new F())
+        {
+            await using var state=new LocalGameState(f.Store,"owned-fixture");await state.InitializeAsync();
+            Check(state.NeedsFinal&&state.CanContinue&&!state.CanStartNewGame,"startup recognizes five completed with no result");
+            f.Store.LostPrepare=true;Check(!await state.PrepareFinalAsync()&&state.HasPendingWrite,"lost prepare response retains immutable pending command");
+            Check(await state.PrepareFinalAsync()&&state.ConfirmedEnding=="good"&&!state.HasPendingWrite,"same prepare resolves confirmed result after response loss");
+            long revision=f.Current.Game.Revision;
+            // Navigation is deliberately refused: persisted final and the menu capability remain authoritative.
+            Check(!await state.NavigateFinalAsync(()=>Task.FromResult(false))&&state.Code=="NAVIGATION_FAILED"&&state.ConfirmedEnding=="good"&&!state.CanStartNewGame,"navigation failure cannot undo final or enable new game");
+            await using var restarted=new LocalGameState(f.Store,"owned-fixture");await restarted.InitializeAsync();
+            Check(await restarted.PrepareFinalAsync()&&restarted.ConfirmedEnding=="good"&&f.Current.Game.Revision==revision,"new context restores final without replaying fifth biome");
+            f.Store.LostClose=true;Check(!await state.CloseFinalAsync(f.Game,"good")&&state.HasPendingWrite&&!state.CanStartNewGame,"lost close response stays recoverable without early UI unlock");
+            Check(await state.CloseFinalAsync(f.Game,"good")&&state.CanStartNewGame&&!state.CanContinue,"close retry verifies commit and unlocks explicit new game");
+            Check(await state.NewGameAsync()&&state.ActiveGame!.Decisions.Count==0&&state.Profile!.LocalPlayerId==f.Owner,"menu creates fresh game only after explicit request");
+        }
+        using(var f=new F())
+        {
+            await using var state=new LocalGameState(f.Store,"owned-fixture");await state.InitializeAsync();f.Store.Gate=new();
+            var first=state.PrepareFinalAsync();Check(!await state.PrepareFinalAsync(),"double prepare click rejected while busy");
+            f.Store.Gate.SetResult(true);Check(await first,"original prepare click confirms once");
+        }
+        using(var f=new F(4,false))
+        {
+            GameplayEventSchema.MigrateSynthetic(f.Db);var events=new GameplayEventService(f.Db);string session=Id(),run=Id();
+            events.RecordEvent(new(Id(),f.Owner,session,GameplayEventKind.SESSION_STARTED,DateTimeOffset.UnixEpoch,0));
+            events.RecordEvent(new(run,f.Owner,session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,DateTimeOffset.UnixEpoch,0,f.Game,"ocean",run));
+            events.RecordInterval(new(Id(),f.Owner,session,0,100,GameplayTimeState.ActiveAnimal,f.Game,"ocean",run));
+            events.RecordEvent(new(Id(),f.Owner,session,GameplayEventKind.ANIMAL_SEGMENT_EXITED,DateTimeOffset.UnixEpoch.AddMilliseconds(100),100,f.Game,"ocean",run));
+            events.RecordEvent(new(Id(),f.Owner,session,GameplayEventKind.SESSION_ENDED,DateTimeOffset.UnixEpoch.AddMilliseconds(100),100,SessionEnd:GameplaySessionEnd.Normal));
+            var originalEvents=events.GetEvents(f.Owner).ToArray();
+            for(int i=0;i<4;i++)f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,f.Current.Game.Revision,Biomes[i],"good"));
+            Reject(()=>f.Save.PrepareFinal(f.Prepare()),"four completed do not unlock global final");
+            f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,f.Current.Game.Revision,"tundra","bad"));
+            Check(f.Save.AreAllCanonicalBiomesCompleted(f.Owner,f.Game),"fifth physical completion satisfies canonical set");
+            f.Save.PrepareFinal(f.Prepare());f.Save.CloseGame(f.Close());
+            Check(events.GetEvents(f.Owner).SequenceEqual(originalEvents)&&events.GetTotals(f.Owner,f.Game).EffectiveMs.Value==100,"prepare and closure preserve existing gameplay events and effective time");
+            Reject(()=>f.Save.PrepareFinal(new(Id(),Id(),f.Game,f.Current.Game.Revision)),"foreign player cannot prepare another game");
+            Reject(()=>f.Save.CloseGame(f.Close() with {LocalPlayerId=Id()}),"foreign player cannot close another game");
+        }
+        Console.WriteLine(_count+" local final checks passed; presentation/SceneTree require Godot manual validation.");return 0;
+    }
+}

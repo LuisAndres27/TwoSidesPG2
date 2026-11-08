@@ -1,0 +1,54 @@
+using System;
+using System.IO;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+// B73: builds a LEGITIMATE production-style store (real OwnedCopyDatabase production code, real ownership.json, real schema) inside a disposable
+// simulated LocalAppData root, so the second-start preflight and the read-only inspector can be tested without touching any real profile.
+//   --make-synthetic-store  <localRoot>   profile + game + dolphin (ocean) decision, then closes
+//   --extend-synthetic-store <localRoot>  reopens the same store (as a second start would) and adds a jungle decision, then closes
+// The root must not be the machine's real LocalAppData and must contain a "TwoSidesTests" segment.
+internal static class SyntheticStoreMaker
+{
+    private const string Owner = "11111111-1111-4111-8111-111111111111";
+    private const string Game = "22222222-2222-4222-8222-222222222222";
+    private static string Id() => Guid.NewGuid().ToString("D");
+
+    private static string Check(string root)
+    {
+        string full = Path.GetFullPath(root);
+        string real = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.Equals(full.TrimEnd('\\'), real.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase) || !full.Contains(Path.DirectorySeparatorChar + "TwoSidesTests" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new Exception("REFUSED: only a disposable root under a 'TwoSidesTests' folder is allowed");
+        Directory.CreateDirectory(full);
+        return full;
+    }
+
+    public static int Run(string[] args)
+    {
+        if (args.Length != 2) throw new Exception("argument: <localRoot>");
+        string root = Check(args[1]);
+        string path = Path.Combine(OwnedCopyDatabaseBridge.Directory(root), "save.sqlite3");
+        using var db = CopyGameDatabase.OpenProductionUnder(root, path);
+        var service = new GameSaveService(db, RealGameCatalog.InitialState());
+        if (args[0] == "--make-synthetic-store")
+        {
+            service.CreateLocalProfile(Id(), Owner, "Synthetic Player");
+            service.CreateNewGame(new(Id(), Owner, Game));
+            service.EnterBiome(new(Id(), Owner, Game, service.LoadGame(Owner, Game).Game.Revision, "ocean", "human"));
+            service.RecordDecision(new(Id(), Id(), Owner, Game, service.LoadGame(Owner, Game).Game.Revision, "ocean", "ocean_waste_disposal", "reject", "healthy", "{\"stateKind\":\"healthy\"}"));
+        }
+        else
+        {
+            service.EnterBiome(new(Id(), Owner, Game, service.LoadGame(Owner, Game).Game.Revision, "jungle", "human"));
+            service.RecordDecision(new(Id(), Id(), Owner, Game, service.LoadGame(Owner, Game).Game.Revision, "jungle", "jungle_transport_route", "approve", "degraded", "{\"stateKind\":\"degraded\"}"));
+        }
+        Console.WriteLine("OK " + args[0] + " " + path);
+        return 0;
+    }
+}
+
+internal static class OwnedCopyDatabaseBridge
+{
+    public static string Directory(string localRoot) => Path.Combine(localRoot, "TwoSides", "PlayerData");
+}

@@ -1,0 +1,89 @@
+// fake-sync-server.mjs.template — OFFLINE TEST DOUBLE of the Express main sync API, ONLY for staged-selftest.ps1.template (B40). It is NOT Express, NOT the backend and NOT part of src/.
+// Plain node:http on 127.0.0.1 (random port). It stores everything in memory, connects to nothing, reads no secret and no project file. It imitates the PUBLIC contract that
+// the staged script uses (health, registration, session, batches, receipts/query) with the same field names as the real service, plus a test-only control channel (/__ctl, /__log, /__db)
+// that the staged script is forbidden to call (its method/path allow-list does not contain it).
+//   node fake-sync-server.mjs <absolute db-snapshot file>        prints {"listening":true,"port":N} and writes the snapshot after every change
+import http from 'node:http';
+import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+
+const snapshotFile = process.argv[2];
+if (!snapshotFile || process.argv.length !== 3) { console.error('usage: node fake-sync-server.mjs <absolute snapshot file>'); process.exit(1); }
+const db = { accounts: {}, registrations: {}, sessions: 0, operations: {}, facts: 0, guard: {}, fences: {}, historical: { users: 2, decisions: 7, gameevents: 13, gameprogresses: 2, statisticevents: 14, statisticsummaries: 2, syncidentities: 1 },
+  baseline: { operations: 1, facts: 1, fences: 2, identities: 1, ownerGuards: 1, identitySessions: 1, revocations: 0 } };
+const ctl = { batch: [], query: [], session: [] };            // queues of behaviours consumed one per request
+const log = [];
+const save = () => fs.writeFileSync(snapshotFile, JSON.stringify({ ...db, counts: counts() }));
+const counts = () => ({ identities: db.baseline.identities + Object.keys(db.accounts).length, ownerGuards: db.baseline.ownerGuards + Object.keys(db.accounts).length,
+  identitySessions: db.baseline.identitySessions + db.sessions, operations: db.baseline.operations + Object.keys(db.operations).length, facts: db.baseline.facts + db.facts,
+  fences: db.baseline.fences + Object.keys(db.fences).length, revocations: db.baseline.revocations });
+const body = req => new Promise(resolve => { const c = []; req.on('data', d => c.push(d)); req.on('end', () => resolve(Buffer.concat(c).toString('utf8'))); });
+const nap = ms => new Promise(r => setTimeout(r, ms));
+const send = (res, status, value) => { const text = typeof value === 'string' ? value : JSON.stringify(value); res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) }); res.end(text); };
+const tokenFor = t => 'eyJhbGciOiJSUzI1NiJ9.' + Buffer.from(JSON.stringify({ sub: t, jti: randomUUID() })).toString('base64url') + '.fakesignature' + randomUUID().replaceAll('-', '');
+const account = req => { const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? ''); return m ? Object.values(db.accounts).find(a => a.token === m[1]) : undefined; };
+const receiptOf = (a, op) => ({ receiptVersion: 1, operationContractVersion: 1, technicalAccountId: a.technicalAccountId, operationId: op.operationId, localPlayerId: a.localPlayerId, installationId: a.installationId,
+  bindingGeneration: 1, payloadHash: op.payloadHash, receiptId: randomUUID(), committedAtUtc: new Date().toISOString(), acceptedAs: 'committed' });
+
+http.createServer(async (req, res) => {
+  const path = req.url, text = await body(req); let json = null; try { json = text ? JSON.parse(text) : null; } catch { /* leave null */ }
+  const entry = { method: req.method, path, ops: [], status: 0 }; log.push(entry);
+  const done = (status, value) => { entry.status = status; send(res, status, value); };
+  try {
+    if (path === '/__ctl' && req.method === 'POST') { for (const k of Object.keys(ctl)) if (json?.[k]) ctl[k].push(...json[k]); if (json?.historicalDelta) db.historical[json.historicalDelta.name] += json.historicalDelta.by; save(); return done(200, { ok: true }); }
+    if (path === '/__log') { entry.status = 200; log.pop(); return send(res, 200, log); }
+    if (path === '/__db') { log.pop(); return send(res, 200, { ...db, counts: counts() }); }
+    if (path === '/api/health' && req.method === 'GET') return done(200, { status: 'ok' });
+    if (path === '/api/v2/technical/registrations' && req.method === 'POST') {
+      const prior = db.registrations[json?.registrationId];
+      if (prior) return done(200, { schemaVersion: 2, technicalAccountId: prior });
+      const id = randomUUID();
+      db.registrations[json.registrationId] = id;
+      db.accounts[id] = { technicalAccountId: id, credential: json.credential, installationId: json.installationId, localPlayerId: json.localPlayerId, token: null };
+      db.guard[id] = 0; save(); return done(201, { schemaVersion: 2, technicalAccountId: id });
+    }
+    if (path === '/api/v2/technical/sessions' && req.method === 'POST') {
+      const a = db.accounts[json?.technicalAccountId];
+      if (!a || a.credential !== json.credential) return done(401, { schemaVersion: 2, error: { code: 'authentication_failed', retryable: false } });
+      const behaviour = ctl.session.shift(); if (behaviour === '503') return done(503, { schemaVersion: 2, error: { code: 'storage_unavailable', retryable: true } });
+      a.token = tokenFor(a.technicalAccountId); db.sessions++; db.guard[a.technicalAccountId]++; save(); return done(200, { schemaVersion: 2, accessToken: a.token, expiresIn: 900 });
+    }
+    const a = account(req);
+    if (path === '/api/v2/sync/batches' && req.method === 'POST') {
+      if (!a) return done(401, { schemaVersion: 2, error: { code: 'authentication_expired', retryable: false } });
+      const behaviour = ctl.batch.shift() ?? 'normal';
+      for (const op of json?.operations ?? []) entry.ops.push(op.operationId);
+      if (behaviour === '503') return done(503, { schemaVersion: 2, error: { code: 'storage_unavailable', retryable: true }, requestId: randomUUID() });
+      if (behaviour === '503-results') { const o = json.operations[0]; return done(503, { schemaVersion: 2, batchId: json.batchId, outcome: 'none_accepted', results: [{ index: 0, operationId: o.operationId, status: 'deferred', httpStatus: 503, error: { code: 'storage_unavailable', retryable: true, retryAfterSeconds: 1 } }] }); }
+      const results = [];
+      let sleepAfter = 0;
+      json.operations.forEach((op, index) => {
+        const prior = db.operations[op.operationId];
+        if (behaviour === 'dropBeforeCommit') { sleepAfter = 4000; return; }
+        if (prior) {
+          if (prior.payloadHash !== op.payloadHash) { results.push({ index, operationId: op.operationId, status: 'conflict', httpStatus: 409, error: { code: 'idempotency_conflict', retryable: false } }); return; }
+          const receipt = behaviour === 'otherReceiptId' ? { ...prior.receipt, receiptId: randomUUID() } : prior.receipt;
+          results.push({ index, operationId: op.operationId, status: 'duplicate', httpStatus: 200, receipt, attempt: { leaseId: op.leaseId, attempt: op.attempt } }); db.guard[a.technicalAccountId]++; db.fences[a.technicalAccountId] = (db.fences[a.technicalAccountId] ?? 0) + 1; return;
+        }
+        const receipt = receiptOf(a, op); db.operations[op.operationId] = { payloadHash: op.payloadHash, receipt }; db.facts++;
+        db.guard[a.technicalAccountId]++; db.fences[a.technicalAccountId] = (db.fences[a.technicalAccountId] ?? 0) + 1;
+        results.push({ index, operationId: op.operationId, status: 'committed', httpStatus: 201, receipt: behaviour === 'wrongBinding' ? { ...receipt, installationId: randomUUID() } : receipt, attempt: { leaseId: op.leaseId, attempt: op.attempt } });
+        if (behaviour === 'dropAfterCommit') sleepAfter = 4000;
+      });
+      save();
+      if (sleepAfter) await nap(sleepAfter);                       // the client gives up before this ends: response lost
+      const positive = results.filter(r => r.receipt).length;
+      const status = positive === results.length ? 200 : positive ? 207 : (results.some(r => r.status === 'conflict') ? 409 : 503);
+      return done(status, { schemaVersion: 2, batchId: json.batchId, requestId: randomUUID(), outcome: positive === results.length ? 'all_accepted' : positive ? 'partial' : 'none_accepted', results });
+    }
+    if (path === '/api/v2/sync/receipts/query' && req.method === 'POST') {
+      if (!a) return done(401, { schemaVersion: 2, error: { code: 'authentication_expired', retryable: false } });
+      const behaviour = ctl.query.shift() ?? 'normal';
+      if (behaviour === '503') return done(503, { schemaVersion: 2, error: { code: 'storage_unavailable', retryable: true } });
+      db.guard[a.technicalAccountId]++; db.fences[a.technicalAccountId] = (db.fences[a.technicalAccountId] ?? 0) + 1; save();
+      return done(200, { schemaVersion: 2, requestId: randomUUID(), results: json.attempts.map(d => { const p = db.operations[d.operationId];
+        return p ? { operationId: d.operationId, status: 'found', receipt: behaviour === 'otherReceiptId' ? { ...p.receipt, receiptId: randomUUID() } : p.receipt, attempt: { leaseId: d.leaseId, attempt: d.attempt } } : { operationId: d.operationId, status: 'not_found' }; }) });
+    }
+    return done(404, { schemaVersion: 2, error: { code: 'not_found', retryable: false } });
+  } catch { try { done(500, { error: { code: 'internal_error' } }); } catch { /* socket gone */ } }
+}).listen(0, '127.0.0.1', function () { save(); console.log(JSON.stringify({ listening: true, port: this.address().port })); });

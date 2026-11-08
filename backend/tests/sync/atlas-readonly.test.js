@@ -1,0 +1,30 @@
+import './support/isolation-guard.js';
+import { afterEach,expect,it,vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import { MongoClient } from 'mongodb';
+import { probeAtlasReadonly } from '../../src/modules/sync/atlas-readonly-probe.js';
+import { atlasDouble,atlasConfig,credential } from './support/atlas-double.js';
+afterEach(()=>vi.restoreAllMocks());
+function probeDouble(){
+  const db=atlasDouble(),original=db.connection.db.command;db.observed=[];
+  db.connection.db.command=async command=>{db.observed.push(Object.keys(command)[0]);
+    if(command.connectionStatus)return original(command);
+    if(command.ping)return {ok:1};
+    if(command.hello)return {ok:1,setName:'synthetic-rs',isWritablePrimary:true,hosts:['a','b','c'],logicalSessionTimeoutMinutes:30,maxWireVersion:25};
+    if(command.buildInfo)return {ok:1,version:'8.0.1'};
+    throw new Error('Non-read-only command');};
+  db.probe=extra=>probeAtlasReadonly({config:db.config,credential:credential(),connector:db.connector,...extra});return db;
+}
+it('R01 probe only uses permitted metadata, no models/writes/transactions',async()=>{const db=probeDouble();const r=await db.probe();expect(r.status).toBe('completed');expect(db.observed).toEqual(['connectionStatus','ping','hello','buildInfo']);expect(r.closed).toBe(true);expect(r.serverVersion).toBe('8.0.1');expect(db.calls).toHaveLength(0);expect(db.rows.operations).toHaveLength(0);expect(db.ended).toBeUndefined();});
+it('R02 write authorization is rejected before connector',async()=>{const db=probeDouble();const r=await db.probe({config:atlasConfig({allowWrites:true})});expect(r.status).toBe('blocked');expect(db.connects).toBe(0);});
+it('R03 unexpected destination rejected before connector',async()=>{const db=probeDouble();const r=await db.probe({config:atlasConfig({database:'two_sides_db'})});expect(r.status).toBe('blocked');expect(db.connects).toBe(0);});
+it('R04 excessive permissions close and prevent all additional diagnostics',async()=>{const db=probeDouble();db.status.authInfo.authenticatedUserRoles[0]={role:'atlasAdmin',db:'admin'};const r=await db.probe();expect(r.errorCode).toBe('atlas_permissions_unverified');expect(r.closed).toBe(true);expect(db.observed).toEqual(['connectionStatus']);expect(db.calls).toHaveLength(0);});
+it('R05 ping failure remains partial without speculative success',async()=>{const db=probeDouble(),original=db.connection.db.command;db.connection.db.command=async c=>c.ping?{ok:0}:original(c);const r=await db.probe();expect(r.status).toBe('partial');expect(r.closed).toBe(true);expect(r.errorCode).toBe('atlas_diagnostic_unavailable');});
+it('R06 unavailable optional version is recorded, not fabricated',async()=>{const db=probeDouble(),original=db.connection.db.command;db.connection.db.command=async c=>{if(c.buildInfo)throw new Error();return original(c);};const r=await db.probe();expect(r.status).toBe('completed');expect(r.serverVersion).toBeNull();expect(r.versionObservation).toBe('unavailable');expect(r.closed).toBe(true);});
+it('R07 raw connector errors never appear in result',async()=>{const db=probeDouble(),secret=randomBytes(24).toString('hex');const r=await db.probe({connector:async()=>{throw new Error(secret);}});expect(JSON.stringify(r)).not.toContain(secret);expect(r.status).toBe('blocked');expect(r.connection).toBe('attempted');});
+it('R08 lack of replica-set topology is not a validated adapter',async()=>{const db=probeDouble(),original=db.connection.db.command;db.connection.db.command=async c=>c.hello?{ok:1,isWritablePrimary:true}:original(c);const r=await db.probe();expect(r.status).toBe('partial');expect(r.topology).toBeNull();expect(r.transactionsExecuted).toBe(0);});
+it('R09 failed close must be reported as partial',async()=>{const db=probeDouble();db.connection.close=async()=>{throw new Error();};const r=await db.probe();expect(r.status).toBe('partial');expect(r.closed).toBe(false);expect(r.errorCode).toBe('atlas_close_failed');});
+it('R10 probe uses only doubles with no DNS/socket traffic',async()=>{const net=await import('node:net');const connect=vi.spyOn(net.Socket.prototype,'connect').mockImplementation(()=>{throw new Error('Network forbidden');});const db=probeDouble();expect((await db.probe()).status).toBe('completed');expect(connect).not.toHaveBeenCalled();});
+it('R11 actual driver parses factory options offline with strict TLS',async()=>{const net=await import('node:net');const connect=vi.spyOn(net.Socket.prototype,'connect').mockImplementation(()=>{throw new Error('Network forbidden');});const db=probeDouble();const r=await db.probe({connector:async(uri,options)=>{const{user,pass,autoCreate,autoIndex,bufferCommands,...native}=options;expect(options).not.toHaveProperty('tlsInsecure');const client=new MongoClient(uri,{...native,auth:{username:user,password:pass}});expect(client.options.tls).toBe(true);expect(client.options.rejectUnauthorized).toBe(true);expect(client.options.checkServerIdentity).toBeUndefined();return db.connector();}});expect(r.status).toBe('completed');expect(connect).not.toHaveBeenCalled();});
+it('R12 actual driver rejects the previous conflicting TLS flags before network',()=>{expect(()=>new MongoClient('mongodb+srv://twosidescluster.fxqeo8o.mongodb.net/two_sides_integration_test',{tls:true,tlsInsecure:false,tlsAllowInvalidCertificates:false,tlsAllowInvalidHostnames:false})).toThrow(/cannot be used/);});
+it('R13 normalized TLS bypass options are rejected before metadata inspection',async()=>{for(const unsafe of [{rejectUnauthorized:false},{checkServerIdentity:()=>undefined}]){const db=probeDouble(),original=db.connection.getClient().options;db.connection.getClient=()=>({options:{...original,...unsafe}});const r=await db.probe();expect(r.destination).toBe('not-verified');expect(db.observed).toHaveLength(0);expect(r.closed).toBe(true);}});

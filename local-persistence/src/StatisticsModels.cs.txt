@@ -1,0 +1,45 @@
+using System.Collections.Generic;
+
+namespace TwoSides.LocalPersistence;
+
+public enum StatisticsAvailability { Available, Unknown, NotAvailable, NoData }
+public sealed record StatisticCount(StatisticsAvailability State, long? Value, string? Reason = null);
+public sealed record StatisticsResult<T>(StatisticsAvailability State, T? Data) where T : class;
+public sealed record UncollectedStatistics(StatisticCount PlayedMilliseconds, StatisticCount Sessions,
+    StatisticCount Deaths, StatisticCount Restarts, StatisticCount Retries);
+public sealed record BiomeDecisionStatistics(string BiomeId, long Total, long Reject, long Approve,
+    long Healthy, long Degraded);
+public sealed record DecisionStatistics(long Total, long Reject, long Approve, long Healthy, long Degraded,
+    IReadOnlyList<BiomeDecisionStatistics> ByBiome);
+public sealed record ConsequenceStatistics(string GameId, string BiomeId, string DecisionId,
+    string OperationId, string OptionId, string StateKind, string ConsequencesJson,
+    int ConsequencesVersion, string RulesVersion, string OccurredAt);
+public sealed record BiomeStatistics(string GameId, string BiomeId, string Status, string? Result,
+    bool? Started, string StartedEvidence, string? HumanCompletedAt, string? AnimalCompletedAt,
+    string UpdatedAt, StatisticsAvailability ConsequenceState, ConsequenceStatistics? Consequence);
+public sealed record ProgressStatistics(StatisticCount Started, long ConfirmedStartedMinimum,
+    long Completed, long Pending, long HumanPending, long AnimalPending);
+public sealed record EndingStatistics(StatisticsAvailability State, string? Kind,
+    string? RulesVersion, string? Reason);
+public sealed record GameStatistics(string LocalPlayerId, string GameId, long Revision, bool IsCurrent,
+    string Status, string RulesVersion, string ContentVersion, string CreatedAt, string SavedAt,
+    string? CompletedAt, string? ArchivedAt, bool ConfirmedCompleted,
+    EndingStatistics Ending, DecisionStatistics Decisions, ProgressStatistics Progress,
+    IReadOnlyList<BiomeStatistics> Biomes)
+{
+    public ActivityStatistics? Activity {get;init;}
+}
+public sealed record PlayerStatistics(string LocalPlayerId, string DisplayName, long TotalGames,
+    long ActiveGames, string? ActiveGameId, StatisticCount CompletedGames,
+    StatisticsAvailability GamesState, GameStatistics? ActiveGame,
+    IReadOnlyList<GameStatistics> HistoricalGames, DecisionStatistics AllDecisions,
+    DecisionStatistics HistoricalDecisions, ProgressStatistics AllProgress,
+    ProgressStatistics HistoricalProgress, UncollectedStatistics Uncollected)
+{
+    public ActivityStatistics? Activity {get;init;}
+    public ActivityStatistics? HistoricalActivity {get;init;}
+}
+public sealed record BiomeActivityStatistics(string BiomeId,StatisticCount EffectiveMs);
+public sealed record ActivityStatistics(StatisticCount Sessions,StatisticCount Deaths,
+    StatisticCount RestartRequests,StatisticCount RetryRequests,StatisticCount EffectiveMs,
+    IReadOnlyList<BiomeActivityStatistics> ByBiome,bool Incomplete,bool HistoricalCoverageUnknown);

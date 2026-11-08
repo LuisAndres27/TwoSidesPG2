@@ -1,0 +1,137 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using F=ReconciliationChecks.F;
+
+// Synthetic capabilities only. Reuses existing guarded subprocess and source-history fixture.
+internal static class OutboxShutdownRecoveryChecks
+{
+    private static int _count;
+    private static readonly DateTimeOffset Time=DateTimeOffset.Parse("2026-10-28T07:05:22Z");
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok){if(!ok)throw new Exception("Shutdown recovery assertion failed");}
+    private static async Task Case(string name,Func<F,Task> action)
+    {using var f=new F(events:true);await action(f);_count++;Console.WriteLine("PASS "+name);}
+    private static int Recover(F f,int limit=1)
+    {var pages=f.Pass(limit);Check(pages.All(p=>p.Committed && p.Consistent) && pages.Last().Completed);return pages.Sum(p=>p.Inserted);}
+    private static void Start(F f)
+    {
+        f.Session=Id();f.Interval=Id();
+        new GameplayEventService(f.Db).RecordEvent(new(Id(),f.Owner,f.Session,GameplayEventKind.SESSION_STARTED,Time,0));
+        Recover(f);
+    }
+    private static void Close(F f)
+    {
+        var service=new GameplayEventService(f.Db);
+        service.RecordInterval(new(f.Interval,f.Owner,f.Session,0,3932,GameplayTimeState.Menu));
+        service.RecordEvent(new(Id(),f.Owner,f.Session,GameplayEventKind.SESSION_ENDED,Time.AddMilliseconds(3932),3932,SessionEnd:GameplaySessionEnd.Normal));
+    }
+    private static void Missing(F f){Start(f);Close(f);}
+    private static OutboxOperation Terminal(F f)=>f.Operations().Single(o=>o.SourceKey=="session:"+f.Session+":terminal");
+    private static OutboxOperation Interval(F f)=>f.Operations().Single(o=>o.SourceKey=="interval:"+f.Interval);
+    private static OutboxOperation Capture(F f,bool terminal)
+    {
+        var open=f.Operations().Single(o=>o.SourceKey=="session:"+f.Session+":open");
+        return f.Queue.Capture(new(Id(),f.Binding,terminal?new(SyncFactKind.SessionReport,f.Session,Phase:"terminal"):
+            new(SyncFactKind.GameplayInterval,f.Interval),new[]{open.OperationId})).Operation;
+    }
+    public static async Task<int> Run()
+    {
+        await Case("confirmed terminal source survives without its asynchronous capture",f=>{
+            Missing(f);var s=new GameplayEventService(f.Db).GetSessions(f.Owner).Single();
+            Check(s.Status=="closed" && s.EndOffsetMs==3932 && !f.Operations().Any(o=>o.SourceKey.EndsWith(":terminal")));return Task.CompletedTask;
+        });
+        await Case("terminal-only omission recovers exactly one row",f=>{Missing(f);Capture(f,false);Check(Recover(f)==1 && Terminal(f).Type=="session.report");return Task.CompletedTask;});
+        await Case("interval-only omission recovers exactly one row",f=>{Missing(f);Capture(f,true);Check(Recover(f)==1 && Interval(f).Type=="gameplay.interval");return Task.CompletedTask;});
+        await Case("both omissions recover exactly two rows across one-fact pages",f=>{Missing(f);Check(Recover(f)==2);return Task.CompletedTask;});
+        await Case("terminal projection retains closed status time and source key",f=>{
+            Missing(f);Recover(f);var op=Terminal(f);using var doc=JsonDocument.Parse(op.CanonicalEnvelope);var p=doc.RootElement.GetProperty("payload");
+            Check(op.SourceId==f.Session && p.GetProperty("phase").GetString()=="terminal" && p.GetProperty("status").GetString()=="closed" && p.GetProperty("endOffsetMs").GetInt64()==3932);
+            return Task.CompletedTask;
+        });
+        await Case("menu serialization preserves original 0..3932 boundaries and category",f=>{
+            Missing(f);Recover(f);using var doc=JsonDocument.Parse(Interval(f).CanonicalEnvelope);var p=doc.RootElement.GetProperty("payload");
+            Check(p.GetProperty("state").GetString()=="Menu" && p.GetProperty("startMs").GetInt64()==0 && p.GetProperty("endMs").GetInt64()==3932 && p.GetProperty("gameId").ValueKind==JsonValueKind.Null && p.GetProperty("animalRunId").ValueKind==JsonValueKind.Null);return Task.CompletedTask;
+        });
+        await Case("menu capture adds no effective animal time",f=>{
+            Missing(f);var service=new GameplayEventService(f.Db);var before=service.GetTotals(f.Owner);Recover(f);var after=service.GetTotals(f.Owner);
+            Check(before.EffectiveMs.Value==0 && after.EffectiveMs.Value==0 && after.RecordedElapsedMs.Value==3932);return Task.CompletedTask;
+        });
+        await Case("already measured animal time remains 10ms beside recovered menu",f=>{
+            f.Telemetry();Missing(f);var s=new GameplayEventService(f.Db);long? before=s.GetTotals(f.Owner).EffectiveMs.Value;
+            Check(before==10 && Recover(f)==2 && s.GetTotals(f.Owner).EffectiveMs.Value==before);return Task.CompletedTask;
+        });
+        await Case("second pass inserts zero and preserves complete envelopes UUIDs hashes",f=>{
+            Missing(f);Recover(f);var before=f.Operations();Check(Recover(f)==0 && before.SequenceEqual(f.Operations()));return Task.CompletedTask;
+        });
+        await Case("fresh process recovers both omissions and another process changes nothing",async f=>{
+            Missing(f);int n=f.Operations().Length;Check(await ReconciliationChecks.Child(f,"reconcile")==0 && f.Operations().Length==n+2);
+            var rows=f.Operations();Check(await ReconciliationChecks.Child(f,"reconcile")==0 && rows.SequenceEqual(f.Operations()));
+        });
+        await Case("observer close commits sources while cancellation drops secondary request",async f=>{
+            long now=0;var store=new GameplayObserverChecks.Store(f.Db);
+            var observer=new LocalGameplayObserver(store,()=>now,()=>Time.AddMilliseconds(now));
+            await observer.InitializeAsync(f.Owner);await observer.DrainAsync();f.Session=observer.SessionId!;Recover(f);
+            int calls=0;var pump=new LocalOutboxPump(f.Db);
+            var scheduler=new LocalOutboxScheduler((cursor,token)=>{Interlocked.Increment(ref calls);return Task.FromResult(pump.Step(cursor));},coalesce:TimeSpan.FromHours(1));
+            try {now=3932;await observer.CloseAsync();Check(observer.Pending==0);scheduler.Request();}
+            finally {await scheduler.DisposeAsync();}
+            Check(calls==0 && new GameplayEventService(f.Db).GetSessions(f.Owner).Single().Status=="closed");
+            f.Interval=f.RowStrings("SELECT interval_id FROM gameplay_intervals;").Single();
+            Check(!f.Operations().Any(o=>o.SourceKey=="session:"+f.Session+":terminal") && Recover(f)==2);
+        });
+        await Case("capture before final commits cannot see future terminal or interval",f=>{
+            Start(f);Check(Recover(f)==0);Close(f);Check(Recover(f)==2);return Task.CompletedTask;
+        });
+        await Case("open session never fabricates a terminal report",f=>{
+            Start(f);Check(Recover(f)==0 && !f.Operations().Any(o=>o.SourceKey.EndsWith(":terminal")));return Task.CompletedTask;
+        });
+        await Case("duplicate terminal capture reuses original operation identifier",f=>{
+            Missing(f);var first=Capture(f,true);var second=Capture(f,true);Check(first==second && Recover(f)==1);return Task.CompletedTask;
+        });
+        await Case("duplicate interval capture reuses original immutable operation",f=>{
+            Missing(f);var first=Capture(f,false);Check(first==Capture(f,false) && Recover(f)==1);return Task.CompletedTask;
+        });
+        await Case("reused operation ID for different fact rejects contradiction",f=>{
+            Missing(f);var op=Capture(f,true);try {f.Queue.Capture(new(op.OperationId,f.Binding,new(SyncFactKind.GameplayInterval,f.Interval)));throw new Exception("Unexpected capture");}
+            catch(SaveException e){Check(e.Code=="OUTBOX_CONFLICT");}Check(Terminal(f)==op && Recover(f)==1);return Task.CompletedTask;
+        });
+        await Case("write failure rolls back capture without rolling back committed sources",f=>{
+            Missing(f);var source=f.DomainDigest();var rows=f.Operations();
+            var result=new SyntheticOutboxReconciler(f.Db,beforeCommit:()=>throw new IOException("Synthetic failure")).ReconcilePage(f.Binding);
+            Check(!result.Committed && result.Inserted==0 && f.DomainDigest()==source && rows.SequenceEqual(f.Operations()) && Recover(f)==2);return Task.CompletedTask;
+        });
+        await Case("busy database reports local failure then recovers both sources",f=>{
+            Missing(f);using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false)){
+                var page=f.Reconciler.ReconcilePage(f.Binding);Check(!page.Committed && page.Diagnostics.ContainsKey("STORAGE_BUSY"));}
+            Check(Recover(f)==2);return Task.CompletedTask;
+        });
+        await Case("process interruption rolls back partial repair and later restart recovers",async f=>{
+            Missing(f);var source=f.DomainDigest();var rows=f.Operations();Check(await ReconciliationChecks.Child(f,"crash")==74);
+            Check(source==f.DomainDigest() && rows.SequenceEqual(f.Operations()));Check(await ReconciliationChecks.Child(f,"reconcile")==0 && f.Operations().Length==rows.Length+2);
+        });
+        await Case("abandoned page cursor can restart without duplicates",f=>{
+            Missing(f);var page=f.Reconciler.ReconcilePage(f.Binding,1);Check(page.Committed && page.Next is not null);Recover(f);
+            Check(f.Operations().Count(o=>o.SourceKey=="session:"+f.Session+":terminal")==1 && f.Operations().Count(o=>o.SourceKey=="interval:"+f.Interval)==1);return Task.CompletedTask;
+        });
+        await Case("source history decisions and environments stay byte-equivalent",f=>{
+            f.Telemetry();Missing(f);var before=f.DomainDigest();Recover(f);Check(before==f.DomainDigest());return Task.CompletedTask;
+        });
+        await Case("terminal and menu retain the original open-session dependency",f=>{
+            Missing(f);Recover(f);foreach(var op in new[]{Terminal(f),Interval(f)})Check(f.Number("SELECT count(*) FROM sync_dependencies WHERE operation_id='"+op.OperationId+"';")==1);return Task.CompletedTask;
+        });
+        await Case("offline recovery never fabricates a remote acknowledgement",f=>{
+            Missing(f);Recover(f);Check(f.Operations().All(o=>o.State==OutboxDeliveryState.Pending && o.Attempts==0 && o.ReceiptJson is null));return Task.CompletedTask;
+        });
+        await Case("recovery preserves schema versions and existing capture rows",f=>{
+            Missing(f);var original=f.Operations();Recover(f);Check(original.All(row=>f.Operations().Contains(row)) && SchemaManager.ReadVersion(f.Db)==2);
+            GameplayEventSchema.Verify(f.Db);SyncOutboxSchema.Verify(f.Db);return Task.CompletedTask;
+        });
+        Console.WriteLine(_count+" shutdown recovery checks passed");return 0;
+    }
+}

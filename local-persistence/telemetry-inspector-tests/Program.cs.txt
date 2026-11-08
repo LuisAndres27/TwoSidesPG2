@@ -1,0 +1,80 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Security.Cryptography;
+using Microsoft.Data.Sqlite;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using TwoSides.TelemetryInspection;
+
+internal static class Program
+{
+    static int count;
+    static string Id()=>Guid.NewGuid().ToString("D");
+    static void Check(bool ok,string label){if(!ok)throw new Exception(label);count++;Console.WriteLine("PASS "+label);}
+    static void Refused(Action act,string code){try{act();throw new Exception("unexpected acceptance");}catch(InspectionRefused e){Check(e.Code==code,code);}}
+    static string Hash(string path)=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+    static void Sql(string path,string sql){using var c=new SqliteConnection(new SqliteConnectionStringBuilder{DataSource=path,Pooling=false}.ToString());c.Open();using var q=c.CreateCommand();q.CommandText=sql;q.ExecuteNonQuery();}
+    public static int Main()
+    {
+        string anchor=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"TwoSidesTests","B78");
+        string lab=Path.Combine(anchor,Guid.NewGuid().ToString("N")),root=Path.Combine(lab,"SyntheticProfile","AppData","Local"),file=Path.Combine(root,"TwoSides","PlayerData","save.sqlite3");
+        string owner=Id(),game=Id();Directory.CreateDirectory(root);
+        try{
+            using(var db=CopyGameDatabase.OpenProductionUnder(root,file)){
+                StatisticsTelemetry.Initialize(db);StatisticsTelemetry.Initialize(db);
+                var stats=new StatisticsTelemetry(db);var save=new GameSaveService(db,RealGameCatalog.InitialState(),extension:stats);
+                save.CreateLocalProfile(Id(),owner,"PRIVATE-TEST-NAME-B78");save.CreateNewGame(new(Id(),owner,game));
+                save.EnterBiome(new(Id(),owner,game,save.LoadGame(owner,game).Game.Revision,"ocean","human"));
+                var decision=new RecordDecisionCommand(Id(),Id(),owner,game,save.LoadGame(owner,game).Game.Revision,"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}");
+                save.RecordDecision(decision);save.RecordDecision(decision);
+                var gameplay=new GameplayEventService(db);var now=DateTimeOffset.UtcNow;
+                gameplay.RecordEvent(new(Id(),owner,stats.SessionId,GameplayEventKind.SESSION_STARTED,now,0));
+                gameplay.RecordInterval(new(Id(),owner,stats.SessionId,0,30000,GameplayTimeState.ActiveHuman,game,"ocean"));
+                gameplay.RecordInterval(new(Id(),owner,stats.SessionId,30000,60000,GameplayTimeState.Paused));
+                gameplay.RecordInterval(new(Id(),owner,stats.SessionId,60000,90000,GameplayTimeState.Background));
+                gameplay.RecordEvent(new(Id(),owner,stats.SessionId,GameplayEventKind.SESSION_ENDED,now,90000,SessionEnd:GameplaySessionEnd.Normal));
+                stats.BiomeIntent="ocean";save.CompleteBiome(new(Id(),owner,game,save.LoadGame(owner,game).Game.Revision,"ocean","good"));stats.BiomeIntent=null;
+                stats.ReconcileGameplay();
+                Refused(()=>Inspector.Inspect(file,file),"STORE_NOT_CLOSED_OR_ACCESS_DENIED");
+            }
+            var before=Directory.GetFiles(Path.GetDirectoryName(file)!).ToDictionary(p=>Path.GetFileName(p)!,p=>(Hash:Hash(p),Modified:File.GetLastWriteTimeUtc(p),Length:new FileInfo(p).Length));
+            var snapshotCount=Directory.GetDirectories(Path.GetTempPath(),"TwoSidesB78Inspect-*").Length;
+            var report=Inspector.Inspect(file,file);var json=JsonSerializer.Serialize(report);
+            Check(report.Result=="PASS"&&report.SourceUnchanged&&report.TemporaryCopyDeleted,"consistent copy inspected and removed");
+            Check(report.SchemaVersion==2&&report.StatisticsVersion==1&&report.GameplayVersion==1,"save/gameplay/statistics migrations verified");
+            Check(report.EffectiveMs==30000&&report.BiomeTimeMs["ocean"]==30000,"only active time counted; pause and background excluded");
+            Check(report.Decisions["ocean:reject:healthy"]==1,"one confirmed decision with biome option state");
+            Check(report.BiomeCompletions["ocean:good"]==1,"validated biome completion");
+            Check(report.GamesStarted==1&&report.GamesCompleted==0,"incomplete game not misreported as final");
+            Check(report.Sessions["closed"]==1&&report.SessionTimes.Sum(x=>x.EffectiveMs)==30000,"sessions and per-session aggregate without IDs");
+            Check(report.Outbox["pending"]==report.Events&&report.Outbox.GetValueOrDefault("confirmed")==0,"offline events remain pending without server");
+            Check(report.DuplicateEventIds==0&&report.DuplicateSourceKeys==0&&report.DuplicateDecisionFacts==0,"no duplicate facts");
+            Check(report.UnprojectedIntents==0&&report.UnprojectedGameplay==0,"no unprojected sources after normal capture");
+            Check(!json.Contains(owner)&&!json.Contains(game)&&!json.Contains("PRIVATE-TEST-NAME")&&!json.Contains(root),"no names IDs or source paths in output");
+            Check(Directory.GetFiles(Path.GetDirectoryName(file)!).All(p=>Hash(p)==before[Path.GetFileName(p)].Hash&&File.GetLastWriteTimeUtc(p)==before[Path.GetFileName(p)].Modified&&new FileInfo(p).Length==before[Path.GetFileName(p)].Length),"all source bytes lengths and modification dates unchanged");
+            Check(Directory.GetDirectories(Path.GetTempPath(),"TwoSidesB78Inspect-*").Length==snapshotCount,"no disposable snapshots remain");
+            Check(JsonSerializer.Serialize(Inspector.Inspect(file,file))==json,"repeated inspection is stable and read only");
+            Refused(()=>Inspector.Inspect(file,Path.Combine(root,"forbidden.sqlite3")),"OUT_OF_SCOPE_PATH");
+            Refused(()=>Inspector.Inspect("relative.sqlite3",file),"OUT_OF_SCOPE_PATH");
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(file)!,"unexpected.txt"),"synthetic");
+            Refused(()=>Inspector.Inspect(file,file),"UNKNOWN_STORE_FILE");File.Delete(Path.Combine(Path.GetDirectoryName(file)!,"unexpected.txt"));
+            string ownership=Path.Combine(Path.GetDirectoryName(file)!,"ownership.json"),old=File.ReadAllText(ownership);
+            File.WriteAllText(ownership,old.Replace("player-production-save","foreign-store"));Refused(()=>Inspector.Inspect(file,file),"OWNERSHIP_INVALID");File.WriteAllText(ownership,old);
+            File.WriteAllText(file+"-journal","synthetic hot journal");Refused(()=>Inspector.Inspect(file,file),"JOURNAL_REQUIRES_SEPARATE_REVIEW");File.Delete(file+"-journal");
+            Sql(file,"UPDATE statistics_schema_migrations SET checksum='wrong';");Refused(()=>Inspector.Inspect(file,file),"STATISTICS_MIGRATION_INVALID");
+            Sql(file,"UPDATE statistics_schema_migrations SET checksum='"+StatisticsTelemetry.Checksum+"';");
+            Sql(file,"DROP TRIGGER statistics_event_immutable; PRAGMA ignore_check_constraints=ON; UPDATE statistics_events SET duration_ms=-1 WHERE event_type='playtime_interval';");
+            try{Inspector.Inspect(file,file);throw new Exception("invalid duration accepted");}catch(SaveException){Check(true,"invalid interval rejected on disposable copy");}catch(InspectionRefused){Check(true,"invalid interval rejected on disposable copy");}
+            Check(Directory.GetDirectories(Path.GetTempPath(),"TwoSidesB78Inspect-*").Length==snapshotCount,"failure also removes disposable copy");
+            Console.WriteLine("B78 INSPECTOR CHECKS PASS "+count);return 0;
+        }catch(Exception e){Console.WriteLine("B78 INSPECTOR FAIL "+e.GetType().Name+" "+(e is InspectionRefused r?r.Code:e.Message));return 1;}
+        finally{
+            NeedCleanup(lab,anchor);foreach(var p in Directory.GetFiles(lab,"*",SearchOption.AllDirectories))File.Delete(p);
+            foreach(var d in Directory.GetDirectories(lab,"*",SearchOption.AllDirectories).OrderByDescending(x=>x.Length))Directory.Delete(d);Directory.Delete(lab);
+        }
+    }
+    static void NeedCleanup(string lab,string anchor){if(!Path.GetFullPath(lab).StartsWith(Path.GetFullPath(anchor)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase)||Path.GetFileName(lab).Length!=32)throw new Exception("unsafe cleanup refused");}
+}

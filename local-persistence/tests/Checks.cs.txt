@@ -1,0 +1,368 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class Checks
+{
+    private static string Root = "";
+    private static string Id() => Guid.NewGuid().ToString("D");
+    private static void Check(bool condition,string detail="assertion") { if(!condition) throw new Exception(detail); }
+    private static void Error(string code,Action action)
+    {
+        try { action(); } catch(SaveException error) { Check(error.Code==code,"unexpected error code: "+error.Code); return; }
+        throw new Exception("expected typed rejection: "+code);
+    }
+    private static void Constraint(Action action)
+    {
+        try { action(); } catch(SqliteException error) { Check(error.SqliteErrorCode==19,"unexpected SQLite code"); return; }
+        throw new Exception("expected SQLite integrity rejection");
+    }
+    private static SaveCatalog Catalog(string version="synthetic-rules/1") => new(version,"synthetic-content/1",new Dictionary<string,string> {
+        ["ocean"]="ocean_waste_disposal",["jungle"]="jungle_transport_route",["desert"]="desert_cat_abandonment",
+        ["forest"]="forest_industrial_pesticides",["tundra"]="tundra_fossil_extraction"
+    });
+
+    private sealed class Fixture : IDisposable
+    {
+        public SyntheticSandbox Sandbox { get; }
+        public SyntheticDatabase Db { get; }
+        public GameSaveService Service { get; private set; } = null!;
+        public string Owner { get; }=Id();
+        public string Game { get; }=Id();
+        public Fixture(bool initialize=true)
+        {
+            Sandbox=new SyntheticSandbox(Root); Db=Sandbox.CreateDatabase();
+            if(initialize) { SchemaManager.Initialize(Db); Service=OpenService(); }
+        }
+        public GameSaveService OpenService(ITransactionalSaveExtension? extension=null) => new(Db,Catalog(),()=>DateTimeOffset.Parse("2026-10-25T12:00:00Z"),extension,new[]{"synthetic.audio"});
+        public void Start()
+        {
+            Service.CreateLocalProfile(Id(),Owner,"Jugador sintetico");
+            Service.CreateNewGame(new NewGameCommand(Id(),Owner,Game));
+        }
+        public SaveGameCommand Save(long revision=0,string? biome=null,string kind="menu",string? checkpoint=null) =>
+            new(Id(),Owner,Game,revision,biome,kind,checkpoint,GameSaveService.BoundarySnapshot);
+        public RecordDecisionCommand Decision(long revision=0,string biome="ocean",string key="ocean_waste_disposal",string environment="healthy") =>
+            new(Id(),Id(),Owner,Game,revision,biome,key,"reject",environment,"{\"stateKind\":\""+environment+"\"}");
+        public long Scalar(string sql)
+        {
+            using var c=Db.Open(); using var cmd=c.CreateCommand(); cmd.CommandText=sql; return Convert.ToInt64(cmd.ExecuteScalar());
+        }
+        public void Sql(string sql)
+        {
+            using var c=Db.Open(); using var cmd=c.CreateCommand(); cmd.CommandText=sql; cmd.ExecuteNonQuery();
+        }
+        public void Dispose() => Sandbox.Dispose();
+    }
+    private sealed class Probe : ITransactionalSaveExtension
+    {
+        public bool Seen;
+        public void BeforeCommit(SqliteConnection connection,SqliteTransaction transaction,SaveReceipt receipt)
+        {
+            Seen=true;
+            using var cmd=connection.CreateCommand(); cmd.Transaction=transaction;
+            cmd.CommandText="INSERT INTO local_settings VALUES($owner,'synthetic.extension','{\"value\":true}',1,$at);";
+            cmd.Parameters.AddWithValue("$owner",receipt.LocalPlayerId); cmd.Parameters.AddWithValue("$at",receipt.CommittedAt);
+            cmd.ExecuteNonQuery();
+            throw new SaveException("INJECTED_FAILURE");
+        }
+    }
+
+    public static int Main(string[] args)
+    {
+        if(args.Length!=1) return 2; Root=Path.GetFullPath(args[0]);
+        if(!string.Equals(Root,SyntheticSandbox.AuthorizedProjectRoot,StringComparison.OrdinalIgnoreCase)) return 2;
+        var tests=new List<(string Name,Action Run)> {
+            ("initial schema and ten tables",()=>{
+                using var f=new Fixture(); Check(SchemaManager.ReadVersion(f.Db)==2);
+                Check(f.Scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")==10);
+                Check(f.Scalar("SELECT json_valid('{}');")==1);
+                using var c=f.Db.Open(); using var cmd=c.CreateCommand(); cmd.CommandText="SELECT sqlite_version();";
+                Console.WriteLine("SQLite engine: "+cmd.ExecuteScalar());
+            }),
+            ("foreign keys enabled on every connection",()=>{
+                using var f=new Fixture(); Check(f.Scalar("PRAGMA foreign_keys;")==1);
+                Check(f.Scalar("PRAGMA foreign_keys;")==1);
+                Constraint(()=>f.Sql("INSERT INTO biome_progress VALUES('unowned','ocean','human_pending',NULL,0,NULL,NULL,'synthetic');"));
+            }),
+            ("documented indexes exist",()=>{
+                using var f=new Fixture();
+                Check(f.Scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN('ux_current_game','ix_games_profile_date','ix_biome_status','ix_decisions_biome_order','ix_operations_game_date');")==5);
+            }),
+            ("create and retrieve singleton local profile",()=>{
+                using var f=new Fixture(); Check(f.Service.GetLocalProfile() is null);
+                f.Service.CreateLocalProfile(Id(),f.Owner,"Perfil"); var p=f.Service.GetLocalProfile()!;
+                Check(p.LocalPlayerId==f.Owner && p.RegistrationStatus=="LOCAL_ONLY" && p.Revision==0);
+                Check(p.TechnicalAccountId is null && p.CredentialRef is null);
+            }),
+            ("second profile cannot replace singleton",()=>{
+                using var f=new Fixture(); f.Service.CreateLocalProfile(Id(),f.Owner,"Uno");
+                Error("PROFILE_ALREADY_EXISTS",()=>f.Service.CreateLocalProfile(Id(),Id(),"Dos"));
+                Check(f.Service.GetLocalProfile()!.DisplayName=="Uno");
+            }),
+            ("rename preserves IDs and increments profile revision",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.UpdateDisplayName(Id(),f.Owner,0,"  Jose\u0301  ");
+                var p=f.Service.GetLocalProfile()!; Check(p.DisplayName=="Jos\u00e9" && p.LocalPlayerId==f.Owner && p.Revision==1);
+                Check(f.Service.LoadGame(f.Owner,f.Game).Game.Revision==0);
+            }),
+            ("Unicode validation rejects controls and malformed names",()=>{
+                foreach(var value in new[]{""," ","x\n","a\u202eb","a".PadRight(33,'a'),"\ud800","\u200b"}) Error("INVALID_NAME",()=>SaveValidation.Name(value));
+                Check(SaveValidation.Name("\u68ee\u306e\u4eba")=="\u68ee\u306e\u4eba");
+                Check(SaveValidation.Name("\ud83d\udc69\u200d\ud83d\udd2c").Length>0);
+            }),
+            ("new game creates independent biome rows and snapshot",()=>{
+                using var f=new Fixture(); f.Start(); var save=f.Service.LoadGame(f.Owner,f.Game);
+                Check(save.Biomes.Count==5 && save.Environments.Count==5 && save.Decisions.Count==0);
+                Check(save.Biomes.All(b=>b.Status=="human_pending"));
+                Check(save.Snapshot.CapturedRevision==0 && save.Game.SaveFormatVersion==1);
+            }),
+            ("second unfinished game rejects replacement with or without revision",()=>{
+                using var f=new Fixture(); f.Start(); var next=Id();
+                Error("GAME_IN_PROGRESS",()=>f.Service.CreateNewGame(new NewGameCommand(Id(),f.Owner,next)));
+                Error("GAME_IN_PROGRESS",()=>f.Service.CreateNewGame(new NewGameCommand(Id(),f.Owner,next,f.Game,0)));
+                var unchanged=f.Service.LoadGame(f.Owner,f.Game);
+                Check(unchanged.Game.IsCurrent && unchanged.Game.Status=="in_progress" && f.Service.GetGameHistory(f.Owner).Count==1);
+                var archived=f.Service.LoadGame(f.Owner,f.Game);
+                Check(archived.Game.IsCurrent && archived.Game.Status=="in_progress" && archived.Snapshot.CapturedRevision==0);
+                Check(f.Service.HasUnfinishedGames(f.Owner));
+            }),
+            ("save persists after closing and reopening",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.SaveCurrentGame(f.Save(0,"ocean","human_decision"));
+                var reopened=f.OpenService(); var save=reopened.LoadGame(f.Owner,f.Game);
+                Check(save.Game.Revision==1 && save.Game.CurrentBiomeId=="ocean" && save.Snapshot.CapturedRevision==1);
+            }),
+            ("decision and environment commit together",()=>{
+                using var f=new Fixture(); f.Start(); var command=f.Decision(); f.Service.RecordDecision(command);
+                var save=f.Service.LoadGame(f.Owner,f.Game);
+                Check(save.Decisions.Single().DecisionId==command.DecisionId);
+                Check(save.Environments.Single(e=>e.BiomeId=="ocean").LastDecisionId==command.DecisionId);
+                Check(save.Biomes.Single(b=>b.BiomeId=="ocean").Status=="animal_pending");
+                Check(save.Game.ResumeKind=="decision_info" && save.Game.Revision==1);
+            }),
+            ("biome states remain independent",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                var states=f.Service.GetBiomeProgress(f.Owner,f.Game);
+                Check(states.Single(b=>b.BiomeId=="ocean").Status=="animal_pending");
+                Check(states.Where(b=>b.BiomeId!="ocean").All(b=>b.Status=="human_pending"));
+                Check(f.Service.GetEnvironment(f.Owner,f.Game,"jungle").StateKind is null);
+            }),
+            ("decision history chronological and paginated",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                f.Service.RecordDecision(f.Decision(1,"jungle","jungle_transport_route","degraded"));
+                var history=f.Service.GetDecisions(f.Owner,f.Game);
+                Check(history.Count==2 && history[0].DecisionOrder==1 && history[1].DecisionOrder==2);
+                Check(f.Service.GetDecisions(f.Owner,f.Game,after:1).Single().BiomeId=="jungle");
+                Check(f.Service.GetDecisions(f.Owner,f.Game,"ocean").Count==1);
+            }),
+            ("environment re-save preserves decision relationship",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                var environment=f.Service.GetEnvironment(f.Owner,f.Game,"ocean");
+                f.Service.UpdateEnvironment(Id(),f.Owner,f.Game,1,environment);
+                Check(f.Service.LoadGame(f.Owner,f.Game).Game.Revision==2);
+                Check(f.Service.GetEnvironment(f.Owner,f.Game,"ocean").LastDecisionId==environment.LastDecisionId);
+                Error("INVALID_DATA",()=>f.Service.UpdateEnvironment(Id(),f.Owner,f.Game,2,environment with {StateKind="degraded"}));
+            }),
+            ("progress update and completed result validation",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                var biome=f.Service.GetBiomeProgress(f.Owner,f.Game).Single(b=>b.BiomeId=="ocean");
+                f.Service.UpdateBiomeProgress(Id(),f.Owner,f.Game,1,biome with {Status="completed",Result="good",AnimalCompletedAt="2026-10-25T12:00:01Z"});
+                var save=f.Service.LoadGame(f.Owner,f.Game);
+                Check(save.Biomes.Single(b=>b.BiomeId=="ocean").Status=="completed" && save.Game.Status=="in_progress");
+                Check(save.Game.Ending is null && save.Game.ResumeKind=="menu");
+            }),
+            ("valid segment checkpoint can continue after reopening",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                f.Service.SaveCurrentGame(f.Save(1,"ocean","animal_start","segment-start"));
+                var plan=f.OpenService().ContinueGame(f.Owner);
+                Check(plan.GameId==f.Game && plan.ResumeKind=="animal_start" && plan.CheckpointKey=="segment-start" && plan.Revision==2);
+            }),
+            ("exact mid-level checkpoint explicitly unsupported",()=>{
+                using var f=new Fixture(); f.Start();
+                Error("UNSUPPORTED_CHECKPOINT",()=>f.Service.SaveCurrentGame(f.Save(0,"ocean","animal_checkpoint","unassigned-entity")));
+                Check(f.Service.LoadGame(f.Owner,f.Game).Game.Revision==0);
+            }),
+            ("injected extension rolls back all related writes",()=>{
+                using var f=new Fixture(); f.Start(); var probe=new Probe(); var failing=f.OpenService(probe); var command=f.Decision();
+                Error("INJECTED_FAILURE",()=>failing.RecordDecision(command)); Check(probe.Seen);
+                var save=f.Service.LoadGame(f.Owner,f.Game);
+                Check(save.Game.Revision==0 && save.Decisions.Count==0 && save.Environments.All(e=>e.StateKind is null));
+                Check(f.Scalar("SELECT count(*) FROM local_settings;")==0 && f.Scalar("SELECT count(*) FROM local_operations;")==2);
+                f.Service.RecordDecision(command); Check(f.Service.GetDecisions(f.Owner,f.Game).Count==1);
+            }),
+            ("idempotent decision retry does not duplicate or increment",()=>{
+                using var f=new Fixture(); f.Start(); var command=f.Decision();
+                var first=f.Service.RecordDecision(command); var second=f.Service.RecordDecision(command);
+                Check(first==second && f.Service.GetDecisions(f.Owner,f.Game).Count==1 && f.Service.LoadGame(f.Owner,f.Game).Game.Revision==1);
+            }),
+            ("idempotency conflict rejects changed payload",()=>{
+                using var f=new Fixture(); f.Start(); var command=f.Decision(); f.Service.RecordDecision(command);
+                Error("OPERATION_CONFLICT",()=>f.Service.RecordDecision(command with {OptionId="approve"}));
+                Check(f.Service.GetDecisions(f.Owner,f.Game).Single().OptionId=="reject");
+            }),
+            ("canonical JSON retry recognizes reordered whitespace",()=>{
+                using var f=new Fixture(); f.Start(); var command=f.Decision(); var first=f.Service.RecordDecision(command);
+                Check(f.Service.RecordDecision(command with {ConsequencesJson="{ \"stateKind\" : \"healthy\" }"})==first);
+            }),
+            ("environment retry ignores transient updated timestamp",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                var state=f.Service.GetEnvironment(f.Owner,f.Game,"ocean"); var operation=Id();
+                var first=f.Service.UpdateEnvironment(operation,f.Owner,f.Game,1,state);
+                var second=f.Service.UpdateEnvironment(operation,f.Owner,f.Game,1,state with {UpdatedAt="transient-not-part-of-command"});
+                Check(first==second && f.Service.LoadGame(f.Owner,f.Game).Game.Revision==2);
+            }),
+            ("inconsistent biome result rolls back progress and receipt",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                var biome=f.Service.GetBiomeProgress(f.Owner,f.Game).Single(x=>x.BiomeId=="ocean");
+                Error("INVALID_SNAPSHOT",()=>f.Service.UpdateBiomeProgress(Id(),f.Owner,f.Game,1,biome with {Status="completed",Result="bad",AnimalCompletedAt="2026-10-25T12:00:01Z"}));
+                Check(f.Service.LoadGame(f.Owner,f.Game).Game.Revision==1 && f.Scalar("SELECT count(*) FROM local_operations;")==3);
+            }),
+            ("composite environment foreign key rejects another biome decision",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.RecordDecision(f.Decision());
+                f.Service.RecordDecision(f.Decision(1,"jungle","jungle_transport_route"));
+                Constraint(()=>f.Sql("UPDATE environmental_state SET last_decision_id=(SELECT decision_id FROM environmental_decisions WHERE biome_id='jungle') WHERE biome_id='ocean';"));
+                Check(f.Service.GetEnvironment(f.Owner,f.Game,"ocean").StateKind=="healthy");
+            }),
+            ("unknown populated synthetic schema is not overwritten",()=>{
+                using var f=new Fixture(false); f.Sql("CREATE TABLE synthetic_unknown(value TEXT); INSERT INTO synthetic_unknown VALUES('preserve');");
+                Error("UNSUPPORTED_SCHEMA",()=>SchemaManager.Initialize(f.Db));
+                Check(f.Scalar("SELECT count(*) FROM synthetic_unknown;")==1 && SchemaManager.ReadVersion(f.Db)==0);
+            }),
+            ("stale revisions reject lost updates",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.SaveCurrentGame(f.Save());
+                Error("REVISION_CONFLICT",()=>f.Service.SaveCurrentGame(f.Save())); Check(f.Service.LoadGame(f.Owner,f.Game).Game.Revision==1);
+            }),
+            ("invalid identifiers biome JSON and foreign owner rejected",()=>{
+                using var f=new Fixture(); f.Start();
+                Error("INVALID_DATA",()=>f.Service.CreateLocalProfile("invalid",Id(),"Nombre"));
+                Error("UNKNOWN_BIOME",()=>f.Service.SaveCurrentGame(f.Save(0,"imaginary","human_decision")));
+                Error("INVALID_DATA",()=>f.Service.RecordDecision(f.Decision() with {ConsequencesJson="{broken"}));
+                Error("NOT_FOUND",()=>f.Service.LoadGame(Id(),f.Game));
+                Check(f.Service.LoadGame(f.Owner,f.Game).Game.Revision==0);
+            }),
+            ("SQL injection input is stored only as parameterized data",()=>{
+                using var f=new Fixture(); var input="x');DROP TABLE saved_games;--";
+                f.Service.CreateLocalProfile(Id(),f.Owner,input);
+                Check(f.Service.GetLocalProfile()!.DisplayName==input);
+                Check(f.Scalar("SELECT count(*) FROM saved_games;")==0);
+            }),
+            ("missing owned file returns NOT_FOUND without recreation",()=>{
+                using var f=new Fixture(false); f.Sandbox.ValidateOwnedPath(f.Db.Path); File.Delete(f.Db.Path);
+                Error("NOT_FOUND",()=>{ using var connection=f.Db.Open(); }); Check(!File.Exists(f.Db.Path));
+            }),
+            ("corrupt synthetic database produces sanitized error",()=>{
+                using var f=new Fixture(); f.Sandbox.ValidateOwnedPath(f.Db.Path);
+                File.WriteAllBytes(f.Db.Path,Encoding.ASCII.GetBytes("synthetic-invalid-sqlite-file"));
+                Error("CORRUPT_STORAGE",()=>SchemaManager.Verify(f.Db));
+            }),
+            ("controlled migration v1 to v2 preserves profile",()=>{
+                using var f=new Fixture(false); SchemaManager.Initialize(f.Db,1);
+                using(var c=f.Db.Open()) using(var cmd=c.CreateCommand())
+                {
+                    cmd.CommandText="INSERT INTO local_profiles(local_player_id,singleton_key,display_name,revision,registration_status,created_at,updated_at) VALUES($id,1,'Synthetic migration',0,'LOCAL_ONLY','synthetic','synthetic');";
+                    cmd.Parameters.AddWithValue("$id",f.Owner); cmd.ExecuteNonQuery();
+                }
+                SchemaManager.Initialize(f.Db); Check(SchemaManager.ReadVersion(f.Db)==2);
+                Check(f.OpenService().GetLocalProfile()!.LocalPlayerId==f.Owner && f.Scalar("SELECT count(*) FROM schema_migrations;")==2);
+            }),
+            ("failed migration rolls back version history and indexes",()=>{
+                using var f=new Fixture(false); SchemaManager.Initialize(f.Db,1);
+                Error("INJECTED_FAILURE",()=>SchemaManager.Initialize(f.Db,2,_=>throw new SaveException("INJECTED_FAILURE")));
+                Check(SchemaManager.ReadVersion(f.Db)==1 && f.Scalar("SELECT count(*) FROM schema_migrations;")==1);
+                Check(f.Scalar("SELECT count(*) FROM sqlite_master WHERE name='ix_decisions_biome_order';")==0);
+                SchemaManager.Initialize(f.Db); SchemaManager.Verify(f.Db);
+            }),
+            ("future schema rejected without downgrade or deletion",()=>{
+                using var f=new Fixture(); f.Sql("PRAGMA user_version=999;");
+                Error("UNSUPPORTED_SCHEMA",()=>SchemaManager.Initialize(f.Db)); Error("UNSUPPORTED_SCHEMA",()=>f.OpenService());
+                Check(SchemaManager.ReadVersion(f.Db)==999);
+            }),
+            ("migration checksum mismatch rejected",()=>{
+                using var f=new Fixture(); f.Sql("UPDATE schema_migrations SET checksum='tampered' WHERE version=1;");
+                Error("UNSUPPORTED_SCHEMA",()=>f.OpenService());
+            }),
+            ("future save format and inconsistent snapshot rejected",()=>{
+                using var f=new Fixture(); f.Start(); f.Sql("UPDATE saved_games SET save_format_version=999;");
+                Error("UNSUPPORTED_SCHEMA",()=>f.Service.LoadGame(f.Owner,f.Game));
+                f.Sql("UPDATE saved_games SET save_format_version=1; UPDATE continuation_snapshots SET captured_revision=99;");
+                Error("INVALID_SNAPSHOT",()=>f.Service.LoadGame(f.Owner,f.Game));
+            }),
+            ("writer lock times out then original command can retry",()=>{
+                using var f=new Fixture(); f.Start(); var command=f.Save();
+                using(var c=f.Db.Open()) using(var tx=c.BeginTransaction(deferred:false))
+                { Error("STORAGE_BUSY",()=>f.Service.SaveCurrentGame(command)); tx.Rollback(); }
+                Check(f.Service.SaveCurrentGame(command).ResultRevision==1);
+            }),
+            ("concurrent writers serialize with one revision winner",()=>{
+                using var f=new Fixture(); f.Start(); var successes=0; var conflicts=0;
+                Parallel.For(0,2,_=>{
+                    try { f.Service.SaveCurrentGame(f.Save()); System.Threading.Interlocked.Increment(ref successes); }
+                    catch(SaveException e) when(e.Code is "REVISION_CONFLICT" or "STORAGE_BUSY") {System.Threading.Interlocked.Increment(ref conflicts);}
+                });
+                Check(successes==1 && conflicts==1 && f.Service.LoadGame(f.Owner,f.Game).Game.Revision==1);
+            }),
+            ("database path capability rejects traversal and another sandbox",()=>{
+                using var first=new SyntheticSandbox(Root); using var second=new SyntheticSandbox(Root); var db=first.CreateDatabase();
+                Error("UNSAFE_PATH",()=>second.ValidateOwnedPath(db.Path));
+                Error("UNSAFE_PATH",()=>first.ValidateOwnedPath(Path.Combine(first.Root,"..","outside.sqlite3")));
+                Error("UNSAFE_PATH",()=>new SyntheticSandbox(Path.GetDirectoryName(Root)!));
+                Check(db.Path.StartsWith(Path.Combine(Root,".work","databases")+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase));
+            }),
+            ("only owned synthetic database files are cleaned",()=>{
+                string file; string directory;
+                using(var sandbox=new SyntheticSandbox(Root)) {var db=sandbox.CreateDatabase(); file=db.Path; directory=sandbox.Root; SchemaManager.Initialize(db);}
+                Check(!File.Exists(file) && !Directory.Exists(directory));
+            }),
+            ("settings transactional and only permitted keys accepted",()=>{
+                using var f=new Fixture(); f.Start(); f.Service.SetLocalSetting(Id(),f.Owner,0,"synthetic.audio","{\"value\":true}");
+                Check(f.Service.GetLocalSetting(f.Owner,"synthetic.audio")!.ValueJson=="{\"value\":true}");
+                Error("INVALID_DATA",()=>f.Service.SetLocalSetting(Id(),f.Owner,1,"password","{\"value\":true}"));
+            }),
+            ("schema and payloads do not store technical secrets",()=>{
+                using var f=new Fixture(); f.Start();
+                Check(f.Scalar("SELECT count(*) FROM pragma_table_info('local_profiles') WHERE name IN('password','credential','credential_verifier','access_token','token');")==0);
+                Error("INVALID_DATA",()=>f.Service.SetLocalSetting(Id(),f.Owner,0,"synthetic.audio","{\"value\":{\"token\":\"SYNTHETIC-NOT-A-TOKEN\"}}"));
+                Error("INVALID_DATA",()=>f.Service.RecordDecision(f.Decision() with {ConsequencesJson="{\"password\":\"SYNTHETIC-INERT-MARKER\"}"}));
+                Check(!Encoding.ASCII.GetString(File.ReadAllBytes(f.Db.Path)).Contains("SYNTHETIC-INERT-MARKER",StringComparison.Ordinal));
+            }),
+            ("runtime does not require Godot HTTP or Express",()=>{
+                var names=typeof(GameSaveService).Assembly.GetReferencedAssemblies().Select(a=>a.Name??"").ToArray();
+                Check(!names.Any(n=>n.Contains("Godot",StringComparison.OrdinalIgnoreCase)||n.Contains("Http",StringComparison.OrdinalIgnoreCase)));
+                using var f=new Fixture(); f.Start(); Check(f.Service.ContinueGame(f.Owner).ResumeKind=="menu");
+            }),
+            ("final narrative and unlock rules are not invented",()=>{
+                using var f=new Fixture(); f.Start();
+                Check(f.Service.LoadGame(f.Owner,f.Game).Game.Ending is null);
+                Error("UNSUPPORTED_CHECKPOINT",()=>f.Service.SaveCurrentGame(f.Save(0,null,"ending")));
+                Error("UNKNOWN_CONTENT",()=>new GameSaveService(f.Db,Catalog("other-synthetic-rules")).LoadGame(f.Owner,f.Game));
+            })
+        };
+        Console.WriteLine("Runtime: "+System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription+"; target: net8.0; synthetic SQLite only");
+        var failures=0;
+        foreach(var (name,run) in tests)
+        {
+            try {run(); Console.WriteLine("PASS "+name);}
+            catch(Exception error) {failures++; Console.WriteLine("FAIL "+name+": "+error.GetType().Name+" "+(error is SaveException save?save.Code:error.Message));}
+        }
+        var remaining=0;
+        var pending=new Stack<string>(); pending.Push(Path.Combine(Root,".work","databases"));
+        while(pending.Count>0)
+        {
+            var directory=pending.Pop();
+            Check((File.GetAttributes(directory)&FileAttributes.ReparsePoint)==0,"linked database directory");
+            foreach(var entry in Directory.EnumerateFileSystemEntries(directory))
+            {
+                var attributes=File.GetAttributes(entry);
+                Check((attributes&FileAttributes.ReparsePoint)==0,"linked test artifact");
+                if((attributes&FileAttributes.Directory)!=0) pending.Push(entry);
+                else if(entry.EndsWith(".sqlite3",StringComparison.Ordinal)) remaining++;
+            }
+        }
+        Console.WriteLine($"SQLite checks: {tests.Count-failures} passed, {failures} failed, {remaining} synthetic database files remaining");
+        return failures==0 && remaining==0?0:1;
+    }
+}

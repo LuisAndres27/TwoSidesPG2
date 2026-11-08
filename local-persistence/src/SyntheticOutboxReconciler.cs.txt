@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Linq;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+// Explicit synthetic-only composition; never hooks GameSaveService or opens runtime.
+public sealed class SyntheticOutboxReconciler
+{
+    private readonly SyntheticDatabase _database;
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly Action? _beforeCommit;
+    private readonly int _capacity;
+    public SyntheticOutboxReconciler(SyntheticDatabase database,Func<DateTimeOffset>? clock=null,Action? beforeCommit=null,int capacity=10000)
+    { _database=database;_clock=clock??(()=>DateTimeOffset.UtcNow);_beforeCommit=beforeCommit;_capacity=capacity; }
+
+    public SyncReconciliationPage ReconcilePage(SyncBinding binding,int limit=50,SyncReconciliationCursor? cursor=null,string origin="historical_import")
+    {
+        try
+        {
+            SyncOutboxSchema.Verify(_database);
+            using var c=_database.Open();using var tx=c.BeginTransaction(deferred:false);
+            var result=PrepareSyntheticPage(new(c,tx),binding,_clock(),limit,cursor,origin,_capacity);
+            _beforeCommit?.Invoke();tx.Commit();return result with{Committed=true};
+        }
+        catch(Exception error) when(error is SaveException or SqliteException or System.IO.IOException or UnauthorizedAccessException or ArgumentException or FormatException or OverflowException or JsonException)
+        {
+            string code=SafeCode(error);
+            return new(false,false,0,0,0,0,new ReadOnlyDictionary<string,int>(new Dictionary<string,int>{{code,1}}),cursor);
+        }
+    }
+    // Same-transaction port for synthetic process tests/future explicitly authorized integration.
+    // Returned Committed=false until its owner commits. This method never commits domain data.
+    public static SyncReconciliationPage PrepareSyntheticPage(SQLiteRepository r,SyncBinding binding,DateTimeOffset now,
+        int limit=50,SyncReconciliationCursor? cursor=null,string origin="historical_import",int capacity=10000)
+    {
+        SyncOutboxSchema.Verify(r);
+        SaveValidation.Id(binding.LocalPlayerId);SaveValidation.Id(binding.InstallationId);
+        SaveValidation.Require(binding.BindingGeneration>0 && binding.BindingGeneration<=SyncOutboxProjection.MaxInteger &&
+            limit is >=1 and <=100 && capacity is >=1 and <=100000 && origin is "live_capture" or "historical_import","INVALID_RECONCILIATION");
+        SaveValidation.Require(r.Profile()?.LocalPlayerId==binding.LocalPlayerId,"NOT_FOUND");
+        if(cursor is not null)
+        {
+            SaveValidation.Require(cursor.Binding==binding && cursor.Origin==origin && cursor.Rank is >=-1 and <=5,"INVALID_RECONCILIATION_CURSOR");
+            if(cursor.After!="")SaveValidation.Id(cursor.After);
+        }
+        // Local references only: no remote account, JWT, name, credential or registration is needed.
+        r.Execute("INSERT INTO sync_installations VALUES($p,$i,$g,$at) ON CONFLICT(local_player_id,installation_id,binding_generation) DO NOTHING;",
+            ("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$g",binding.BindingGeneration),("$at",SyncOutboxProjection.Utc(now)));
+        var work=new PageWork(r,binding,now,origin,capacity,limit*8+16);
+        if(cursor?.PreviousIssues==true)work.Issue("PRIOR_PAGE_REQUIRES_REVIEW");
+        if(cursor?.Audit==true)
+        {
+            var ids=new List<string>();
+            using(var q=r.Command("SELECT operation_id FROM sync_outbox WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$g AND operation_id>$after ORDER BY operation_id LIMIT $n;",
+                ("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$g",binding.BindingGeneration),("$after",cursor.After),("$n",limit+1)))
+            using(var reader=q.ExecuteReader())while(reader.Read())ids.Add(reader.GetString(0));
+            bool more=ids.Count>limit;
+            foreach(string id in ids.Take(limit))
+            {
+                work.Examined++;
+                try{var row=SyncOutboxService.Find(r,binding.LocalPlayerId,id)!;work.ValidateExisting(row,true);}
+                catch(SaveException e) when(FactIssue(e.Code)){work.Issue(e.Code=="NOT_FOUND"?"ORPHANED_OUTBOX":e.Code);}
+                catch(Exception e) when(e is JsonException or FormatException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+                {work.Issue("INVALID_SYNC_SNAPSHOT");}
+            }
+            return work.Result(!more,more?new(binding,origin,true,5,ids[limit-1]):null);
+        }
+        var candidates=SyncFactInventory.Page(r,binding.LocalPlayerId,origin,cursor?.Rank??-1,cursor?.After??"",limit+1);
+        foreach(var candidate in candidates.Take(limit))
+        {
+            work.Examined++;
+            var saved=work.Save();
+            r.Execute("SAVEPOINT sync_reconcile_fact;");
+            try {work.Ensure(candidate.Fact,0);r.Execute("RELEASE sync_reconcile_fact;");}
+            catch(SaveException e) when(FactIssue(e.Code))
+            {
+                r.Execute("ROLLBACK TO sync_reconcile_fact;RELEASE sync_reconcile_fact;");
+                work.Restore(saved);work.Issue(e.Code);
+            }
+            catch(Exception e) when(e is JsonException or FormatException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+            {
+                r.Execute("ROLLBACK TO sync_reconcile_fact;RELEASE sync_reconcile_fact;");
+                work.Restore(saved);work.Issue("INVALID_SYNC_SNAPSHOT");
+            }
+        }
+        bool remaining=candidates.Count>limit;
+        var last=candidates.Take(limit).LastOrDefault();
+        return work.Result(false,remaining?new(binding,origin,false,last!.Rank,last.Id):new(binding,origin,true,5,""));
+    }
+    private static bool FactIssue(string code)=>code is "NOT_FOUND" or "OUTBOX_CONFLICT" or "SOURCE_CONTENT_CONFLICT" or
+        "SOURCE_REVISION_UNAVAILABLE" or "SOURCE_REVISION_REGRESSION" or "SOURCE_NOT_COMMITTED" or "SOURCE_DEPENDENCY_MISSING" or
+        "UNSUPPORTED_SYNC_VALUE" or "INVALID_SYNC_FACT" or "INVALID_DEPENDENCIES" or "INVALID_DATA" or "INVALID_SNAPSHOT" or
+        "UNKNOWN_CONTENT" or "INVALID_SYNC_SNAPSHOT" or "DEPENDENCY_COVERAGE_INCOMPLETE" or "DEPENDENCY_REJECTED" or
+        "PERMANENT_FAILURE_REQUIRES_REVIEW" or "LEGACY_SESSION_EVENT_DUPLICATE";
+    private static string SafeCode(Exception error)
+    {
+        string? code=error is SqliteException sql?StorageErrors.Map(sql).Code:(error as SaveException)?.Code;
+        return code is "STORAGE_BUSY" or "CORRUPT_STORAGE" or "DISK_FULL" or "ACCESS_DENIED" or "IO_ERROR" or "OUTBOX_FULL" or
+            "UNSUPPORTED_SCHEMA" or "UNSUPPORTED_SYNC_SCHEMA" or "UNSUPPORTED_EVENT_SCHEMA" or "NOT_FOUND" or
+            "INVALID_RECONCILIATION_CURSOR" or "INVALID_RECONCILIATION" or "RECONCILIATION_BUDGET" ? code : "RECONCILIATION_FAILED";
+    }
+
+    private sealed record WorkSnapshot(Dictionary<string,OutboxOperation> Cache,HashSet<string> Verified,int Inserted,int Existing,int Historical);
+    private sealed class PageWork
+    {
+        private readonly SQLiteRepository _r;private readonly SyncBinding _binding;private readonly DateTimeOffset _now;
+        private readonly string _origin;private readonly int _capacity,_budget;
+        private Dictionary<string,OutboxOperation> _cache=new(StringComparer.Ordinal);
+        private HashSet<string> _verified=new(StringComparer.Ordinal);
+        private readonly Dictionary<string,int> _issues=new(StringComparer.Ordinal);
+        internal int Examined,Inserted,Existing,Historical;
+        internal PageWork(SQLiteRepository r,SyncBinding binding,DateTimeOffset now,string origin,int capacity,int budget)
+        {_r=r;_binding=binding;_now=now;_origin=origin;_capacity=capacity;_budget=budget;}
+        internal WorkSnapshot Save()=>new(new(_cache,StringComparer.Ordinal),new(_verified,StringComparer.Ordinal),Inserted,Existing,Historical);
+        internal void Restore(WorkSnapshot s){_cache=s.Cache;_verified=s.Verified;Inserted=s.Inserted;Existing=s.Existing;Historical=s.Historical;}
+        internal void Issue(string code){_issues.TryGetValue(code,out int count);_issues[code]=count+1;}
+        internal SyncReconciliationPage Result(bool completed,SyncReconciliationCursor? next)=>new(false,completed,Examined,Inserted,Existing,Historical,
+            new ReadOnlyDictionary<string,int>(new Dictionary<string,int>(_issues,StringComparer.Ordinal)),
+            next is null?null:next with{PreviousIssues=_issues.Count>0});
+        private OutboxOperation? BySource(string key)
+        {
+            using var q=_r.Command("SELECT operation_id FROM sync_outbox WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$g AND source_key=$key;",
+                ("$p",_binding.LocalPlayerId),("$i",_binding.InstallationId),("$g",_binding.BindingGeneration),("$key",key));
+            string? id=q.ExecuteScalar() as string;return id is null?null:SyncOutboxService.Find(_r,_binding.LocalPlayerId,id);
+        }
+        private string[] Dependencies(string id)
+        {
+            using var q=_r.Command("SELECT depends_on_id FROM sync_dependencies WHERE operation_id=$id ORDER BY depends_on_id;",("$id",id));
+            using var d=q.ExecuteReader();var ids=new List<string>();while(d.Read())ids.Add(d.GetString(0));return ids.ToArray();
+        }
+        internal OutboxOperation Ensure(SyncFact fact,int depth)
+        {
+            SaveValidation.Require(depth<=8,"RECONCILIATION_BUDGET");
+            string key=SyncOutboxProjection.SourceKey(fact);
+            if(_cache.TryGetValue(key,out var cached))return cached;
+            var existing=BySource(key);
+            if(existing is not null){ValidateExisting(existing,false);_cache[key]=existing;return existing;}
+            var parents=SyncFactInventory.Parents(_r,_binding.LocalPlayerId,fact).Select(p=>Ensure(p,depth+1)).ToArray();
+            SaveValidation.Require(parents.All(p=>p.State!=OutboxDeliveryState.PermanentFailure),"DEPENDENCY_REJECTED");
+            SaveValidation.Require(Inserted<_budget,"RECONCILIATION_BUDGET");
+            var result=SyncOutboxService.CaptureInTransaction(_r,new(Guid.NewGuid().ToString("D"),_binding,fact,parents.Select(p=>p.OperationId).Distinct().ToArray()),_now,_capacity);
+            if(result.Inserted)Inserted++;else Existing++;
+            _cache[key]=result.Operation;_verified.Add(result.Operation.OperationId);
+            return result.Operation;
+        }
+        internal void ValidateExisting(OutboxOperation row,bool audit)
+        {
+            if(_verified.Contains(row.OperationId))return;
+            SaveValidation.Require(row.LocalPlayerId==_binding.LocalPlayerId && row.InstallationId==_binding.InstallationId &&
+                row.BindingGeneration==_binding.BindingGeneration && row.ContractVersion==1,"INVALID_SYNC_SNAPSHOT");
+            SaveValidation.Require(SyncOutboxProjection.Digest(row.CanonicalEnvelope)==row.PayloadHash &&
+                SaveValidation.JsonObject(row.CanonicalEnvelope,16384)==row.CanonicalEnvelope,"INVALID_SYNC_SNAPSHOT");
+            using var document=JsonDocument.Parse(row.CanonicalEnvelope);var e=document.RootElement;
+            SaveValidation.Require(e.EnumerateObject().Count()==9 && e.GetProperty("schemaVersion").GetInt32()==1 && e.GetProperty("type").GetString()==row.Type &&
+                e.GetProperty("localPlayerId").GetString()==row.LocalPlayerId && e.GetProperty("installationId").GetString()==row.InstallationId &&
+                e.GetProperty("bindingGeneration").GetInt64()==row.BindingGeneration && e.GetProperty("sourceKey").GetString()==row.SourceKey &&
+                e.GetProperty("createdAtUtc").GetString()==row.CreatedAtUtc &&
+                (e.GetProperty("gameId").ValueKind==JsonValueKind.Null?null:e.GetProperty("gameId").GetString())==row.GameId,"INVALID_SYNC_SNAPSHOT");
+            var parts=row.SourceKey.Split(':');
+            SyncFact fact;
+            if(row.Type=="game.report")
+            {
+                SaveValidation.Require(parts.Length==3 && long.TryParse(parts[2],NumberStyles.None,CultureInfo.InvariantCulture,out _),"INVALID_SYNC_SNAPSHOT");
+                fact=new(SyncFactKind.GameReport,row.SourceId,long.Parse(parts[2],CultureInfo.InvariantCulture),Origin:row.Origin);
+                SaveValidation.Require(e.GetProperty("payload").GetProperty("revision").GetInt64()==fact.Revision,"INVALID_SYNC_SNAPSHOT");
+            }
+            else if(row.Type=="session.report"){SaveValidation.Require(parts.Length==3,"INVALID_SYNC_SNAPSHOT");fact=new(SyncFactKind.SessionReport,row.SourceId,Phase:parts[2],Origin:row.Origin);}
+            else fact=new(row.Type=="gameplay.event"?SyncFactKind.GameplayEvent:SyncFactKind.GameplayInterval,row.SourceId,Origin:row.Origin);
+            SaveValidation.Require(SyncOutboxProjection.SourceKey(fact)==row.SourceKey,"INVALID_SYNC_SNAPSHOT");
+            var parents=Dependencies(row.OperationId);
+            SyncOutboxService.CaptureInTransaction(_r,new(row.OperationId,_binding,fact,parents),_now,_capacity);
+            if(fact.Kind==SyncFactKind.GameReport && _r.Game(row.LocalPlayerId,row.SourceId)!.Revision>fact.Revision)
+            {
+                // A later revision cannot reproduce an old projection, but immutable metadata/decisions must still agree.
+                var game=_r.Game(row.LocalPlayerId,row.SourceId)!;
+                var currentProjection=SyncOutboxProjection.Read(_r,row.LocalPlayerId,new(SyncFactKind.GameReport,row.SourceId,game.Revision,Origin:row.Origin));
+                using var current=JsonDocument.Parse(currentProjection.Payload);
+                var oldPayload=e.GetProperty("payload");var latest=current.RootElement;
+                foreach(string key in new[]{"gameId","rulesVersion","contentVersion","saveFormatVersion","createdAtUtc"})
+                    SaveValidation.Require(SaveValidation.Canonical(oldPayload.GetProperty(key))==SaveValidation.Canonical(latest.GetProperty(key)),"SOURCE_CONTENT_CONFLICT");
+                var decisions=latest.GetProperty("decisions").EnumerateArray().ToArray();
+                foreach(var oldDecision in oldPayload.GetProperty("decisions").EnumerateArray())
+                    SaveValidation.Require(decisions.Any(d=>d.GetProperty("decisionId").GetString()==oldDecision.GetProperty("decisionId").GetString() &&
+                        SaveValidation.Canonical(d)==SaveValidation.Canonical(oldDecision)),"SOURCE_CONTENT_CONFLICT");
+                Historical++;
+            }
+            if(audit && fact.Kind==SyncFactKind.GameplayEvent)
+            {
+                var source=new GameplayEventRepository(_r).FindEvent(row.SourceId)?.Event;
+                if(source?.Kind is GameplayEventKind.SESSION_STARTED or GameplayEventKind.SESSION_ENDED)
+                    Issue("LEGACY_SESSION_EVENT_DUPLICATE");
+            }
+            // Existing dependencies must not be silently rewritten to today's revision.
+            var expected=SyncFactInventory.Parents(_r,row.LocalPlayerId,fact);
+            var declared=parents.Select(id=>SyncOutboxService.Find(_r,row.LocalPlayerId,id)).ToArray();
+            SaveValidation.Require(declared.All(p=>p is not null && p.InstallationId==_binding.InstallationId && p.BindingGeneration==_binding.BindingGeneration),"INVALID_DEPENDENCIES");
+            foreach(var parent in expected)
+                SaveValidation.Require(declared.Any(p=>parent.Kind==SyncFactKind.GameReport
+                    ? p!.Type=="game.report" && p.SourceId==parent.SourceId
+                    : p!.SourceKey==SyncOutboxProjection.SourceKey(parent)),"DEPENDENCY_COVERAGE_INCOMPLETE");
+            if(declared.Any(p=>p!.State==OutboxDeliveryState.PermanentFailure))Issue("DEPENDENCY_REJECTED");
+            if(row.State==OutboxDeliveryState.PermanentFailure)Issue("PERMANENT_FAILURE_REQUIRES_REVIEW");
+            Existing++;_verified.Add(row.OperationId);
+        }
+    }
+}
+

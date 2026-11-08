@@ -1,0 +1,12 @@
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+namespace TwoSides.LocalPersistence;
+public interface IStatisticsDeliveryStore
+{
+    Task<IReadOnlyList<StatisticalDelivery>> ReserveStatisticsAsync(long now,CancellationToken cancel);
+    Task ConfirmStatisticsAsync(StatisticalDelivery delivery,CancellationToken cancel);
+    Task DeferStatisticsAsync(StatisticalDelivery delivery,long now,long retryAt,string code,CancellationToken cancel);
+    Task RejectStatisticsAsync(StatisticalDelivery delivery,long now,string code,CancellationToken cancel);
+    Task ResumeStatisticsAsync(long now,CancellationToken cancel);
+}

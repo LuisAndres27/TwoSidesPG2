@@ -1,0 +1,380 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class OutboxChecks
+{
+    private static int _count;
+    private static readonly DateTimeOffset Start=DateTimeOffset.Parse("2026-10-27T12:00:00.000Z",CultureInfo.InvariantCulture);
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok){if(!ok)throw new Exception("Outbox assertion failed");}
+    private static void Error(string code,Action action)
+    {try{action();throw new Exception("Expected "+code);}catch(SaveException e){if(e.Code!=code)throw new Exception("Expected "+code+", got "+e.Code);}}
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly string Owner=Id(),Game=Id(),Installation=Id();
+        internal readonly GameSaveService Save;
+        internal DateTimeOffset Clock=Start;
+        internal SyncBinding Binding=>new(Owner,Installation,1);
+        internal SyncOutboxService Queue=>new(Db,()=>Clock,()=>0);
+        internal SyncFact Fact=>new(SyncFactKind.GameReport,Game,Save.LoadGame(Owner,Game).Game.Revision);
+        internal F(bool migrate=true,bool events=false)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState(),()=>Start);
+            Save.CreateLocalProfile(Id(),Owner,"Synthetic Outbox");Save.CreateNewGame(new(Id(),Owner,Game));
+            if(events)GameplayEventSchema.MigrateSynthetic(Db);
+            if(migrate){SyncOutboxSchema.MigrateSynthetic(Db);Queue.RegisterInstallation(Binding);}
+        }
+        internal OutboxCapture Input(SyncFact? fact=null,IReadOnlyList<string>? dependencies=null)=>new(Id(),Binding,fact??Fact,dependencies);
+        internal OutboxOperation Capture()=>Queue.Capture(Input()).Operation;
+        internal OutboxOperation Reserve()=>Queue.Reserve(Binding).Single();
+        internal SimulatedSyncReceipt Ack(OutboxOperation row)=>new(row.OperationId,Owner,Installation,1,row.PayloadHash,row.LeaseId!,row.Attempts,Id(),"2026-10-27T12:00:00.000Z");
+        internal long Number(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+        internal void Sql(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;q.ExecuteNonQuery();}
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static void Case(string label,Action<F> action,bool migrate=true,bool events=false)
+    {using var f=new F(migrate,events);action(f);_count++;Console.WriteLine("PASS "+label);}
+    private static async Task AsyncCase(string label,Func<F,Task> action)
+    {using var f=new F();await action(f);_count++;Console.WriteLine("PASS "+label);}
+
+    // Child-process capability is restricted to fresh synthetic UUID paths, never runtime/AppData.
+    internal sealed class ProbeStore:ISaveDatabase
+    {
+        private readonly string _path;
+        internal ProbeStore(string path)
+        {
+            _path=Path.GetFullPath(path);
+            string parent=Path.GetDirectoryName(_path)!;
+            string expected=Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","databases");
+            SaveValidation.Require(Path.GetDirectoryName(parent)==expected &&
+                Guid.TryParseExact(Path.GetFileName(parent),"N",out _) &&
+                Guid.TryParseExact(Path.GetFileNameWithoutExtension(_path),"N",out _) && Path.GetExtension(_path)==".sqlite3","UNSAFE_PATH");
+            foreach(string p in new[]{SyntheticSandbox.AuthorizedProjectRoot,Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work"),expected,parent,_path})
+                SaveValidation.Require((File.GetAttributes(p)&FileAttributes.ReparsePoint)==0,"UNSAFE_PATH");
+        }
+        public SqliteConnection Open()
+        {
+            var c=new SqliteConnection(new SqliteConnectionStringBuilder{DataSource=_path,Mode=SqliteOpenMode.ReadWrite,Pooling=false,ForeignKeys=true,DefaultTimeout=1}.ToString());
+            c.Open();using var q=c.CreateCommand();q.CommandText="PRAGMA synchronous=FULL;PRAGMA busy_timeout=1000;";q.ExecuteNonQuery();return c;
+        }
+    }
+    public static int Probe(string[] args)
+    {
+        // mode,path,owner,installation,operation,time
+        var db=new ProbeStore(args[1]);string owner=args[2],installation=args[3],op=args[4];
+        var clock=DateTimeOffset.FromUnixTimeMilliseconds(long.Parse(args[5],CultureInfo.InvariantCulture));
+        var binding=new SyncBinding(owner,installation,1);
+        var queue=new SyncOutboxService(db,()=>clock,()=>0);
+        if(args[0]=="read")return queue.Get(owner,op)?.State==OutboxDeliveryState.Pending?0:81;
+        if(args[0]=="inflight")return queue.Get(owner,op)?.State==OutboxDeliveryState.InFlight?0:82;
+        if(args[0]=="recover")return queue.RecoverExpired(binding)==1?0:83;
+        if(args[0]=="crash-reserve"){new SyncOutboxService(db,()=>clock,()=>0,()=>Environment.Exit(73)).Reserve(binding);return 84;}
+        if(args[0]=="crash-confirm")
+        {
+            var row=queue.Get(owner,op)!;
+            new SyncOutboxService(db,()=>clock,()=>0,()=>Environment.Exit(73)).Confirm(new(op,owner,installation,1,row.PayloadHash,row.LeaseId!,row.Attempts,Id(),"2026-10-27T12:00:00.000Z"));
+            return 85;
+        }
+        return 86;
+    }
+    private static int Child(F f,string mode,string op)
+    {
+        var start=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true};
+        foreach(string arg in new[]{"--outbox-probe",mode,f.Db.Path,f.Owner,f.Installation,op,f.Clock.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture)})start.ArgumentList.Add(arg);
+        using var child=Process.Start(start)!;
+        if(!child.WaitForExit(15000)){child.Kill();throw new Exception("Synthetic child timeout");}
+        Check(child.StandardOutput.ReadToEnd().Length==0 && child.StandardError.ReadToEnd().Length==0);
+        return child.ExitCode;
+    }
+    public static async Task<int> Run()
+    {
+        Case("sync migration creates four tables, two explicit indexes and preserves base/event versions",f=>{
+            Check(f.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name GLOB 'sync_*';")==4);
+            Check(f.Number("SELECT count(*) FROM sqlite_master WHERE type='index' AND name GLOB 'ix_sync_*';")==2);
+            Check(SchemaManager.ReadVersion(f.Db)==2);GameplayEventSchema.Verify(f.Db);
+        },events:true);
+        Case("migration applies twice without changing bytes",f=>{string hash=f.Hash();SyncOutboxSchema.MigrateSynthetic(f.Db);Check(hash==f.Hash());});
+        Case("migration failure rolls back tables, indexes and history",f=>{
+            string hash=f.Hash();Error("TEST_ROLLBACK",()=>SyncOutboxSchema.MigrateSynthetic(f.Db,()=>throw new SaveException("TEST_ROLLBACK")));
+            Check(f.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'sync_*';")==0 && f.Hash()==hash);
+            SyncOutboxSchema.MigrateSynthetic(f.Db);SyncOutboxSchema.Verify(f.Db);
+        },false);
+        Case("migration preserves existing profile, game, decisions and base receipts",f=>{
+            var before=f.Save.LoadGame(f.Owner,f.Game);long count=f.Number("SELECT count(*) FROM local_operations;");
+            SyncOutboxSchema.MigrateSynthetic(f.Db);
+            Check(f.Save.LoadGame(f.Owner,f.Game).Game==before.Game && count==f.Number("SELECT count(*) FROM local_operations;"));
+        },false);
+        Case("migration rejects altered checksum",f=>{f.Sql("UPDATE sync_schema_migrations SET checksum='tampered';");Error("UNSUPPORTED_SYNC_SCHEMA",()=>SyncOutboxSchema.MigrateSynthetic(f.Db));});
+        Case("migration rejects unknown extension version",f=>{f.Sql("UPDATE sync_schema_migrations SET version=99;");Error("UNSUPPORTED_SYNC_SCHEMA",()=>SyncOutboxSchema.Verify(f.Db));});
+        Case("migration rejects unknown partial extension",f=>{f.Sql("CREATE TABLE sync_unknown(x INTEGER);");Error("UNSUPPORTED_SYNC_SCHEMA",()=>SyncOutboxSchema.MigrateSynthetic(f.Db));},false);
+        Case("base v1 is not upgraded implicitly by extension",f=>{var db=f.Sandbox.CreateDatabase();SchemaManager.Initialize(db,1);Error("UNSUPPORTED_SCHEMA",()=>SyncOutboxSchema.MigrateSynthetic(db));Check(SchemaManager.ReadVersion(db)==1);});
+        Case("empty synthetic extension rollback is reversible and preserves facts",f=>{
+            var before=f.Save.LoadGame(f.Owner,f.Game).Game;SyncOutboxSchema.RollbackEmptySynthetic(f.Db);
+            Check(f.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'sync_*';")==0 && f.Save.LoadGame(f.Owner,f.Game).Game==before);
+            SyncOutboxSchema.MigrateSynthetic(f.Db);
+        });
+        Case("rollback refuses to discard pending or confirmed queue history",f=>{f.Capture();Error("OUTBOX_NOT_EMPTY",()=>SyncOutboxSchema.RollbackEmptySynthetic(f.Db));});
+        Case("pending record has stable operation, source, owner, installation, game and canonical hash",f=>{
+            var op=f.Capture();Check(op.State==OutboxDeliveryState.Pending && op.Attempts==0 && op.SourceId==f.Game &&
+                op.LocalPlayerId==f.Owner && op.InstallationId==f.Installation && op.GameId==f.Game && op.SourceKey=="game:"+f.Game+":0" &&
+                op.PayloadHash.Length==64 && op.ReceiptJson is null);
+        });
+        Case("repeated fact returns original operation and immutable envelope despite clock change",f=>{
+            var op=f.Capture();f.Clock+=TimeSpan.FromHours(2);var retry=f.Queue.Capture(f.Input());
+            Check(!retry.Inserted && retry.Operation.OperationId==op.OperationId && retry.Operation.CanonicalEnvelope==op.CanonicalEnvelope && retry.Operation.PayloadHash==op.PayloadHash);
+        });
+        Case("same fact with contradictory coverage is a controlled conflict",f=>{
+            f.Capture();Error("OUTBOX_CONFLICT",()=>f.Queue.Capture(f.Input(f.Fact with{Origin="historical_import"})));
+        });
+        Case("same source revision with contradictory committed content cannot replace queued payload",f=>{
+            var original=f.Capture();var input=f.Input();f.Sql("UPDATE saved_games SET content_version='contradictory-version';");
+            Error("OUTBOX_CONFLICT",()=>f.Queue.Capture(input));Check(f.Queue.Get(f.Owner,original.OperationId)!.PayloadHash==original.PayloadHash);
+        });
+        Case("same operation ID for a different logical source is a controlled conflict",f=>{
+            var op=f.Capture();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            Error("OUTBOX_CONFLICT",()=>f.Queue.Capture(f.Input() with{OperationId=op.OperationId}));
+        });
+        Case("SQLite uniqueness blocks equivalent facts with another operation UUID",f=>{
+            f.Capture();try{f.Sql("INSERT INTO sync_outbox SELECT '"+Id()+"',local_player_id,installation_id,binding_generation,game_id,source_id,source_key,type,contract_version,created_at_utc,origin,canonical_envelope,payload_hash,state,attempts,next_attempt_ms,lease_id,lease_until_ms,receipt_json,last_error_code FROM sync_outbox;");throw new Exception("Expected constraint");}catch(SqliteException e){Check(e.SqliteErrorCode==19);}
+        });
+        Case("payload and binding are immutable even via direct SQL",f=>{
+            f.Capture();try{f.Sql("UPDATE sync_outbox SET payload_hash='"+new string('0',64)+"';");throw new Exception("Expected constraint");}catch(SqliteException e){Check(e.SqliteErrorCode==19);}
+        });
+        Case("unbound capture is deferred rather than generating installation identity",f=>{
+            var input=f.Input() with{Binding=new(f.Owner,Id(),1)};
+            Error("SYNC_BINDING_REQUIRED",()=>f.Queue.Capture(input));Check(f.Queue.Pending(f.Owner).Count==0);
+        });
+        Case("missing or foreign source cannot create a phantom outbox entry",f=>{
+            Error("NOT_FOUND",()=>f.Queue.Capture(f.Input(new(SyncFactKind.GameReport,Id(),0))));
+            Error("NOT_FOUND",()=>f.Queue.RegisterInstallation(new(Id(),Id(),1)));Check(f.Queue.Pending(f.Owner).Count==0);
+        });
+        Case("uncaptured old revisions are not invented and captured old revisions stay immutable",f=>{
+            var op=f.Capture();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            Check(!f.Queue.Capture(f.Input(new(SyncFactKind.GameReport,f.Game,0))).Inserted);
+            Check(f.Queue.Get(f.Owner,op.OperationId)!.PayloadHash==op.PayloadHash);
+            Error("SOURCE_REVISION_UNAVAILABLE",()=>f.Queue.Capture(f.Input(new(SyncFactKind.GameReport,f.Game,99))));
+        });
+        Case("capacity failure preserves local progress and existing queue",f=>{
+            f.Capture();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            Error("OUTBOX_FULL",()=>new SyncOutboxService(f.Db,()=>f.Clock,()=>0,capacity:1).Capture(f.Input()));
+            Check(f.Save.LoadGame(f.Owner,f.Game).Game.Revision==1 && f.Queue.Pending(f.Owner).Count==1);
+        });
+        Case("reserve creates durable lease and increments attempt once",f=>{
+            var op=f.Capture();var reserved=f.Reserve();Check(reserved.OperationId==op.OperationId && reserved.State==OutboxDeliveryState.InFlight &&
+                reserved.Attempts==1 && reserved.LeaseId is not null && reserved.LeaseUntilUnixMs>f.Clock.ToUnixTimeMilliseconds() && f.Queue.Reserve(f.Binding).Count==0);
+        });
+        await AsyncCase("two SQLite consumers cannot reserve the same operation",async f=>{
+            f.Capture();var results=await Task.WhenAll(Task.Run(()=>f.Queue.Reserve(f.Binding)),Task.Run(()=>f.Queue.Reserve(f.Binding)));
+            Check(results.Sum(x=>x.Count)==1);
+        });
+        await AsyncCase("two SQLite writers capture one logical fact",async f=>{
+            var results=await Task.WhenAll(Task.Run(()=>f.Queue.Capture(f.Input())),Task.Run(()=>f.Queue.Capture(f.Input())));
+            Check(results.Count(x=>x.Inserted)==1 && results.Select(x=>x.Operation.OperationId).Distinct().Count()==1);
+        });
+        Case("valid simulated receipt confirms only its leased element",f=>{
+            f.Capture();var row=f.Reserve();var ack=f.Ack(row);f.Queue.Confirm(ack);
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.Confirmed && f.Queue.Pending(f.Owner).Count==0);
+        });
+        Case("duplicate receipt is idempotent and confirmed rows never mutate",f=>{
+            f.Capture();var row=f.Reserve();var ack=f.Ack(row);f.Queue.Confirm(ack);string hash=f.Hash();
+            f.Queue.Confirm(ack with{Status="duplicate"});Check(hash==f.Hash());
+            Error("RECEIPT_CONFLICT",()=>f.Queue.Confirm(ack with{ReceiptId=Id()}));
+        });
+        foreach(string field in new[]{"hash","owner","installation","generation","lease","attempt","status","timestamp"})
+            Case("invalid receipt "+field+" cannot confirm",f=>{
+                f.Capture();var row=f.Reserve();var ack=f.Ack(row);
+                ack=field switch{"hash"=>ack with{PayloadHash=new string('0',64)},"owner"=>ack with{LocalPlayerId=Id()},
+                    "installation"=>ack with{InstallationId=Id()},"generation"=>ack with{BindingGeneration=2},"lease"=>ack with{LeaseId=Id()},
+                    "attempt"=>ack with{Attempt=99},"status"=>ack with{Status="sent"},"timestamp"=>ack with{CommittedAtUtc="not-a-date"},_=>ack};
+                try{f.Queue.Confirm(ack);throw new Exception("Expected rejection");}catch(SaveException){Check(f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.InFlight);}
+            });
+        Case("pending operation cannot be confirmed without reservation",f=>{
+            var row=f.Capture();Error("LEASE_CONFLICT",()=>f.Queue.Confirm(f.Ack(row) with{LeaseId=Id()}));
+        });
+        Case("late ack at exact lease expiration is rejected",f=>{
+            f.Capture();var row=f.Reserve();f.Clock=DateTimeOffset.FromUnixTimeMilliseconds(row.LeaseUntilUnixMs!.Value);
+            Error("LEASE_CONFLICT",()=>f.Queue.Confirm(f.Ack(row)));
+        });
+        Case("F3.1 default lease is 60 seconds: alive at 30 s and 59 s, expired exactly at 60 s",f=>{
+            Check(SyncOutboxService.DefaultLease==TimeSpan.FromSeconds(60));
+            f.Capture();var row=f.Reserve();Check(row.LeaseUntilUnixMs!.Value-f.Clock.ToUnixTimeMilliseconds()==60000);
+            f.Clock+=TimeSpan.FromSeconds(30);Check(f.Queue.RecoverExpired(f.Binding)==0 && f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.InFlight);
+            f.Clock+=TimeSpan.FromSeconds(29);Check(f.Queue.RecoverExpired(f.Binding)==0);
+            f.Clock+=TimeSpan.FromSeconds(1);Check(f.Queue.RecoverExpired(f.Binding)==1);
+        });
+        Case("F3.1 a slow pass (45 s: session 15 + receipt query 15 + batch 15) can still confirm its reservation",f=>{
+            f.Capture();var row=f.Reserve();f.Clock+=TimeSpan.FromSeconds(45);
+            f.Queue.Confirm(f.Ack(row));Check(f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.Confirmed && f.Queue.RecoverExpired(f.Binding)==0);
+        });
+        Case("expired lease becomes retryable with delay and keeps ID payload and attempts",f=>{
+            f.Capture();var row=f.Reserve();f.Clock+=TimeSpan.FromSeconds(60);
+            Check(f.Queue.RecoverExpired(f.Binding)==1);
+            var recovered=f.Queue.Get(f.Owner,row.OperationId)!;
+            Check(recovered.State==OutboxDeliveryState.RetryableFailure && recovered.Attempts==1 && recovered.LeaseId is null &&
+                recovered.NextAttemptUnixMs>f.Clock.ToUnixTimeMilliseconds() && recovered.PayloadHash==row.PayloadHash);
+        });
+        Case("old lease ack cannot overwrite a newer attempt",f=>{
+            f.Capture();var old=f.Reserve();f.Clock+=TimeSpan.FromSeconds(61);f.Queue.RecoverExpired(f.Binding);f.Clock+=TimeSpan.FromSeconds(1);
+            var current=f.Reserve();Error("LEASE_CONFLICT",()=>f.Queue.Confirm(f.Ack(old)));
+            Check(current.Attempts==2 && current.LeaseId!=old.LeaseId);f.Queue.Confirm(f.Ack(current));
+        });
+        Case("retryable error schedules backoff without a tight loop or new operation",f=>{
+            f.Capture();var row=f.Reserve();f.Queue.Retry(f.Owner,row.OperationId,row.LeaseId!,row.Attempts,"network_unavailable");
+            var pending=f.Queue.Get(f.Owner,row.OperationId)!;Check(pending.LastErrorCode=="network_unavailable" && f.Queue.Reserve(f.Binding).Count==0);
+            f.Clock=DateTimeOffset.FromUnixTimeMilliseconds(pending.NextAttemptUnixMs);var next=f.Reserve();Check(next.OperationId==row.OperationId && next.Attempts==2);
+        });
+        Case("exponential jitter is bounded, nonzero and capped at fifteen minutes",f=>{
+            Check(OutboxRetryPolicy.DelayMilliseconds(1,0)==500 && OutboxRetryPolicy.DelayMilliseconds(2,0)==1000 &&
+                OutboxRetryPolicy.DelayMilliseconds(100000,0.999)<900001);
+            Error("INVALID_RETRY",()=>OutboxRetryPolicy.DelayMilliseconds(1,double.NaN));
+            Error("INVALID_RETRY",()=>OutboxRetryPolicy.DelayMilliseconds(0,0));
+        });
+        Case("server RetryAfter simulation takes precedence within bounded input policy",f=>{
+            f.Capture();var row=f.Reserve();f.Queue.Retry(f.Owner,row.OperationId,row.LeaseId!,1,"rate_limited",TimeSpan.FromMinutes(10));
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.NextAttemptUnixMs==f.Clock.AddMinutes(10).ToUnixTimeMilliseconds());
+        });
+        Case("only sanitized error codes are persisted",f=>{
+            f.Capture();var row=f.Reserve();Error("INVALID_ERROR_CODE",()=>f.Queue.Retry(f.Owner,row.OperationId,row.LeaseId!,1,"credential=forbidden"));
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.LastErrorCode is null);
+        });
+        Case("permanent rejection quarantines original payload without deletion or retries",f=>{
+            f.Capture();var row=f.Reserve();f.Queue.Reject(f.Owner,row.OperationId,row.LeaseId!,1,"invalid_fact");
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.PermanentFailure && f.Queue.Reserve(f.Binding).Count==0);
+        });
+        Case("pending queries respect owner and game scope",f=>{
+            f.Capture();Check(f.Queue.Pending(f.Owner,f.Game).Count==1 && f.Queue.Pending(Id()).Count==0 && f.Queue.Pending(f.Owner,Id()).Count==0);
+        });
+        Case("explicit source dependencies reserve only after prerequisite receipt",f=>{
+            var parent=f.Capture();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            var dependent=f.Queue.Capture(f.Input(dependencies:new[]{parent.OperationId})).Operation;
+            var first=f.Reserve();Check(first.OperationId==parent.OperationId);f.Queue.Confirm(f.Ack(first));
+            Check(f.Reserve().OperationId==dependent.OperationId);
+        });
+        Case("missing and self dependencies are rejected atomically",f=>{
+            Error("INVALID_DEPENDENCIES",()=>f.Queue.Capture(f.Input(dependencies:new[]{Id()})));Check(f.Queue.Pending(f.Owner).Count==0);
+        });
+        Case("historical reports retain explicit unknown coverage and omit invented metrics",f=>{
+            var row=f.Queue.Capture(f.Input(f.Fact with{Origin="historical_import"})).Operation;
+            Check(row.CanonicalEnvelope.Contains("historicalCoverageUnknown") && row.CanonicalEnvelope.Contains("historical_import") &&
+                !row.CanonicalEnvelope.Contains("deaths") && !row.CanonicalEnvelope.Contains("displayName") && !row.CanonicalEnvelope.Contains("snapshot"));
+        });
+        Case("confirmed historical closure exports original ending without inventing sessions or deaths",f=>{
+            string[] biomes={"ocean","jungle","desert","forest","tundra"};
+            string[] keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+            long Revision()=>f.Save.LoadGame(f.Owner,f.Game).Game.Revision;
+            for(int i=0;i<5;i++){
+                f.Save.EnterBiome(new(Id(),f.Owner,f.Game,Revision(),biomes[i],"human"));
+                f.Save.RecordDecision(new(Id(),Id(),f.Owner,f.Game,Revision(),biomes[i],keys[i],"reject","healthy","{\"stateKind\":\"healthy\"}"));
+                f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,Revision(),biomes[i],"good"));
+            }
+            f.Save.PrepareFinal(new(Id(),f.Owner,f.Game,Revision()));f.Save.CloseGame(new(Id(),f.Owner,f.Game,Revision(),"good"));
+            var op=f.Queue.Capture(f.Input(f.Fact with{Origin="historical_import"})).Operation;
+            Check(op.CanonicalEnvelope.Contains("closedAtUtc") && op.CanonicalEnvelope.Contains("local-ending-reject-count-1") &&
+                !op.CanonicalEnvelope.Contains("deaths") && f.Number("SELECT count(*) FROM sqlite_master WHERE name='gameplay_sessions';")==0);
+        });
+        Case("optional event extension is not silently created for base-only data",f=>{
+            f.Capture();Error("UNSUPPORTED_EVENT_SCHEMA",()=>f.Queue.Capture(f.Input(new(SyncFactKind.SessionReport,Id(),Phase:"open"))));
+            Check(f.Number("SELECT count(*) FROM sqlite_master WHERE name='gameplay_sessions';")==0);
+        });
+        Case("committed session event and interval are captured without mutating original facts",f=>{
+            var events=new GameplayEventService(f.Db);string session=Id(),eventId=Id(),intervalId=Id();
+            events.RecordEvent(new(eventId,f.Owner,session,GameplayEventKind.SESSION_STARTED,Start,0));
+            events.RecordInterval(new(intervalId,f.Owner,session,0,10,GameplayTimeState.Menu));
+            var open=f.Queue.Capture(f.Input(new(SyncFactKind.SessionReport,session,Phase:"open"))).Operation;
+            var e=f.Queue.Capture(f.Input(new(SyncFactKind.GameplayEvent,eventId))).Operation;
+            var i=f.Queue.Capture(f.Input(new(SyncFactKind.GameplayInterval,intervalId))).Operation;
+            Check(open.GameId is null && e.GameId is null && i.GameId is null && events.GetEvents(f.Owner).Count==1 &&
+                e.SourceId==eventId && i.CanonicalEnvelope.Contains("endMs") && !i.CanonicalEnvelope.Contains("effectiveMs"));
+        },events:true);
+        Case("terminal report cannot be fabricated for an open session",f=>{
+            string session=Id();new GameplayEventService(f.Db).RecordEvent(new(Id(),f.Owner,session,GameplayEventKind.SESSION_STARTED,Start,0));
+            Error("SOURCE_NOT_COMMITTED",()=>f.Queue.Capture(f.Input(new(SyncFactKind.SessionReport,session,Phase:"terminal"))));
+        },events:true);
+        Case("session open report remains idempotent after closure and terminal is a distinct source",f=>{
+            string session=Id();var events=new GameplayEventService(f.Db);
+            events.RecordEvent(new(Id(),f.Owner,session,GameplayEventKind.SESSION_STARTED,Start,0));
+            var input=f.Input(new(SyncFactKind.SessionReport,session,Phase:"open"));var open=f.Queue.Capture(input).Operation;
+            events.RecordEvent(new(Id(),f.Owner,session,GameplayEventKind.SESSION_ENDED,Start.AddMilliseconds(20),20,SessionEnd:GameplaySessionEnd.Normal));
+            var retry=f.Queue.Capture(input);var terminal=f.Queue.Capture(f.Input(new(SyncFactKind.SessionReport,session,Phase:"terminal"))).Operation;
+            Check(!retry.Inserted && retry.Operation.PayloadHash==open.PayloadHash && terminal.OperationId!=open.OperationId && terminal.CanonicalEnvelope.Contains("closed"));
+        },events:true);
+        Case("shared synthetic source transaction rolls back both source and outbox",f=>{
+            string session=Id();
+            using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false)){
+                var r=new SQLiteRepository(c,tx);
+                r.Execute("INSERT INTO gameplay_sessions VALUES($s,$p,$at,'open',NULL,NULL);",("$s",session),("$p",f.Owner),("$at",Start.ToString("O")));
+                SyncOutboxService.CaptureInTransaction(r,f.Input(new(SyncFactKind.SessionReport,session,Phase:"open")),Start);
+                tx.Rollback();
+            }
+            Check(f.Number("SELECT count(*) FROM gameplay_sessions;")==0 && f.Queue.Pending(f.Owner).Count==0);
+        },events:true);
+        Case("shared synthetic source transaction commits both source and outbox",f=>{
+            string session=Id();
+            using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false)){
+                var r=new SQLiteRepository(c,tx);
+                r.Execute("INSERT INTO gameplay_sessions VALUES($s,$p,$at,'open',NULL,NULL);",("$s",session),("$p",f.Owner),("$at",Start.ToString("O")));
+                SyncOutboxService.CaptureInTransaction(r,f.Input(new(SyncFactKind.SessionReport,session,Phase:"open")),Start);tx.Commit();
+            }
+            Check(f.Number("SELECT count(*) FROM gameplay_sessions;")==1 && f.Queue.Pending(f.Owner).Count==1);
+        },events:true);
+        Case("foreign-key integrity remains clean and rejects deleting a referenced game",f=>{
+            f.Capture();Check(f.Number("SELECT count(*) FROM pragma_foreign_key_check;")==0);
+            try{f.Sql("DELETE FROM saved_games;");throw new Exception("Expected FK");}catch(SqliteException e){Check(e.SqliteErrorCode==19);}
+        });
+        Case("writer lock yields controlled STORAGE_BUSY then permits retry",f=>{
+            f.Capture();using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false))
+                Error("STORAGE_BUSY",()=>f.Queue.Reserve(f.Binding));
+            Check(f.Queue.Reserve(f.Binding).Count==1);
+        });
+        Case("transaction failure during capture leaves no orphan then retry succeeds",f=>{
+            var queue=new SyncOutboxService(f.Db,()=>f.Clock,()=>0,()=>throw new SaveException("TEST_ROLLBACK"));
+            Error("TEST_ROLLBACK",()=>queue.Capture(f.Input()));Check(f.Queue.Pending(f.Owner).Count==0 && f.Save.LoadGame(f.Owner,f.Game).Game.Revision==0);
+            Check(f.Queue.Capture(f.Input()).Inserted);
+        });
+        Case("transaction failure during reservation leaves pending attempt zero",f=>{
+            var row=f.Capture();Error("TEST_ROLLBACK",()=>new SyncOutboxService(f.Db,()=>f.Clock,()=>0,()=>throw new SaveException("TEST_ROLLBACK")).Reserve(f.Binding));
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.Attempts==0 && f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.Pending);
+        });
+        Case("another process reopens the same durable pending operation",f=>{
+            var row=f.Capture();Check(Child(f,"read",row.OperationId)==0);
+        });
+        Case("reservation survives process restart and a new process recovers lease expiration",f=>{
+            f.Capture();var row=f.Reserve();Check(Child(f,"inflight",row.OperationId)==0);
+            f.Clock+=TimeSpan.FromSeconds(61);Check(Child(f,"recover",row.OperationId)==0);
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.RetryableFailure);
+        });
+        Case("abrupt process exit before reservation commit rolls back lease and attempt",f=>{
+            var row=f.Capture();Check(Child(f,"crash-reserve",row.OperationId)==73);
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.Pending && f.Queue.Get(f.Owner,row.OperationId)!.Attempts==0);
+        });
+        Case("abrupt process exit before receipt commit cannot mark delivered",f=>{
+            f.Capture();var row=f.Reserve();Check(Child(f,"crash-confirm",row.OperationId)==73);
+            Check(f.Queue.Get(f.Owner,row.OperationId)!.State==OutboxDeliveryState.InFlight);
+            f.Clock+=TimeSpan.FromSeconds(61);f.Queue.RecoverExpired(f.Binding);f.Clock+=TimeSpan.FromSeconds(1);
+            var retry=f.Reserve();f.Queue.Confirm(f.Ack(retry));Check(retry.OperationId==row.OperationId);
+        });
+        Case("library contains no HTTP, Atlas, JWT or Godot assembly dependency",f=>{
+            Check(typeof(SyncOutboxService).Assembly.GetReferencedAssemblies().All(a=>
+                a.Name is not "System.Net.Http" and not "GodotSharp" && !(a.Name??"").Contains("Mongo") && !(a.Name??"").Contains("Jwt")));
+        });
+        Case("outbox projection never persists secrets, visible name or continuation snapshot",f=>{
+            var row=f.Capture();
+            foreach(string forbidden in new[]{"Synthetic Outbox","credential","password","accessToken","privateKey","Atlas","snapshotJson","checkpoint"})
+                Check(!row.CanonicalEnvelope.Contains(forbidden,StringComparison.OrdinalIgnoreCase));
+        });
+        Console.WriteLine(_count+" outbox checks passed; synthetic SQLite only, no HTTP or runtime migration.");return 0;
+    }
+}
+

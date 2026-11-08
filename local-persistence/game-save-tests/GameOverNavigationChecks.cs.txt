@@ -1,0 +1,140 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class GameOverNavigationChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static void Check(bool ok){if(!ok)throw new Exception("Game Over/navigation assertion failed");}
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly RuntimeMenuChecks.Store Store;
+        internal readonly LocalGameState State;
+        internal readonly LocalMenuReturn Return=new();
+        internal readonly LocalAnimalRestart Restart=new();
+        internal readonly string Owner=Id(),Game=Id();
+        internal bool Paused=true;
+        internal F(int target=0,bool healthy=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Store=new(Db,new RuntimeMenuChecks.Failure());
+            Store.Service.CreateLocalProfile(Id(),Owner,"Derrota sintética");Store.Service.CreateNewGame(new(Id(),Owner,Game));
+            for(int i=0;i<5;i++)
+            {
+                bool good=i==target?healthy:i%2==0;
+                var g=Store.Service.LoadGame(Owner,Game).Game;
+                Store.Service.EnterBiome(new(Id(),Owner,Game,g.Revision,Biomes[i],"human"));
+                g=Store.Service.LoadGame(Owner,Game).Game;
+                Store.Service.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,Biomes[i],Keys[i],good?"reject":"approve",good?"healthy":"degraded",good?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));
+            }
+            State=new(Store,"owned-fixture");
+        }
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        internal Task<bool> Levels(Func<Task<bool>> navigate)=>Return.ReturnToSelectionAsync(State,Paused,p=>Paused=p,navigate);
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work,int target=0,bool healthy=true)
+    {
+        using var f=new F(target,healthy);await f.State.InitializeAsync();
+        try{await work(f);}finally{await f.State.DisposeAsync();}
+        _count++;Console.WriteLine("PASS "+name);
+    }
+    public static async Task<int> Run()
+    {
+        for(int i=0;i<5;i++)foreach(bool healthy in new[]{true,false})
+        {
+            int target=i;
+            await Case("Game Over shared retry "+Biomes[i]+" "+(healthy?"reject":"approve"),async f=>
+            {
+                string hash=f.Hash();var before=f.Store.Service.LoadGame(f.Owner,f.Game);int calls=0;
+                string scene=LocalBiomeSelection.AnimalSceneFor(Biomes[target])!;
+                Check(await f.Restart.RestartAsync(f.State,scene,_=>true,(c,d)=>
+                {
+                    Check(c.Healthy==healthy && c.GameId==f.Game && c.LocalPlayerId==f.Owner && d==scene);
+                    f.Paused=false;calls++;return Task.FromResult(true);
+                }));
+                var after=f.Store.Service.LoadGame(f.Owner,f.Game);
+                Check(calls==1 && !f.Paused && f.State.ActiveGame?.Game.GameId==f.Game && !f.State.CanStartNewGame);
+                Check(before.Game==after.Game && before.Decisions.SequenceEqual(after.Decisions) && before.Environments.SequenceEqual(after.Environments) && before.Biomes.SequenceEqual(after.Biomes));
+                Check(after.Biomes.All(b=>b.Status=="animal_pending") && f.Hash()==hash);
+            },i,healthy);
+        }
+        foreach(string origin in new[]{"pause","game-over"})
+            await Case(origin+" goes directly to authorized five-card selection",async f=>
+            {
+                string hash=f.Hash();int calls=0;
+                Check(await f.Levels(()=>
+                {
+                    Check(!f.Paused && f.State.CanEnterSelection && LocalMenuReturn.SelectionDestination=="res://scenes/levels/menu_niveles.tscn");
+                    calls++;return Task.FromResult(true);
+                }));
+                var selection=f.State.CreateBiomeSelection();Check(await selection.RefreshAsync());
+                foreach(string biome in Biomes)
+                {
+                    Check(selection.Describe(biome).CanEnter);
+                    Check(await selection.EnterAsync(biome,_=>true,plan=>Task.FromResult(plan.Scene==LocalBiomeSelection.AnimalSceneFor(biome) && plan.Environment is "healthy" or "degraded")));
+                }
+                Check(calls==1 && !f.Paused && !f.State.CanStartNewGame && f.State.ActiveGame?.Game.GameId==f.Game && f.Store.EntryCalls==0 && f.Hash()==hash);
+            });
+        await Case("selection SQLite error restores pause and safe retry recovers same game",async f=>
+        {
+            string hash=f.Hash();f.Store.ReadFailure=true;int calls=0;
+            Check(!await f.Levels(()=>{calls++;return Task.FromResult(true);}));
+            Check(f.Paused && !f.State.CanEnterSelection && !f.State.CanStartNewGame && calls==0 && f.Return.Code=="IO_ERROR");
+            f.Store.ReadFailure=false;Check(await f.Levels(()=>Task.FromResult(true)) && f.State.ActiveGame?.Game.GameId==f.Game && f.Hash()==hash);
+        });
+        await Case("failed selection navigation invalidates ticket and restores pause",async f=>
+        {
+            string hash=f.Hash();Check(!await f.Levels(()=>Task.FromResult(false)));
+            Check(f.Paused && !f.State.CanEnterSelection && f.Return.Code=="NAVIGATION_FAILED");
+            Check(await f.Levels(()=>Task.FromResult(true)) && f.State.CanEnterSelection && !f.Paused && f.Hash()==hash);
+        });
+        await Case("selection double click executes one transition",async f=>
+        {
+            string hash=f.Hash();var gate=new TaskCompletionSource<bool>();int calls=0;
+            var first=f.Levels(()=>{calls++;return gate.Task;});Check(f.Return.Busy);
+            Check(!await f.Levels(()=>{calls++;return Task.FromResult(true);}));gate.SetResult(true);
+            Check(await first && calls==1 && !f.Paused && f.Hash()==hash);
+        });
+        await Case("completed retry is rejected and only completed card blocked",async f=>
+        {
+            // Synthetic terminal fixture only, never a Game Over production operation.
+            var g=f.Store.Service.LoadGame(f.Owner,f.Game).Game;
+            f.Store.Service.CompleteBiome(new(Id(),f.Owner,f.Game,g.Revision,"ocean","good"));
+            string hash=f.Hash();Check(!await f.Restart.RestartAsync(f.State,LocalBiomeSelection.AnimalSceneFor("ocean")!,_=>true,(_,_)=>throw new Exception()));
+            Check(f.Restart.Code=="BIOME_COMPLETED" && await f.Levels(()=>Task.FromResult(true)));
+            var selection=f.State.CreateBiomeSelection();Check(await selection.RefreshAsync());
+            Check(!selection.Describe("ocean").CanEnter && Biomes.Skip(1).All(b=>selection.Describe(b).CanEnter) && f.Hash()==hash);
+        });
+        await Case("missing animal scene reports canonical path without navigation",async f=>
+        {
+            string hash=f.Hash();string scene=LocalBiomeSelection.AnimalSceneFor("forest")!;
+            Check(!await f.Restart.RestartAsync(f.State,scene,_=>false,(_,_)=>throw new Exception()));
+            Check(f.Restart.Code=="SCENE_UNAVAILABLE" && f.Restart.Message.Contains(scene,StringComparison.Ordinal) && f.Hash()==hash);
+        });
+        await Case("missing active game rejects selection without replacement",async f=>
+        {
+            RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);string hash=f.Hash();int calls=0;
+            Check(!await f.Levels(()=>{calls++;return Task.FromResult(true);}));
+            Check(calls==0 && f.Paused && !f.State.CanEnterSelection && f.Store.Service.GetGameHistory(f.Owner).Count==1 && f.Hash()==hash);
+        });
+        // Bindings inspected as source, not executed Godot signals. These catch accidental remote rewiring.
+        string root=Path.GetDirectoryName(SyntheticSandbox.AuthorizedProjectRoot)!;
+        string over=File.ReadAllText(Path.Combine(root,"assets/sprites/ui/GameOver.cs"));
+        string pause=File.ReadAllText(Path.Combine(root,"assets/sprites/ui/MenuPausa.cs"));
+        Check(over.Contains("AnimalSegmentFlow.RestartLocalAsync(this)") && over.Contains("AnimalSegmentFlow.ReturnToLevelsLocalAsync(this)"));
+        Check(pause.Contains("AnimalSegmentFlow.ReturnToLevelsLocalAsync(this)"));
+        foreach(string source in new[]{over,pause}) Check(!source.Contains("recuperacion_partida.tscn") && !source.Contains("login.tscn") && !source.Contains("RecordDecision(") && !source.Contains("CompleteBiome(") && !source.Contains("AnimalSegmentFlow.Open("));
+        _count++;Console.WriteLine("PASS inspected UI bindings share local coordinators with no remote recovery or completion");
+        Console.WriteLine($"Game Over/navigation: {_count} passed, 0 failed; synthetic SQLite callbacks and source bindings, not Godot runtime.");
+        return 0;
+    }
+}

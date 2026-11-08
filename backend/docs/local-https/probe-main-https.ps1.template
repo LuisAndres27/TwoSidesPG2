@@ -1,0 +1,44 @@
+# probe-main-https.ps1.template — HTTPS probe for the first controlled test (B23). NOT run. Run by the OWNER after the local proxy and Express main are up.
+# Copy it OUTSIDE the project (e.g. %LOCALAPPDATA%\TwoSidesLocalProxy\probe-main-https.ps1) so it never becomes part of the integrity inventory.
+# Invoke-RestMethod validates the certificate with the Windows trust store (the same mechanism the game's HttpClient uses). Nothing here disables certificate validation.
+# It prints status codes and the token's public header fields only: never a credential, a token or a key.
+param([switch]$WriteSynthetic)
+$ErrorActionPreference = 'Stop'
+$base = 'https://localhost:8443'
+function Get-Status($method, $path, $body, $token) {
+    $headers = @{}; if ($token) { $headers['Authorization'] = 'Bearer ' + $token }
+    try {
+        $arguments = @{ Uri = $base + $path; Method = $method; Headers = $headers; TimeoutSec = 15; UseBasicParsing = $true }
+        if ($body) { $arguments.Body = ($body | ConvertTo-Json -Compress); $arguments.ContentType = 'application/json' }
+        $r = Invoke-WebRequest @arguments; return @{ Status = [int]$r.StatusCode; Content = $r.Content }
+    } catch [System.Net.WebException] {
+        if ($_.Exception.Response) { return @{ Status = [int]$_.Exception.Response.StatusCode; Content = '' } }
+        return @{ Status = 0; Content = '' }                                   # TLS/connection failure: certificate or network problem
+    }
+}
+'1) health over validated TLS (no remote write):   ' + (Get-Status 'GET' '/api/health').Status
+'2) protected route without token (expect 401):    ' + (Get-Status 'GET' '/api/v2/technical/me').Status
+'3) bogus token (expect 401):                      ' + (Get-Status 'GET' '/api/v2/technical/me' $null 'not-a-real-token').Status
+'4) outside /api (expect 404 from the proxy):      ' + (Get-Status 'GET' '/').Status
+if ($WriteSynthetic) {
+    # MINIMAL remote write: one synthetic technical account + one session (random identifiers, never a real player). Atlas keeps these records until the owner removes them.
+    $bytes = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $credential = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $registrationId = [guid]::NewGuid().ToString(); $installationId = [guid]::NewGuid().ToString(); $localPlayerId = [guid]::NewGuid().ToString()
+    $registration = Get-Status 'POST' '/api/v2/technical/registrations' @{ schemaVersion = 2; registrationId = $registrationId; credential = $credential; installationId = $installationId; localPlayerId = $localPlayerId; bindingGeneration = 1 }
+    '5) synthetic registration (expect 201):           ' + $registration.Status
+    if ($registration.Status -eq 201) {
+        $accountId = ($registration.Content | ConvertFrom-Json).technicalAccountId
+        $session = Get-Status 'POST' '/api/v2/technical/sessions' @{ schemaVersion = 2; technicalAccountId = $accountId; credential = $credential; installationId = $installationId; localPlayerId = $localPlayerId }
+        '6) synthetic session (expect 200):                ' + $session.Status
+        if ($session.Status -eq 200) {
+            $token = ($session.Content | ConvertFrom-Json).accessToken
+            $part = $token.Split('.')[0].Replace('-', '+').Replace('_', '/'); $part = $part.PadRight([int][math]::Ceiling($part.Length / 4) * 4, '=')
+            $header = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($part)) | ConvertFrom-Json
+            '   token header: alg=' + $header.alg + ' typ=' + $header.typ + ' kid=' + $header.kid + '  (expect RS256 at+jwt main-2026-11)'
+            '7) authenticated call (expect 200):               ' + (Get-Status 'GET' '/api/v2/technical/me' $null $token).Status
+        }
+        'Synthetic ids for later manual cleanup in Atlas (not secrets): registrationId=' + $registrationId + ' technicalAccountId=' + $accountId
+    }
+    Remove-Variable credential, bytes, token, session, registration -ErrorAction SilentlyContinue
+}

@@ -1,0 +1,125 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class MenuReturnChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok){if(!ok)throw new Exception("Return-to-menu assertion failed");}
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly RuntimeMenuChecks.Store Store;
+        internal readonly LocalGameState State;
+        internal readonly LocalMenuReturn Return=new();
+        internal readonly string Owner=Id(), Game=Id();
+        internal bool Paused=true;
+        internal F(bool healthy=true,bool game=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);
+            Store=new(Db,new RuntimeMenuChecks.Failure());
+            Store.Service.CreateLocalProfile(Id(),Owner,"Retorno sintético");
+            if(game)
+            {
+                Store.Service.CreateNewGame(new(Id(),Owner,Game));
+                var g=Store.Service.LoadGame(Owner,Game).Game;
+                Store.Service.EnterBiome(new(Id(),Owner,Game,g.Revision,"ocean","human"));
+                g=Store.Service.LoadGame(Owner,Game).Game;
+                Store.Service.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,"ocean","ocean_waste_disposal",healthy?"reject":"approve",healthy?"healthy":"degraded",healthy?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));
+            }
+            State=new(Store,"owned-fixture");
+        }
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        internal Task<bool> Back(Func<Task<bool>> navigate)=>Return.ReturnAsync(State,Paused,p=>Paused=p,navigate);
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work,bool healthy=true,bool game=true)
+    {
+        using var f=new F(healthy,game);await f.State.InitializeAsync();
+        try{await work(f);}finally{await f.State.DisposeAsync();}
+        _count++;Console.WriteLine("PASS "+name);
+    }
+    public static async Task<int> Probe(string path,string owner,string game)
+    {
+        var store=new RuntimeMenuChecks.Store(new RuntimeMenuChecks.ReadOnlyFixture(path),new RuntimeMenuChecks.Failure());
+        await using var state=new LocalGameState(store,"owned-fixture");await state.InitializeAsync();
+        return state.Profile?.LocalPlayerId==owner && state.ActiveGame?.Game.GameId==game && state.CanContinue && !state.CanStartNewGame && await state.PrepareSelectionAsync()?0:41;
+    }
+    public static async Task<int> Run()
+    {
+        foreach(bool healthy in new[]{true,false})
+            await Case("return continue and animal environment "+(healthy?"healthy":"degraded"),async f=>
+            {
+                string hash=f.Hash();var before=f.Store.Service.LoadGame(f.Owner,f.Game);
+                Check(await f.Back(()=>{Check(!f.Paused);Check(LocalMenuReturn.Destination=="res://assets/sprites/ui/menu_principal.tscn");return Task.FromResult(true);}));
+                Check(!f.Paused && f.State.Profile?.LocalPlayerId==f.Owner && f.State.ActiveGame?.Game.GameId==f.Game && f.State.CanContinue && !f.State.CanStartNewGame);
+                Check(await f.State.PrepareSelectionAsync());var selection=f.State.CreateBiomeSelection();Check(await selection.RefreshAsync());
+                bool projected=false;
+                Check(await selection.EnterAsync("ocean",_=>true,plan=>{Check(plan.Environment==(healthy?"healthy":"degraded") && plan.Scene==LocalBiomeSelection.AnimalSceneFor("ocean"));projected=true;return Task.FromResult(true);}));
+                var after=f.Store.Service.LoadGame(f.Owner,f.Game);
+                Check(projected && after.Game.Revision==before.Game.Revision && after.Decisions.Count==1 && after.Decisions[0]==before.Decisions[0] && after.Biomes[0].Status!="completed" && f.Hash()==hash);
+            },healthy);
+        await Case("SQLite failure stays local paused and blocks new game",async f=>
+        {
+            string hash=f.Hash();f.Store.ReadFailure=true;int calls=0;
+            Check(!await f.Back(()=>{calls++;return Task.FromResult(true);}));
+            Check(calls==0 && f.Paused && !f.State.CanStartNewGame && f.Return.Code=="IO_ERROR" && f.Hash()==hash);
+        });
+        await Case("SQLite retry recovers same game without writes",async f=>
+        {
+            string hash=f.Hash();f.Store.ReadFailure=true;Check(!await f.Back(()=>Task.FromResult(true)));
+            f.Store.ReadFailure=false;Check(await f.Back(()=>Task.FromResult(true)));
+            Check(!f.Paused && f.State.ActiveGame?.Game.GameId==f.Game && !f.State.CanStartNewGame && f.Hash()==hash);
+        });
+        await Case("navigation failure restores pause and permits retry",async f=>
+        {
+            string hash=f.Hash();Check(!await f.Back(()=>Task.FromResult(false)));
+            Check(f.Paused && f.Return.Code=="NAVIGATION_FAILED" && !f.Return.Busy);
+            Check(await f.Back(()=>Task.FromResult(true)) && !f.Paused && f.Hash()==hash);
+        });
+        await Case("navigation exception restores pause",async f=>
+        {
+            string hash=f.Hash();Check(!await f.Back(()=>throw new IOException("synthetic")));
+            Check(f.Paused && !f.Return.Busy && f.Hash()==hash);
+        });
+        await Case("double click coalesces return and one navigation",async f=>
+        {
+            string hash=f.Hash();int calls=0;var gate=new TaskCompletionSource<bool>();
+            var first=f.Back(()=>{calls++;return gate.Task;});Check(f.Return.Busy);
+            Check(!await f.Back(()=>{calls++;return Task.FromResult(true);}));
+            gate.SetResult(true);Check(await first);Check(calls==1 && !f.Paused && f.Hash()==hash);
+        });
+        await Case("closed store rejects return without navigation or temporary game",async f=>
+        {
+            string hash=f.Hash();int calls=0;
+            await f.State.DisposeAsync();
+            Check(!await f.Back(()=>{calls++;return Task.FromResult(true);}));
+            Check(f.Return.Code=="STORAGE_CLOSED" && f.Paused && calls==0 && f.Hash()==hash);
+        });
+        await Case("repeated menu visits keep decision and unfinished restriction",async f=>
+        {
+            string hash=f.Hash();for(int i=0;i<3;i++){f.Paused=true;Check(await f.Back(()=>Task.FromResult(true)));Check(await f.State.PrepareSelectionAsync());}
+            Check(f.State.ActiveGame?.Game.GameId==f.Game && !f.State.CanStartNewGame && f.Hash()==hash);
+        });
+        await Case("new process recovers same SQLite game readonly without HTTP",async f=>
+        {
+            string hash=f.Hash();Check(await f.Back(()=>Task.FromResult(true)));
+            var start=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false};
+            foreach(string arg in new[]{"--menu-return-probe",f.Db.Path,f.Owner,f.Game})start.ArgumentList.Add(arg);
+            using var child=Process.Start(start)!;await child.WaitForExitAsync();Check(child.ExitCode==0 && f.Hash()==hash);
+        });
+        await Case("absent active game rejects return without creating one",async f=>
+        {
+            string hash=f.Hash();int calls=0;Check(!await f.Back(()=>{calls++;return Task.FromResult(true);}));
+            Check(calls==0 && f.Paused && f.Store.Service.GetGameHistory(f.Owner).Count==0 && f.Hash()==hash);
+        },game:false);
+        Console.WriteLine($"Menu return: {_count} passed, 0 failed; synthetic SQLite and pause/navigation callbacks, not Godot runtime.");
+        return 0;
+    }
+}

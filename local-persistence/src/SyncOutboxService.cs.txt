@@ -1,0 +1,247 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+// Local-only service. No timers, workers, HTTP, token or Godot dependency; never auto-migrates.
+public sealed class SyncOutboxService
+{
+    private readonly ISaveDatabase _database;
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly Func<double> _jitter;
+    private readonly Action? _beforeCommit;
+    private readonly int _capacity;
+    public SyncOutboxService(ISaveDatabase database,Func<DateTimeOffset>? clock=null,Func<double>? jitter=null,
+        Action? beforeCommit=null,int capacity=10000)
+    {
+        SaveValidation.Require(capacity is >=1 and <=100000,"INVALID_OUTBOX_LIMIT");
+        SyncOutboxSchema.Verify(database);_database=database;_clock=clock??(()=>DateTimeOffset.UtcNow);
+        _jitter=jitter??Random.Shared.NextDouble;_beforeCommit=beforeCommit;_capacity=capacity;
+    }
+    private long Now()=>_clock().ToUnixTimeMilliseconds();
+    private T Work<T>(bool write,Func<SQLiteRepository,T> action)
+    {
+        try
+        {
+            using var c=_database.Open();using var tx=c.BeginTransaction(deferred:!write);
+            var r=new SQLiteRepository(c,tx);SyncOutboxSchema.Verify(r);
+            T result=action(r);if(write)_beforeCommit?.Invoke();tx.Commit();return result;
+        }
+        catch(SqliteException e){throw StorageErrors.Map(e);}
+        catch(UnauthorizedAccessException){throw new SaveException("ACCESS_DENIED");}
+        catch(System.IO.IOException){throw new SaveException("IO_ERROR");}
+        catch(OverflowException){throw new SaveException("INVALID_SYNC_VALUE");}
+        catch(FormatException){throw new SaveException("INVALID_SYNC_VALUE");}
+        catch(ArgumentException){throw new SaveException("INVALID_SYNC_VALUE");}
+    }
+    private static void Binding(SyncBinding b)
+    {SaveValidation.Id(b.LocalPlayerId);SaveValidation.Id(b.InstallationId);SyncOutboxProjection.Number(b.BindingGeneration);SaveValidation.Require(b.BindingGeneration>0);}
+    internal static void KnownBinding(SQLiteRepository r,SyncBinding b)
+    {
+        Binding(b);
+        SaveValidation.Require(r.Number("SELECT count(*) FROM sync_installations WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$v;",
+            ("$p",b.LocalPlayerId),("$i",b.InstallationId),("$v",b.BindingGeneration))==1,"SYNC_BINDING_REQUIRED");
+    }
+    public void RegisterInstallation(SyncBinding binding)=>Work(true,r=>{
+        Binding(binding);SaveValidation.Require(r.Profile()?.LocalPlayerId==binding.LocalPlayerId,"NOT_FOUND");
+        r.Execute("INSERT INTO sync_installations VALUES($p,$i,$v,$at) ON CONFLICT(local_player_id,installation_id,binding_generation) DO NOTHING;",
+            ("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$v",binding.BindingGeneration),("$at",SyncOutboxProjection.Utc(_clock())));
+        return true;
+    });
+    private static string State(OutboxDeliveryState s)=>s switch{
+        OutboxDeliveryState.Pending=>"pending",OutboxDeliveryState.InFlight=>"in_flight",OutboxDeliveryState.Confirmed=>"confirmed",
+        OutboxDeliveryState.RetryableFailure=>"retryable_failure",OutboxDeliveryState.PermanentFailure=>"permanent_failure",_=>throw new SaveException("INVALID_STATE")};
+    private static OutboxDeliveryState State(string s)=>s switch{
+        "pending"=>OutboxDeliveryState.Pending,"in_flight"=>OutboxDeliveryState.InFlight,"confirmed"=>OutboxDeliveryState.Confirmed,
+        "retryable_failure"=>OutboxDeliveryState.RetryableFailure,"permanent_failure"=>OutboxDeliveryState.PermanentFailure,_=>throw new SaveException("INVALID_STATE")};
+    private static OutboxOperation Map(SqliteDataReader r)
+    {
+        string S(string n)=>r.GetString(r.GetOrdinal(n));long L(string n)=>r.GetInt64(r.GetOrdinal(n));
+        string? N(string n)=>r.IsDBNull(r.GetOrdinal(n))?null:S(n);
+        return new(S("operation_id"),S("local_player_id"),S("installation_id"),L("binding_generation"),N("game_id"),S("source_id"),S("source_key"),S("type"),
+            (int)L("contract_version"),S("created_at_utc"),S("origin"),S("canonical_envelope"),S("payload_hash"),State(S("state")),L("attempts"),L("next_attempt_ms"),
+            N("lease_id"),r.IsDBNull(r.GetOrdinal("lease_until_ms"))?null:L("lease_until_ms"),N("receipt_json"),N("last_error_code"));
+    }
+    private static IReadOnlyList<OutboxOperation> Rows(SQLiteRepository r,string sql,params (string,object?)[] args)
+    {using var q=r.Command(sql,args);using var data=q.ExecuteReader();var rows=new List<OutboxOperation>();while(data.Read())rows.Add(Map(data));return rows.AsReadOnly();}
+    internal static OutboxOperation? Find(SQLiteRepository r,string owner,string id)=>Rows(r,"SELECT * FROM sync_outbox WHERE local_player_id=$p AND operation_id=$id;",("$p",owner),("$id",id)).SingleOrDefault();
+    public OutboxOperation? Get(string owner,string operationId)
+    {SaveValidation.Id(owner);SaveValidation.Id(operationId);return Work(false,r=>Find(r,owner,operationId));}
+    public IReadOnlyList<OutboxOperation> Pending(string owner,string? game=null,int limit=100)
+    {
+        SaveValidation.Id(owner);if(game is not null)SaveValidation.Id(game);SaveValidation.Require(limit is >=1 and <=100);
+        return Work(false,r=>Rows(r,"SELECT * FROM sync_outbox WHERE local_player_id=$p AND ($g IS NULL OR game_id=$g) AND state IN('pending','retryable_failure','in_flight') ORDER BY created_at_utc,operation_id LIMIT $n;",
+            ("$p",owner),("$g",game),("$n",limit)));
+    }
+    // Read-only: the parents recorded with an operation, ordinal order. Used by the HTTP dispatcher to send the exact dependency list.
+    public IReadOnlyList<string> Dependencies(string owner,string operationId)
+    {
+        SaveValidation.Id(owner);SaveValidation.Id(operationId);
+        return Work(false,r=>{
+            var list=new List<string>();
+            using var q=r.Command("SELECT depends_on_id FROM sync_dependencies WHERE operation_id=$id AND local_player_id=$p ORDER BY depends_on_id;",("$id",operationId),("$p",owner));
+            using var data=q.ExecuteReader();while(data.Read())list.Add(data.GetString(0));
+            return (IReadOnlyList<string>)list.AsReadOnly();
+        });
+    }
+    public OutboxEnqueueResult Capture(OutboxCapture input)=>Work(true,r=>CaptureInTransaction(r,input,_clock(),_capacity));
+    // Future B05.3B hook/reconciler may call this on its shared connection/transaction. Not wired to gameplay.
+    public static OutboxEnqueueResult CaptureInTransaction(SQLiteRepository r,OutboxCapture input,DateTimeOffset capturedAt,int capacity=10000)
+    {
+        SyncOutboxSchema.Verify(r);SaveValidation.Id(input.OperationId);KnownBinding(r,input.Binding);
+        var b=input.Binding;var fact=input.Fact;string sourceKey=SyncOutboxProjection.SourceKey(fact);
+        var previous=Rows(r,"SELECT * FROM sync_outbox WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$v AND source_key=$s;",
+            ("$p",b.LocalPlayerId),("$i",b.InstallationId),("$v",b.BindingGeneration),("$s",sourceKey)).SingleOrDefault();
+        var dependencies=(input.Dependencies??Array.Empty<string>()).OrderBy(x=>x,StringComparer.Ordinal).ToArray();
+        SaveValidation.Require(dependencies.Length<=16 && dependencies.Distinct().Count()==dependencies.Length,"INVALID_DEPENDENCIES");
+        foreach(var id in dependencies)SaveValidation.Id(id);
+        if(previous is not null)
+        {
+            SaveValidation.Require(previous.Origin==fact.Origin,"OUTBOX_CONFLICT");
+            using var q=r.Command("SELECT depends_on_id FROM sync_dependencies WHERE operation_id=$id ORDER BY depends_on_id;",("$id",previous.OperationId));
+            using var reader=q.ExecuteReader();var old=new List<string>();while(reader.Read())old.Add(reader.GetString(0));
+            SaveValidation.Require(old.SequenceEqual(dependencies),"OUTBOX_CONFLICT");
+        }
+        // An already captured old game revision is immutable; never fabricate an uncaptured old revision.
+        if(previous is not null && fact.Kind==SyncFactKind.GameReport)
+        {
+            var source=r.Game(b.LocalPlayerId,fact.SourceId);SaveValidation.Require(source is not null,"NOT_FOUND");
+            SaveValidation.Require(source!.Revision>=fact.Revision,"SOURCE_REVISION_REGRESSION");
+            if(source.Revision!=fact.Revision)return new(previous,false);
+        }
+        var projection=SyncOutboxProjection.Read(r,b.LocalPlayerId,fact);
+        string at=previous?.CreatedAtUtc??SyncOutboxProjection.Utc(capturedAt);
+        using var payload=System.Text.Json.JsonDocument.Parse(projection.Payload);
+        string envelope=SyncOutboxProjection.Json(new {schemaVersion=1,type=projection.Type,installationId=b.InstallationId,localPlayerId=b.LocalPlayerId,
+            bindingGeneration=b.BindingGeneration,gameId=projection.GameId,sourceKey,createdAtUtc=at,payload=payload.RootElement});
+        string hash=SyncOutboxProjection.Digest(envelope);
+        if(previous is not null)
+        {
+            SaveValidation.Require(previous.PayloadHash==hash && previous.CanonicalEnvelope==envelope,"OUTBOX_CONFLICT");
+            return new(previous,false);
+        }
+        SaveValidation.Require(Encoding.UTF8.GetByteCount(envelope)+256<=16384,"SYNC_PAYLOAD_TOO_LARGE");
+        SaveValidation.Require(capacity is >=1 and <=100000 && r.Number("SELECT count(*) FROM sync_outbox;")<capacity,"OUTBOX_FULL");
+        SaveValidation.Require(r.Number("SELECT count(*) FROM sync_outbox WHERE operation_id=$id;",("$id",input.OperationId))==0,"OUTBOX_CONFLICT");
+        foreach(var id in dependencies)
+        {
+            var parent=Find(r,b.LocalPlayerId,id);
+            SaveValidation.Require(parent is not null && parent.InstallationId==b.InstallationId && parent.BindingGeneration==b.BindingGeneration &&
+                parent.State!=OutboxDeliveryState.PermanentFailure && id!=input.OperationId,"INVALID_DEPENDENCIES");
+        }
+        r.Execute("""
+INSERT INTO sync_outbox(operation_id,local_player_id,installation_id,binding_generation,game_id,source_id,source_key,type,contract_version,created_at_utc,origin,canonical_envelope,payload_hash,state,next_attempt_ms)
+VALUES($id,$p,$i,$v,$g,$source,$key,$type,1,$at,$origin,$json,$hash,'pending',$now);
+""",("$id",input.OperationId),("$p",b.LocalPlayerId),("$i",b.InstallationId),("$v",b.BindingGeneration),("$g",projection.GameId),("$source",fact.SourceId),
+            ("$key",sourceKey),("$type",projection.Type),("$at",at),("$origin",fact.Origin),("$json",envelope),("$hash",hash),("$now",capturedAt.ToUnixTimeMilliseconds()));
+        foreach(var id in dependencies)r.Execute("INSERT INTO sync_dependencies VALUES($op,$dep,$p,$i,$v);",("$op",input.OperationId),("$dep",id),("$p",b.LocalPlayerId),("$i",b.InstallationId),("$v",b.BindingGeneration));
+        return new(Find(r,b.LocalPlayerId,input.OperationId)!,true);
+    }
+    // F3.1 (B47/B48): 60 s, not 30 s. The worst sync pass is session (15 s) + receipt query (15 s) + batch (15 s) = 45 s with the 15 s request timeout; the lease must outlive it
+    // so a normal pass can still Confirm. A lease that does expire (process death) is recovered by RecoverExpired exactly as before.
+    public static readonly TimeSpan DefaultLease=TimeSpan.FromSeconds(60);
+    public IReadOnlyList<OutboxOperation> Reserve(SyncBinding binding,int limit=100,TimeSpan? leaseDuration=null)
+    {
+        var duration=leaseDuration??DefaultLease;
+        SaveValidation.Require(limit is >=1 and <=100 && duration>=TimeSpan.FromSeconds(1) && duration<=TimeSpan.FromMinutes(5),"INVALID_LEASE");
+        return Work(true,r=>{
+            KnownBinding(r,binding);long now=Now(),until=checked(now+(long)duration.TotalMilliseconds);
+            var rows=Rows(r,"""
+SELECT o.* FROM sync_outbox o WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$v
+AND state IN('pending','retryable_failure') AND next_attempt_ms<=$now
+AND NOT EXISTS(SELECT 1 FROM sync_dependencies d JOIN sync_outbox parent ON parent.operation_id=d.depends_on_id WHERE d.operation_id=o.operation_id AND parent.state!='confirmed')
+ORDER BY created_at_utc,operation_id LIMIT $n;
+""",("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$v",binding.BindingGeneration),("$now",now),("$n",limit));
+            var reserved=new List<OutboxOperation>();int bytes=0;
+            foreach(var row in rows)
+            {
+                int size=Encoding.UTF8.GetByteCount(row.CanonicalEnvelope)+256;if(bytes+size>256*1024)break;bytes+=size;
+                SaveValidation.Require(row.Attempts<SyncOutboxProjection.MaxInteger,"ATTEMPT_LIMIT");
+                string lease=Guid.NewGuid().ToString("D");
+                SaveValidation.Require(r.Execute("UPDATE sync_outbox SET state='in_flight',attempts=attempts+1,lease_id=$lease,lease_until_ms=$until,last_error_code=NULL WHERE operation_id=$id AND state IN('pending','retryable_failure');",
+                    ("$lease",lease),("$until",until),("$id",row.OperationId))==1,"LEASE_CONFLICT");
+                reserved.Add(Find(r,binding.LocalPlayerId,row.OperationId)!);
+            }
+            return (IReadOnlyList<OutboxOperation>)reserved.AsReadOnly();
+        });
+    }
+    private static OutboxOperation CurrentAttempt(SQLiteRepository r,string owner,string id,string lease,long attempt,long now)
+    {
+        SaveValidation.Id(owner);SaveValidation.Id(id);SaveValidation.Id(lease);
+        var row=Find(r,owner,id);
+        SaveValidation.Require(row is not null && row.State==OutboxDeliveryState.InFlight && row.LeaseId==lease && row.Attempts==attempt && row.LeaseUntilUnixMs>now,"LEASE_CONFLICT");
+        return row!;
+    }
+    private long Next(long now,long attempts,TimeSpan? retryAfter)
+    {
+        SaveValidation.Require(retryAfter is null || retryAfter>=TimeSpan.Zero && retryAfter<=TimeSpan.FromDays(1),"INVALID_RETRY");
+        long delay=OutboxRetryPolicy.DelayMilliseconds(attempts,_jitter());
+        return checked(now+Math.Max(delay,(long)(retryAfter?.TotalMilliseconds??0)));
+    }
+    // B54: owner quota exhausted at the server. A pause moves ONLY next_attempt_ms of operations that are not yet confirmed, and never touches an identifier, payload, hash,
+    // dependency, state or attempt counter, so the queue keeps its exact content and order. The pause lives in SQLite (next_attempt_ms), so it survives a restart.
+    public static readonly TimeSpan MaxQuotaPause=TimeSpan.FromDays(1);
+    public int DeferForQuota(SyncBinding binding,TimeSpan pause)
+    {
+        SaveValidation.Require(pause>=TimeSpan.FromSeconds(1) && pause<=MaxQuotaPause,"INVALID_RETRY");
+        return Work(true,r=>{
+            KnownBinding(r,binding);long until=checked(Now()+(long)pause.TotalMilliseconds);
+            return r.Execute("UPDATE sync_outbox SET next_attempt_ms=$until WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$v AND state IN('pending','retryable_failure') AND next_attempt_ms<$until;",
+                ("$until",until),("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$v",binding.BindingGeneration));
+        });
+    }
+    // Makes a quota pause end now (the owner's quota was raised or freed). Only pending operations and those that failed BECAUSE of the quota are touched.
+    public int ReleaseQuotaPause(SyncBinding binding)=>Work(true,r=>{
+        KnownBinding(r,binding);long now=Now();
+        return r.Execute("UPDATE sync_outbox SET next_attempt_ms=$now WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$v AND next_attempt_ms>$now AND (state='pending' OR (state='retryable_failure' AND last_error_code='quota_exceeded'));",
+            ("$now",now),("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$v",binding.BindingGeneration));
+    });
+    // Unix ms until which a quota pause lasts, or null when there is none. Read-only.
+    public long? QuotaPauseUntil(SyncBinding binding)=>Work(false,r=>{
+        KnownBinding(r,binding);long now=Now();
+        long until=r.Number("SELECT COALESCE(max(next_attempt_ms),0) FROM sync_outbox WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$v AND state='retryable_failure' AND last_error_code='quota_exceeded' AND next_attempt_ms>$now;",
+            ("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$v",binding.BindingGeneration),("$now",now));
+        return until>0?until:(long?)null;
+    });
+    private static void ErrorCode(string code,bool permanent)=>SaveValidation.Require(permanent
+        ? code is "payload_conflict" or "invalid_fact" or "unsupported_contract" or "unsupported_rules_version"
+        : code is "network_unavailable" or "timeout" or "remote_unavailable" or "rate_limited" or "quota_exceeded" or "dependency_missing" or "lease_expired","INVALID_ERROR_CODE");
+    public void Retry(string owner,string id,string lease,long attempt,string errorCode,TimeSpan? retryAfter=null)=>Work(true,r=>{
+        ErrorCode(errorCode,false);long now=Now();var row=CurrentAttempt(r,owner,id,lease,attempt,now);
+        r.Execute("UPDATE sync_outbox SET state='retryable_failure',next_attempt_ms=$next,lease_id=NULL,lease_until_ms=NULL,last_error_code=$code WHERE operation_id=$id;",
+            ("$next",Next(now,row.Attempts,retryAfter)),("$code",errorCode),("$id",id));return true;
+    });
+    public void Reject(string owner,string id,string lease,long attempt,string errorCode)=>Work(true,r=>{
+        ErrorCode(errorCode,true);CurrentAttempt(r,owner,id,lease,attempt,Now());
+        r.Execute("UPDATE sync_outbox SET state='permanent_failure',lease_id=NULL,lease_until_ms=NULL,last_error_code=$code WHERE operation_id=$id;",("$code",errorCode),("$id",id));return true;
+    });
+    public int RecoverExpired(SyncBinding binding,int limit=100)=>Work(true,r=>{
+        KnownBinding(r,binding);SaveValidation.Require(limit is >=1 and <=100);long now=Now();
+        var rows=Rows(r,"SELECT * FROM sync_outbox WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$v AND state='in_flight' AND lease_until_ms<=$now ORDER BY lease_until_ms,operation_id LIMIT $n;",
+            ("$p",binding.LocalPlayerId),("$i",binding.InstallationId),("$v",binding.BindingGeneration),("$now",now),("$n",limit));
+        foreach(var row in rows)r.Execute("UPDATE sync_outbox SET state='retryable_failure',lease_id=NULL,lease_until_ms=NULL,next_attempt_ms=$next,last_error_code='lease_expired' WHERE operation_id=$id;",
+            ("$id",row.OperationId),("$next",Next(now,row.Attempts,null)));
+        return rows.Count;
+    });
+    public void Confirm(SimulatedSyncReceipt receipt)=>Work(true,r=>{
+        SaveValidation.Id(receipt.ReceiptId);SaveValidation.Id(receipt.OperationId);SaveValidation.Id(receipt.LeaseId);
+        Binding(new(receipt.LocalPlayerId,receipt.InstallationId,receipt.BindingGeneration));
+        SaveValidation.Require(receipt.Status is "committed" or "duplicate" or "superseded","INVALID_RECEIPT");
+        string at=SyncOutboxProjection.Utc(receipt.CommittedAtUtc);
+        SaveValidation.Require(at==receipt.CommittedAtUtc,"INVALID_RECEIPT");
+        var row=Find(r,receipt.LocalPlayerId,receipt.OperationId);
+        SaveValidation.Require(row is not null && row.InstallationId==receipt.InstallationId && row.BindingGeneration==receipt.BindingGeneration &&
+            row.PayloadHash==receipt.PayloadHash,"INVALID_RECEIPT");
+        string json=SyncOutboxProjection.Json(new {operationId=receipt.OperationId,localPlayerId=receipt.LocalPlayerId,installationId=receipt.InstallationId,
+            bindingGeneration=receipt.BindingGeneration,payloadHash=receipt.PayloadHash,leaseId=receipt.LeaseId,attempt=receipt.Attempt,receiptId=receipt.ReceiptId,committedAtUtc=at});
+        if(row!.State==OutboxDeliveryState.Confirmed){SaveValidation.Require(row.ReceiptJson==json,"RECEIPT_CONFLICT");return true;}
+        CurrentAttempt(r,receipt.LocalPlayerId,receipt.OperationId,receipt.LeaseId,receipt.Attempt,Now());
+        r.Execute("UPDATE sync_outbox SET state='confirmed',receipt_json=$receipt,lease_id=NULL,lease_until_ms=NULL,last_error_code=NULL WHERE operation_id=$id;",
+            ("$receipt",json),("$id",receipt.OperationId));return true;
+    });
+}
+

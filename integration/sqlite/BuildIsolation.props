@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory).work/obj/</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(MSBuildThisFileDirectory).work/obj/</MSBuildProjectExtensionsPath>
+    <BaseOutputPath>$(MSBuildThisFileDirectory).work/bin/</BaseOutputPath>
+    <UseSharedCompilation>false</UseSharedCompilation>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+</Project>

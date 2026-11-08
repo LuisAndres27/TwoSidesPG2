@@ -1,0 +1,99 @@
+[gd_scene format=3 uid="uid://cfgim0qsioyk2"]
+
+[ext_resource type="Script" uid="uid://b5ht8a0wfvsft" path="res://scripts/enemies/Oso.cs" id="1_aqimu"]
+[ext_resource type="Texture2D" uid="uid://ddqhpdx1haplr" path="res://assets/sprites/characters/enemies/OSOS ENEMIGO.png" id="2_1wagm"]
+[ext_resource type="Texture2D" uid="uid://bn2in4neax2q8" path="res://assets/sprites/characters/oso.png" id="2_l5wjf"]
+[ext_resource type="Script" uid="uid://cq8jxkyuk8uqv" path="res://scripts/globals/Hitbox.cs" id="3_vjn4l"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_pmb5l"]
+atlas = ExtResource("2_l5wjf")
+region = Rect2(128, 0, 64, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_bfxv3"]
+atlas = ExtResource("2_l5wjf")
+region = Rect2(192, 0, 64, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_0pkej"]
+atlas = ExtResource("2_1wagm")
+region = Rect2(0, 0, 64, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_7bd3d"]
+atlas = ExtResource("2_1wagm")
+region = Rect2(64, 0, 64, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_pjbrg"]
+atlas = ExtResource("2_1wagm")
+region = Rect2(128, 0, 64, 32)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_aaqrc"]
+atlas = ExtResource("2_1wagm")
+region = Rect2(192, 0, 64, 32)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_8f2m8"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_pmb5l")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_bfxv3")
+}],
+"loop": true,
+"name": &"Npc",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_0pkej")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_7bd3d")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_pjbrg")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_aaqrc")
+}],
+"loop": true,
+"name": &"NpcBad",
+"speed": 5.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_corj0"]
+size = Vector2(64, 30)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_u85q4"]
+size = Vector2(64, 27)
+
+[node name="Oso" type="CharacterBody2D" unique_id=807172787]
+collision_layer = 3
+script = ExtResource("1_aqimu")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=1099106144]
+position = Vector2(0, -16)
+sprite_frames = SubResource("SpriteFrames_8f2m8")
+animation = &"Npc"
+frame_progress = 0.89068913
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=817408041]
+position = Vector2(0, -15)
+shape = SubResource("RectangleShape2D_corj0")
+
+[node name="RayCast2D" type="RayCast2D" parent="." unique_id=1948446755]
+position = Vector2(24, -24)
+target_position = Vector2(10, 0)
+
+[node name="RayCast2D2" type="RayCast2D" parent="." unique_id=624296223]
+position = Vector2(16, -5)
+target_position = Vector2(0, 20)
+
+[node name="Hitbox" type="Area2D" parent="." unique_id=1804927146]
+collision_layer = 2
+collision_mask = 2
+script = ExtResource("3_vjn4l")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Hitbox" unique_id=1283370044]
+position = Vector2(0, -13.5)
+shape = SubResource("RectangleShape2D_u85q4")
+debug_color = Color(0.8933448, 0.3075646, 0.25506285, 0.41960785)

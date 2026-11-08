@@ -1,0 +1,94 @@
+[gd_scene format=3 uid="uid://pgd543w41qle"]
+
+[ext_resource type="Script" uid="uid://ccqe0omeaa3t0" path="res://scripts/FuenteRecurso.cs" id="1_6fl44"]
+[ext_resource type="PackedScene" uid="uid://3a8fou6tsxmt" path="res://scenes/props/item_baya.tscn" id="2_l2f3l"]
+[ext_resource type="Texture2D" uid="uid://3oh3tg36kjdp" path="res://assets/sprites/fondos/bosque/ARBUSTO BOSQUE BUEN ESTADO.png" id="2_s1n7g"]
+[ext_resource type="Texture2D" uid="uid://b82hgugqn0jnc" path="res://assets/sprites/fondos/bosque/ARBUSTO MAL ESTADO.png" id="3_l2f3l"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_jppkw"]
+atlas = ExtResource("2_s1n7g")
+region = Rect2(0, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_w6g2r"]
+atlas = ExtResource("2_s1n7g")
+region = Rect2(32, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_0matu"]
+atlas = ExtResource("2_s1n7g")
+region = Rect2(64, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_u2exi"]
+atlas = ExtResource("2_s1n7g")
+region = Rect2(96, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_l8va2"]
+atlas = ExtResource("3_l2f3l")
+region = Rect2(0, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_tf1b4"]
+atlas = ExtResource("3_l2f3l")
+region = Rect2(32, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_x14w8"]
+atlas = ExtResource("3_l2f3l")
+region = Rect2(64, 0, 32, 16)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_g5x2f"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_jppkw")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_w6g2r")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_0matu")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_u2exi")
+}],
+"loop": true,
+"name": &"bayas",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_l8va2")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_tf1b4")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_x14w8")
+}],
+"loop": true,
+"name": &"bayas_bad",
+"speed": 5.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_7rqrc"]
+size = Vector2(32, 33)
+
+[node name="Arbusto" type="Area2D" unique_id=113170801]
+script = ExtResource("1_6fl44")
+EscenaRecurso = ExtResource("2_l2f3l")
+
+[node name="PuntoDrop" type="Marker2D" parent="." unique_id=342570844]
+position = Vector2(0, -30)
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=1174918]
+position = Vector2(0, -8)
+sprite_frames = SubResource("SpriteFrames_g5x2f")
+animation = &"bayas"
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=1297744957]
+position = Vector2(0, -17.5)
+shape = SubResource("RectangleShape2D_7rqrc")
+
+[node name="Indicador" type="Label" parent="." unique_id=1347437028]
+offset_left = -10.0
+offset_top = -52.0
+offset_right = 10.0
+offset_bottom = -29.0
+text = "[E]"

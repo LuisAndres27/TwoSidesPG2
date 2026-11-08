@@ -1,0 +1,50 @@
+using System.Collections.Generic;
+using System.Linq;
+
+namespace TwoSides.LocalPersistence;
+
+// Read capability over the existing repository and its caller-owned snapshot transaction.
+// No connection opening, schema creation, writes or independent transactions.
+internal sealed class StatisticsRepository
+{
+    private readonly SQLiteRepository _repository;
+    private const int PageSize = 128;
+    internal StatisticsRepository(SQLiteRepository repository) => _repository=repository;
+    internal LocalProfile? Profile() => _repository.Profile();
+    internal SavedGame? Game(string owner,string game) => _repository.Game(owner,game);
+    internal IReadOnlyList<SavedGame> Games(string owner)
+    {
+        var result=new List<SavedGame>();
+        for(int offset=0;;offset=checked(offset+PageSize))
+        {
+            var page=_repository.Games(owner,offset,PageSize);result.AddRange(page);
+            if(page.Count<PageSize) return result.AsReadOnly();
+        }
+    }
+    internal IReadOnlyList<EnvironmentalDecision> Decisions(string game)
+    {
+        var result=new List<EnvironmentalDecision>();long after=0;
+        while(true)
+        {
+            var page=_repository.Decisions(game,after:after,limit:PageSize);result.AddRange(page);
+            if(page.Count<PageSize) return result.AsReadOnly();
+            long next=page.Last().DecisionOrder;
+            SaveValidation.Require(next>after,"INVALID_STATISTICS_DATA");after=next;
+        }
+    }
+    internal IReadOnlyList<BiomeProgress> Biomes(string game)=>_repository.Biomes(game);
+    internal IReadOnlyList<EnvironmentalState> Environments(string game)=>_repository.Environments(game);
+    internal SaveReceipt? Receipt(string operation)=>_repository.Receipt(operation);
+    private ActivitySource? _activity;
+    internal ActivitySource Activity(string owner)
+    {
+        if(_activity is not null)return _activity;
+        long present=_repository.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'gameplay_%';");
+        if(present==0)return _activity=new(false,System.Array.Empty<GameplaySession>(),System.Array.Empty<GameplayEvent>(),System.Array.Empty<GameplayInterval>());
+        GameplayEventSchema.Verify(_repository);
+        var events=new GameplayEventRepository(_repository);
+        return _activity=new(true,events.Sessions(owner),events.Events(owner),events.Intervals(owner));
+    }
+}
+internal sealed record ActivitySource(bool Available,IReadOnlyList<GameplaySession> Sessions,
+    IReadOnlyList<GameplayEvent> Events,IReadOnlyList<GameplayInterval> Intervals);

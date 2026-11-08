@@ -1,0 +1,588 @@
+# staged-selftest.ps1.template — OFFLINE self-test of sync-test-staged.ps1 and build-second-op.mjs (B40). NOT run by the repository. Windows PowerShell 5.1.
+# It uses ONLY disposable folders under -WorkDir, a node:http TEST DOUBLE on 127.0.0.1 (fake-sync-server.mjs, NOT Express, NOT Caddy, NOT Godot) and fake launchers that read the double's snapshot.
+# No Atlas endpoint, no real launcher, no real authorization, no certificate and no real run folder are used. Run:
+#   .\staged-selftest.ps1 -ToolsSource <backend\docs\main-sync-test> -WorkDir <empty absolute folder outside the project> -ExpectedTreeDigest <v4 digest> -ExpectedKeyFingerprint <fp>
+param([Parameter(Mandatory = $true)][string]$ToolsSource, [Parameter(Mandatory = $true)][string]$WorkDir, [Parameter(Mandatory = $true)][string]$ExpectedTreeDigest, [Parameter(Mandatory = $true)][string]$ExpectedKeyFingerprint,
+      [string]$Backend = 'C:\Users\luis2\OneDrive\Desktop\PRUEBA\TWO SIDES PRUEBA\Two-Sides PRUEBA\backend')
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+$Node = 'C:\Program Files\nodejs\node.exe'
+if (Test-Path $WorkDir) { if (@(Get-ChildItem $WorkDir -Force).Count) { throw 'WorkDir must be empty' } } else { New-Item -ItemType Directory $WorkDir | Out-Null }
+$Tools = Join-Path $WorkDir 'tools'; $Runs = Join-Path $WorkDir 'runs'; $Auth = Join-Path $WorkDir 'auth'; $Out = Join-Path $WorkDir 'out'
+foreach ($d in @($Tools, $Runs, $Auth, $Out)) { New-Item -ItemType Directory $d | Out-Null }
+Copy-Item (Join-Path $ToolsSource 'sync-test-staged.ps1.template') (Join-Path $Tools 'staged.ps1')
+Copy-Item (Join-Path $ToolsSource 'build-synthetic-run.mjs.template') (Join-Path $Tools 'build.mjs')
+Copy-Item (Join-Path $ToolsSource 'build-second-op.mjs.template') (Join-Path $Tools 'second.mjs')
+Copy-Item (Join-Path $ToolsSource 'fake-sync-server.mjs.template') (Join-Path $Tools 'fake.mjs')
+Copy-Item (Join-Path $ToolsSource 'run-main-inspection-captured.ps1.template') (Join-Path $Tools 'wrapper-inspection.ps1')
+Copy-Item (Join-Path $ToolsSource 'run-verify-synthetic.ps1.template') (Join-Path $Tools 'wrapper-verify.ps1')
+$Staged = Join-Path $Tools 'staged.ps1'
+@'
+param([switch]$Enable,[string]$Authorization)
+if($env:FAKE_INSPECT_FAIL -eq '1'){ exit 1 }
+$id=[IO.Path]::GetFileNameWithoutExtension($Authorization) -replace '^main-inspection-authorization-',''; $dir=Split-Path -Parent $Authorization
+$db=Get-Content -Raw $env:FAKE_DB | ConvertFrom-Json
+$req=[ordered]@{}; foreach($k in 'operations','facts','fences','identities','ownerGuards','identitySessions','revocations'){ $req[$k]=@{name='main_v2_'+$k;present=$true;estimatedCount=[int]$db.counts.$k} }
+$others=@(); foreach($p in $db.historical.PSObject.Properties){ $others+=@{name=$p.Name;estimatedCount=[int]$p.Value} }
+$verdict='ready'; if($env:FAKE_INSPECT_VERDICT){$verdict=$env:FAKE_INSPECT_VERDICT}
+$writes=0; if($env:FAKE_INSPECT_WRITES -eq '1'){$writes=1}
+$closed=$true; if($env:FAKE_INSPECT_CLOSED -eq 'false'){$closed=$false}
+$repId=$id; if($env:FAKE_INSPECT_BADID -eq '1'){$repId=('0'*32)}
+$recVerdict=$verdict; if($env:FAKE_INSPECT_ALTER -eq '1'){$recVerdict='conflict'}
+$finished=(Get-Date).ToUniversalTime(); if($env:FAKE_INSPECT_OLD -eq '1'){$finished=$finished.AddHours(-3)}
+if($env:FAKE_INSPECT_NOREC -ne '1'){ @{kind='main-schema-inspection';executionId=$id;finishedAt=$finished.ToString('o');result=@{completed=$true;verdict=$recVerdict};note='No secrets.'} | ConvertTo-Json -Compress -Depth 5 | Set-Content (Join-Path $dir ($id+'.inspection.json')) -Encoding UTF8 }
+$json = @{mainSchemaInspection='finished';executionId=$repId;verdict=$verdict;writes=$writes;requiredCollections=$req;otherCollections=$others;closed=$closed} | ConvertTo-Json -Compress -Depth 6
+switch($env:FAKE_INSPECT_MODE){
+  'empty' { }
+  'badjson' { '{"mainSchemaInspection":"finished","verdict":' }
+  'inherit' { $i=New-Object Diagnostics.ProcessStartInfo; $i.FileName='C:\Program Files\nodejs\node.exe'; $i.Arguments='-e "console.log(process.argv[1])" "'+($json -replace '"','\"')+'"'; $i.UseShellExecute=$false; $q=[Diagnostics.Process]::Start($i); $q.WaitForExit() }
+  'noise' { [Console]::Error.WriteLine('npm warn something harmless'); 'WARNING: harmless notice before the report'; $json; 'trailing notice' }
+  'exit5' { $json; exit 5 }
+  default { $json }
+}
+'@ | Set-Content (Join-Path $Tools 'inspection-fake.ps1') -Encoding UTF8
+@'
+param([switch]$Enable,[string]$Authorization,[string]$RunDir,[string]$Account,[string]$Verifier)
+if($env:FAKE_VERIFY_FAIL -eq '1'){ exit 1 }
+$id=[IO.Path]::GetFileNameWithoutExtension($Authorization) -replace '^main-inspection-authorization-',''; $dir=Split-Path -Parent $Authorization
+$db=Get-Content -Raw $env:FAKE_DB | ConvertFrom-Json; $ids=Get-Content -Raw (Join-Path $RunDir 'run-ids.json') | ConvertFrom-Json
+$persisted = $null -ne $db.operations.PSObject.Properties[$ids.operationId]; $n = 0; if($persisted){$n=1}
+$bad = ($env:FAKE_VERIFY_BAD -eq '1'); $verdict='inconsistent'; $failed=@('operation_not_persisted'); if($persisted -and -not $bad){$verdict='consistent';$failed=@()} elseif($persisted){$failed=@('forced')}
+$sessions=[int]$db.counts.identitySessions-[int]$db.baseline.identitySessions
+$repId=$id; if($env:FAKE_VERIFY_BADID -eq '1'){$repId=('0'*32)}
+$finished=(Get-Date).ToUniversalTime(); if($env:FAKE_VERIFY_OLD -eq '1'){$finished=$finished.AddHours(-3)}
+if($env:FAKE_VERIFY_NOREC -ne '1'){ @{kind='synthetic-run-verification';executionId=$id;finishedAt=$finished.ToString('o');verdict=$verdict;note='No secrets.'} | ConvertTo-Json -Compress | Set-Content (Join-Path $dir ($id+'.verification.json')) -Encoding UTF8 }
+$json = @{syntheticRunVerification='finished';executionId=$repId;writes=0;verdict=$verdict;failed=$failed;counts=@{identities=1;ownerGuards=1;identitySessions=$sessions;operations=$n;facts=$n;fences=$n;revocations=0};closed=$true} | ConvertTo-Json -Compress -Depth 6
+if($env:FAKE_VERIFY_MODE -eq 'empty'){ } elseif($env:FAKE_VERIFY_MODE -eq 'noise'){ [Console]::Error.WriteLine('noise on stderr'); 'plain notice'; $json } else { $json }
+'@ | Set-Content (Join-Path $Tools 'verify-fake.ps1') -Encoding UTF8
+$FakeInsp = Join-Path $Tools 'inspection-fake.ps1'; $FakeVer = Join-Path $Tools 'verify-fake.ps1'; $Dummy = Join-Path $Tools 'verify-dummy.mjs'; 'x' | Set-Content $Dummy
+$Tiny = Join-Path $WorkDir 'tiny-backup'; New-Item -ItemType Directory $Tiny | Out-Null; 'backup test file' | Set-Content (Join-Path $Tiny 'a.txt')
+$h = (Get-FileHash (Join-Path $Tiny 'a.txt')).Hash; "$h  a.txt" | Set-Content (Join-Path $Tiny 'SHA256SUMS.txt') -Encoding ascii
+
+# ------------------------------------------------------------------------------------------------ harness
+$pass = 0; $fail = 0; $failures = New-Object System.Collections.ArrayList
+function Check([bool]$cond, [string]$name) { if ($cond) { $script:pass++; Write-Host ("  ok   " + $name) } else { $script:fail++; [void]$failures.Add($name); Write-Host ("  FAIL " + $name) -ForegroundColor Red } }
+$AllOutput = New-Object System.Text.StringBuilder
+$server = $null; $Port = 0; $DbFile = $null
+function Start-Fake {
+    $script:DbFile = Join-Path $Out ('db-' + [guid]::NewGuid().ToString('N') + '.json'); $outFile = $DbFile + '.out'
+    $info = New-Object Diagnostics.ProcessStartInfo; $info.FileName = $Node; $info.Arguments = '"' + (Join-Path $Tools 'fake.mjs') + '" "' + $DbFile + '"'
+    $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.CreateNoWindow = $true
+    $script:server = [Diagnostics.Process]::Start($info)
+    $line = $server.StandardOutput.ReadLine(); $script:Port = [int]((ConvertFrom-Json $line).port)
+}
+function Stop-Fake { if ($script:server -and -not $script:server.HasExited) { $script:server.Kill(); $script:server.WaitForExit() }; $script:server = $null }
+function Ctl($o) { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/__ctl" -Method Post -Body (ConvertTo-Json $o -Compress -Depth 6) -ContentType 'application/json' | Out-Null }
+function FakeDb { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/__db" }
+function FakeLog { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/__log" }
+function Node-Code([string[]]$arguments) {
+    $info = New-Object Diagnostics.ProcessStartInfo; $info.FileName = $Node; $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.CreateNoWindow = $true
+    $info.Arguments = (($arguments | ForEach-Object { '"' + $_ + '"' }) -join ' ')
+    $p = [Diagnostics.Process]::Start($info); $o = $p.StandardOutput.ReadToEnd(); $null = $p.StandardError.ReadToEnd(); $p.WaitForExit(); return @{ Code = $p.ExitCode; Out = $o }
+}
+function New-Run {
+    $dir = Join-Path $Runs ('run-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $r = & $Node (Join-Path $Tools 'build.mjs') $Backend $dir
+    if ($LASTEXITCODE -ne 0) { throw 'build.mjs failed' }
+    return $dir
+}
+function Phrase([string]$stage, [string]$dir) { $id = (Get-Content -Raw (Join-Path $dir 'run-ids.json') | ConvertFrom-Json).runId; return ('AUTORIZO-ETAPA-' + $stage + '-' + $id.Substring(0, 8)) }
+function Staged([string]$stage, [string]$dir, [string[]]$extra = @(), [bool]$phrase = $true, [hashtable]$env = @{}, [bool]$common = $true) {
+    $a = New-Object System.Collections.ArrayList
+    [void]$a.AddRange(@('-NoProfile', '-File', $Staged, '-Stage', $stage))
+    if ($dir) { [void]$a.AddRange(@('-RunDir', $dir)) }
+    if ($phrase -and $dir) { [void]$a.AddRange(@('-ConfirmPhrase', (Phrase $stage $dir))) }
+    if ($common) {
+        $pairs = [ordered]@{ '-TestMode' = $null; '-BaseUrl' = "http://127.0.0.1:$Port"; '-InspectionLauncher' = $FakeInsp; '-VerifyLauncher' = $FakeVer; '-VerifierScript' = $Dummy; '-AuthorizationDir' = $Auth
+            '-ProcessNames' = 'zz-no-such-process'; '-CheckPorts' = '59999'; '-RequestTimeoutSec' = '2'; '-ExpectedTreeDigest' = $ExpectedTreeDigest; '-ExpectedKeyFingerprint' = $ExpectedKeyFingerprint; '-BackupDirs' = $Tiny; '-BackendDir' = $Backend }
+        foreach ($tok in $extra) { if ($tok.StartsWith('-') -and $pairs.Contains($tok)) { $pairs.Remove($tok) } }       # an explicit extra overrides the common value
+        foreach ($k in $pairs.Keys) { [void]$a.Add($k); if ($null -ne $pairs[$k]) { [void]$a.Add([string]$pairs[$k]) } }
+    }
+    [void]$a.AddRange($extra)
+    $info = New-Object Diagnostics.ProcessStartInfo; $info.FileName = 'powershell.exe'; $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.CreateNoWindow = $true
+    $info.Arguments = (($a | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' ')
+    $info.EnvironmentVariables['FAKE_DB'] = $DbFile; foreach ($k in $env.Keys) { $info.EnvironmentVariables[$k] = [string]$env[$k] }
+    $p = [Diagnostics.Process]::Start($info); $stdout = $p.StandardOutput.ReadToEnd(); $stderr = $p.StandardError.ReadToEnd(); $p.WaitForExit()
+    [void]$script:AllOutput.AppendLine($stdout); [void]$script:AllOutput.AppendLine($stderr)
+    $json = $null; foreach ($line in ($stdout -split "`r?`n")) { if ($line.StartsWith('{"stagedSync"')) { try { $json = ConvertFrom-Json $line } catch { } } }
+    return [pscustomobject]@{ Code = $p.ExitCode; Out = $stdout; Err = $stderr; Json = $json }
+}
+function State($dir) { return (Get-Content -Raw (Join-Path $dir 'stage-state.json') | ConvertFrom-Json) }
+function Fast-To([string]$last, [string]$dir) {            # runs A..last, each with its own phrase, asserting exit 0
+    foreach ($s in @('A', 'B', 'C', 'D', 'E')) { $r = Staged $s $dir; if ($r.Code -ne 0) { throw ("setup stage $s failed: " + $r.Code + ' ' + $r.Out) }; if ($s -eq $last) { return } }
+}
+function Unprotect-Blob($dir) {
+    $id = (Get-Content -Raw (Join-Path $dir 'run-ids.json') | ConvertFrom-Json).runId
+    $plain = [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes((Join-Path $dir 'secrets.dpapi')), [Text.Encoding]::UTF8.GetBytes($id), 'CurrentUser')
+    return (ConvertFrom-Json ([Text.Encoding]::UTF8.GetString($plain)))
+}
+$ManifestReal = Join-Path $env:LOCALAPPDATA 'TwoSidesMainIntegrity\backend-integrity-manifest.json'
+
+# ================================================================================================ 0. integrity before
+Write-Host '[0] integrity before'
+$treeBefore = & $Node -e "const fs=require('fs'),c=require('crypto'),p=require('path');const out=[];const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){const f=p.join(d,e.name);e.isDirectory()?walk(f):out.push(f)}};process.chdir(process.argv[1]);walk('src');walk('scripts');['package.json','package-lock.json','vitest.config.js'].forEach(f=>out.push(f));const h=c.createHash('sha256');for(const f of out.sort())h.update(f+':'+c.createHash('sha256').update(fs.readFileSync(f)).digest('hex')+'\n');console.log(h.digest('hex'))" $Backend
+$v0 = & $Node (Join-Path $Backend 'scripts\backend-integrity.js') verify $ManifestReal
+Check ($v0 -match '"ok":true') 'manifest v4 verifies before the tests'
+Check (@(Get-Process node, caddy -ErrorAction SilentlyContinue).Count -eq 0) 'no node/caddy process before the tests'
+
+try {
+# ================================================================================================ 1. parameters, authorization, no auto-advance
+Write-Host '[1] parameter validation / stage F'
+Start-Fake
+$run = New-Run
+Check ((Staged 'Z' $run @() $false).Code -eq 2) 'invalid stage letter is rejected (2)'
+Check ((Staged 'A' $null @() $false @{} $true).Code -eq 2) 'missing RunDir is rejected (2)'
+Check ((Staged 'A' $run @('-TestMode', '-BaseUrl', 'https://localhost:8443') $false @{} $false).Code -eq 2) 'TestMode with the real URL is rejected (2)'
+Check ((Staged 'A' $run @('-BaseUrl', 'http://127.0.0.1:9') $false @{} $false).Code -eq 2) 'real mode with another URL is rejected (2)'
+Check ((Staged 'A' $run @('-InspectionLauncher', $FakeInsp) $false @{} $false).Code -eq 2) 'test-only parameters without -TestMode are rejected (2)'
+Check ((Staged 'A' $run @('-TestMode', '-BaseUrl', "http://127.0.0.1:$Port", '-InspectionLauncher', 'C:\x\run-main-inspection.ps1', '-VerifyLauncher', $FakeVer, '-VerifierScript', $Dummy) $false @{} $false).Code -eq 2) 'TestMode refuses the real inspection launcher (2)'
+Check ((Staged 'A' $run @('-ProcessNames', 'x') $false @{} $false).Code -eq 2) 'real mode pins the service checks (2)'
+$rF = Staged 'F' $run @() $false
+Check ($rF.Code -eq 9) 'stage F is refused (9) and does nothing'
+$rP = Staged 'C' $run @('-TestForbiddenProbe', 'DELETE:/api/v2/technical/me') $false
+Check ($rP.Code -eq 2 -and $rP.Out -match 'allow-list') 'a DELETE / out-of-list HTTP call is refused by the allow-list (2)'
+Check (@((FakeLog) | Where-Object { $_.method -eq 'DELETE' }).Count -eq 0) 'no DELETE ever reached the server'
+Write-Host '[2] authorization / order'
+Check ((Staged 'A' $run @() $false).Code -eq 10) 'stage A without the phrase: not authorized (10)'
+$wrong = Staged 'A' $run @('-ConfirmPhrase', 'AUTORIZO-ETAPA-A-00000000') $false
+Check ($wrong.Code -eq 10) 'a phrase of another run is rejected (10)'
+Check (-not (Test-Path (Join-Path $run 'stage-state.json')) -or ((State $run).stages.PSObject.Properties.Count -eq 0)) 'nothing was recorded by refused calls'
+Check ((Staged 'C' $run).Code -eq 11) 'C before A/B: prerequisite missing (11)'
+Check ((Staged 'D' $run).Code -eq 11) 'D before C: prerequisite missing (11)'
+Check ((Staged 'E' $run).Code -eq 11) 'E before D: prerequisite missing (11)'
+Check ((Staged 'B' $run).Code -eq 11) 'B before A: prerequisite missing (11)'
+Check (@((FakeLog) | Where-Object { $_.path -like '/api/v2/sync/*' }).Count -eq 0) 'no sync request was made by refused stages'
+Stop-Fake
+
+# ================================================================================================ 3. happy path A..G with REAL manifest + anchors
+Write-Host '[3] full path A-B-C-D-E-G (real manifest/preflight, double server)'
+Start-Fake; $run = New-Run
+$rA = Staged 'A' $run @('-ManifestPath', $ManifestReal) $true @{} $true
+Check ($rA.Code -eq 0 -and $rA.Json.status -eq 'ok') 'A: environment/integrity ok (real manifest, anchor, ACL, scan)'
+Check ((State $run).stages.PSObject.Properties.Name -join ',' -eq 'A') 'A did not advance to B by itself'
+Check ((Staged 'A' $run @('-ManifestPath', $ManifestReal)).Code -eq 11) 'a completed stage is never run twice (11)'
+Check ((Staged 'C' $run).Code -eq 11) 'C refused while B has not run (11)'
+$rB = Staged 'B' $run
+Check ($rB.Code -eq 0 -and $rB.Json.status -eq 'ok') 'B: baseline recorded and equal to the expected one'
+Check ((State $run).stages.PSObject.Properties.Name -join ',' -eq 'A,B') 'B did not advance to C by itself'
+$rC = Staged 'C' $run
+Check ($rC.Code -eq 0 -and $rC.Json.status -eq 'ok') 'C: one registration, one session, one committed operation'
+$ids = Get-Content -Raw (Join-Path $run 'run-ids.json') | ConvertFrom-Json; $batchHash = (Get-FileHash (Join-Path $run 'batch.json')).Hash
+$blob = Unprotect-Blob $run; $cred = $blob.credential; $tok = $blob.token
+$rD = Staged 'D' $run
+Check ($rD.Code -eq 0 -and $rD.Json.resultStatus -eq 'duplicate' -and $rD.Json.sameReceiptId -eq $true) 'D: identical re-send is a duplicate with the SAME receiptId'
+$rE = Staged 'E' $run @('-IncludeNotFoundProbe')
+Check ($rE.Code -eq 0 -and $rE.Json.deltasOk -eq $true) 'E: receipts/query found, final deltas exactly as expected'
+$d = FakeDb
+Check (@($d.operations.PSObject.Properties).Count -eq 1 -and $d.facts -eq 1) 'server: exactly 1 operation and 1 fact'
+Check (@($d.registrations.PSObject.Properties).Count -eq 1) 'server: exactly 1 registration'
+$batchReqs = @((FakeLog) | Where-Object { $_.path -eq '/api/v2/sync/batches' })
+Check ($batchReqs.Count -eq 2 -and @($batchReqs.ops | Select-Object -Unique).Count -eq 1 -and $batchReqs[0].ops[0] -eq $ids.operationId) 'the SAME operationId was sent in both batches (C and D)'
+Check ((Get-FileHash (Join-Path $run 'batch.json')).Hash -eq $batchHash) 'batch.json bytes unchanged'
+Check ((State $run).logins -eq 1) 'a single session was needed (JWT reused from the protected blob)'
+$secretBytes = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $run 'secrets.dpapi')))
+Check (-not $secretBytes.Contains($cred) -and -not $secretBytes.Contains($tok)) 'secrets.dpapi does not contain the credential or the token in clear'
+$hay = New-Object System.Text.StringBuilder
+foreach ($f in Get-ChildItem $run -File | Where-Object { $_.Name -ne 'secrets.dpapi' }) { [void]$hay.AppendLine((Get-Content -Raw $f.FullName)) }
+foreach ($f in Get-ChildItem $Auth -File) { [void]$hay.AppendLine((Get-Content -Raw $f.FullName)) }
+[void]$hay.AppendLine($AllOutput.ToString()); [void]$hay.AppendLine((ConvertTo-Json (FakeLog) -Depth 6))
+$H = $hay.ToString()
+Check (-not $H.Contains($cred)) 'the credential is not in any file, log or output'
+Check (-not $H.Contains($tok) -and -not ($H -match 'eyJ[A-Za-z0-9_-]+\.')) 'the JWT is not in any file, log or output'
+$rG = Staged 'G' $run
+Check ($rG.Code -eq 0 -and $rG.Json.secretsWiped -eq $true -and -not (Test-Path (Join-Path $run 'secrets.dpapi'))) 'G: protected secrets wiped, nothing active'
+Check ((State $run).stages.G.status -eq 'ok') 'G recorded in the state'
+Stop-Fake
+
+# ================================================================================================ 4. manifest / configuration
+Write-Host '[4] invalid manifest / incomplete configuration / id collisions'
+Start-Fake; $run = New-Run
+$bad = Join-Path $WorkDir 'bad-manifest.json'; $txt = Get-Content -Raw $ManifestReal; $txt.Replace('"fileCount":3169', '"fileCount":3168').Replace('"treeDigest":"aea0', '"treeDigest":"bbb0') | Set-Content $bad -NoNewline
+$rBad = Staged 'A' $run @('-ManifestPath', $bad)
+Check ($rBad.Code -eq 21 -and $rBad.Json.failedChecks -contains 'manifestVerify') 'A rejects a corrupted manifest (21)'
+Check ((State $run).stages.A.status -eq 'failed') 'A recorded as failed; B stays blocked'
+Check ((Staged 'B' $run).Code -eq 11) 'B refused after a failed A (11)'
+$run2 = New-Run
+$noAnchor = Staged 'A' $run2 @('-ManifestPath', $ManifestReal, '-ExpectedTreeDigest', 'abc') $true @{} $true
+Check ($noAnchor.Code -eq 21 -and $noAnchor.Json.failedChecks -contains 'configuration') 'A rejects an incomplete/invalid anchor configuration (21)'
+$run3 = New-Run
+$wrongAnchor = Staged 'A' $run3 @('-ManifestPath', $ManifestReal, '-ExpectedTreeDigest', ('a' * 64))
+Check ($wrongAnchor.Code -eq 21 -and $wrongAnchor.Json.failedChecks -contains 'preflight') 'A rejects a wrong tree-digest anchor (preflight fails, 21)'
+$run4 = New-Run; $other = New-Run
+Copy-Item (Join-Path $other 'run-ids.json') (Join-Path $run4 'run-ids.json') -Force
+$collide = Staged 'A' $run4 @('-ManifestPath', $ManifestReal)
+Check ($collide.Code -eq 21 -and $collide.Json.failedChecks -contains 'runMaterial') 'A rejects ids reused from another run (21)'
+$run5 = New-Run; $ids5 = Get-Content -Raw (Join-Path $run5 'run-ids.json') | ConvertFrom-Json; $ids5.registrationId = '5e05a972-98ef-447a-9579-ba4d0e20a4b8'; $ids5 | ConvertTo-Json -Compress | Set-Content (Join-Path $run5 'run-ids.json') -NoNewline
+Check ((Staged 'A' $run5 @('-ManifestPath', $ManifestReal)).Code -eq 21) 'A rejects an id of the previous real test (21)'
+$run6 = New-Run; $b6 = Get-Content -Raw (Join-Path $run6 'batch.json'); $b6.Replace('"attempt":1', '"attempt":2') | Set-Content (Join-Path $run6 'batch.json') -NoNewline
+Check ((Staged 'A' $run6 @('-ManifestPath', $ManifestReal)).Code -eq 21) 'A rejects a tampered batch (attempt/hash mismatch, 21)'
+$run7 = New-Run; $busy = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $busy.Start(); $busyPort = $busy.LocalEndpoint.Port
+$rSrv = Staged 'A' $run7 @('-ManifestPath', $ManifestReal, '-CheckPorts', [string]$busyPort)
+$busy.Stop()
+Check ($rSrv.Code -eq 21 -and $rSrv.Json.failedChecks -contains 'noServers') 'A detects a listener on a checked port (21)'
+$rProc = Staged 'A' (New-Run) @('-ManifestPath', $ManifestReal, '-ProcessNames', 'powershell')
+Check ($rProc.Code -eq 21 -and $rProc.Json.failedChecks -contains 'noServers') 'A detects a running server-like process (21)'
+Stop-Fake
+
+# ================================================================================================ 5. interruption + resume
+Write-Host '[5] interruption and safe resume'
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+$crash = Staged 'C' $run @('-TestFaultAfterStep', 'registration')
+Check ($crash.Code -eq 99) 'process killed after the registration (simulated crash, 99)'
+Check ((State $run).stages.C.status -eq 'started' -and (Test-Path (Join-Path $run 'stage.lock'))) 'state = started, stale lock left behind'
+Check ((Staged 'C' $run).Code -eq 12) 'C without -Resume is refused (12)'
+$account1 = (State $run).account
+$res = Staged 'C' $run @('-Resume')
+Check ($res.Code -eq 0) 'C -Resume completes with the SAME identifiers'
+Check ((State $run).account -eq $account1 -and @((FakeDb).registrations.PSObject.Properties).Count -eq 1) 'no second registration/account was created'
+Check (@((FakeDb).operations.PSObject.Properties).Count -eq 1) 'exactly one operation after the resume'
+Stop-Fake
+
+# ================================================================================================ 6. HTTP 503 / lost response / unknown
+Write-Host '[6] simulated 503, lost responses and unknown outcomes (never a new operationId)'
+foreach ($case in @(@{ n = '503 without results'; b = '503'; persisted = $false }, @{ n = '503 with deferred results'; b = '503-results'; persisted = $false },
+                    @{ n = 'response lost AFTER commit'; b = 'dropAfterCommit'; persisted = $true }, @{ n = 'response lost BEFORE commit'; b = 'dropBeforeCommit'; persisted = $false })) {
+    Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+    Ctl @{ batch = @($case.b) }
+    $c = Staged 'C' $run
+    Check ($c.Code -eq 20 -and $c.Json.status -eq 'unknown') ($case.n + ': C reports UNKNOWN (20), not failure')
+    Check ((State $run).stages.C.status -eq 'unknown') ($case.n + ': state C = unknown')
+    Start-Sleep -Milliseconds 300
+    $d = Staged 'D' $run
+    Check ($d.Code -eq 0) ($case.n + ': D resolves it (verification, then identical re-send)')
+    if ($case.persisted) { Check ($d.Json.resultStatus -eq 'duplicate') ($case.n + ': the re-send is a duplicate of the persisted operation') } else { Check ($d.Json.resultStatus -eq 'committed') ($case.n + ': the re-send commits it once') }
+    $ops = @((FakeLog) | Where-Object { $_.path -eq '/api/v2/sync/batches' } | ForEach-Object { $_.ops } | Select-Object -Unique)
+    Check ($ops.Count -eq 1) ($case.n + ': only ONE operationId ever reached the server')
+    Check (@((FakeDb).operations.PSObject.Properties).Count -eq 1 -and (FakeDb).facts -eq 1) ($case.n + ': exactly one operation and one fact (no duplicates)')
+    $e = Staged 'E' $run
+    Check ($e.Code -eq 0 -and $e.Json.deltasOk) ($case.n + ': E confirms the final deltas')
+    Stop-Fake
+}
+
+# ================================================================================================ 7. inconsistent receipts
+Write-Host '[7] inconsistent receipts'
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run; $null = Staged 'C' $run
+Ctl @{ batch = @('otherReceiptId') }
+$dd = Staged 'D' $run
+Check ($dd.Code -eq 30 -and (State $run).stages.D.status -eq 'inconsistent') 'D rejects a duplicate whose receiptId differs from the first one (30)'
+Check ((Staged 'E' $run).Code -eq 11) 'E is blocked after an inconsistent D (11)'
+Stop-Fake
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+Ctl @{ batch = @('wrongBinding') }
+$cc = Staged 'C' $run
+Check ($cc.Code -eq 30 -and $cc.Json.badFields -contains 'installationId') 'C rejects a first receipt with a foreign installationId (30)'
+Check ((Staged 'D' $run).Code -eq 11) 'D is blocked after an inconsistent C (11)'
+Stop-Fake
+Start-Fake; $run = New-Run; Fast-To 'D' $run
+Ctl @{ query = @('otherReceiptId') }
+$ee = Staged 'E' $run
+Check ($ee.Code -eq 30) 'E rejects a queried receipt that differs from the first one (30)'
+Stop-Fake
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run; $null = Staged 'C' $run
+$dv = Staged 'D' $run @() $true @{ FAKE_VERIFY_BAD = '1' }
+Check ($dv.Code -eq 30) 'D stops when the read-only verification is not consistent (30)'
+Check (@((FakeLog) | Where-Object { $_.path -eq '/api/v2/sync/batches' }).Count -eq 1) 'no re-send was made after the failed verification'
+Stop-Fake
+
+# ================================================================================================ 8. baseline protection
+Write-Host '[8] baseline discrepancies and stale baseline'
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal)
+Ctl @{ historicalDelta = @{ name = 'users'; by = 1 } }
+$bd = Staged 'B' $run
+Check ($bd.Code -eq 31 -and $bd.Json.status -eq 'discrepancy') 'B detects a change in a historical collection (31)'
+Check ((Staged 'C' $run).Code -eq 11) 'C is blocked after a baseline discrepancy (11)'
+Check (@((FakeLog) | Where-Object { $_.path -like '/api/v2/*' }).Count -eq 0) 'nothing was written after the discrepancy'
+Stop-Fake
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal)
+$bi = Staged 'B' $run @() $true @{ FAKE_INSPECT_VERDICT = 'partial' }
+Check ($bi.Code -eq 21) 'B fails if the inspection verdict is not ready (21)'
+$bj = Staged 'B' $run @('-Resume') $true @{ FAKE_INSPECT_FAIL = '1' }
+Check ($bj.Code -eq 21) 'B fails if the inspection launcher fails (21)'
+Stop-Fake
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+$st = Staged 'C' $run @('-BaselineMaxAgeMinutes', '0')
+Check ($st.Code -eq 11 -and $st.Out -match 'older') 'C refuses a stale baseline (11)'
+Check (@((FakeLog) | Where-Object { $_.path -like '/api/v2/*' }).Count -eq 0) 'no request was sent with a stale baseline'
+Stop-Fake
+Start-Fake; $run = New-Run; Fast-To 'D' $run
+Ctl @{ historicalDelta = @{ name = 'decisions'; by = 2 } }
+$de = Staged 'E' $run
+Check ($de.Code -eq 31) 'E detects an unexpected change in a historical collection (31)'
+Stop-Fake
+
+# ================================================================================================ 9. stage G
+Write-Host '[9] safe shutdown (stage G), without assuming earlier stages'
+Start-Fake
+$fresh = New-Run
+$g1 = Staged 'G' $fresh
+Check ($g1.Code -eq 0) 'G on a run that never started: ok (0)'
+$g2 = Staged 'G' $null @() $false
+Check ($g2.Code -eq 0 -and $g2.Json.secretsWiped -eq $false) 'G with no RunDir (system checks only): ok (0)'
+$interrupted = New-Run; $null = Staged 'A' $interrupted @('-ManifestPath', $ManifestReal); $null = Staged 'B' $interrupted
+$null = Staged 'C' $interrupted @('-TestFaultAfterStep', 'session')
+Check (Test-Path (Join-Path $interrupted 'secrets.dpapi')) 'an interrupted run holds protected secrets before G'
+$g3 = Staged 'G' $interrupted
+Check ($g3.Code -eq 0 -and $g3.Json.secretsWiped -eq $true -and -not (Test-Path (Join-Path $interrupted 'secrets.dpapi')) -and -not (Test-Path (Join-Path $interrupted 'stage.lock'))) 'G after an interruption wipes the secrets and the stale lock'
+'not json' | Set-Content (Join-Path $interrupted 'stage-state.json')
+Check ((Staged 'G' $interrupted).Code -eq 0) 'G still works with a corrupted state file'
+$g4 = Staged 'G' $fresh @('-ProcessNames', 'powershell')
+Check ($g4.Code -eq 40 -and $g4.Json.status -eq 'attention') 'G reports attention (40) when a server-like process is still active'
+$me = $PID
+$sRun = New-Run; $null = Staged 'A' $sRun @('-ManifestPath', $ManifestReal)
+$g5 = Staged 'G' $sRun @('-StopCaddy', '-CaddyPid', [string]$me) $false
+Check ($g5.Code -eq 10) 'G refuses to stop processes without the phrase (10)'
+$g6 = Staged 'G' $sRun @('-StopCaddy', '-CaddyPid', [string]$me)
+Check ((Get-Process -Id $me -ErrorAction SilentlyContinue) -ne $null -and $g6.Json.caddyStopped -eq $false) 'G never stops a process that is not caddy'
+$g7 = Staged 'G' $fresh @('-CaThumbprint', (@(Get-ChildItem Cert:\CurrentUser\Root)[0].Thumbprint))
+Check ($g7.Code -eq 40 -and $g7.Out -match 'certutil') 'G reports a still-installed CA and prints the owner-only removal command (never removes it)'
+Check (@(Get-ChildItem Cert:\CurrentUser\Root).Count -ge 44) 'the certificate store was not modified'
+Stop-Fake
+
+# ================================================================================================ 10. second-operation builder (stage F material, never sent)
+Write-Host '[10] build-second-op.mjs'
+$firstRun = New-Run; $o2 = Join-Path $Runs 'second'
+$b2 = & $Node (Join-Path $Tools 'second.mjs') $Backend $firstRun $o2
+Check ($LASTEXITCODE -eq 0 -and $b2 -match '"validatedByBackendSchema":true') 'second operation built and validated by the real backend validator'
+$i1 = Get-Content -Raw (Join-Path $firstRun 'run-ids.json') | ConvertFrom-Json; $i2 = Get-Content -Raw (Join-Path $o2 'second-op.json') | ConvertFrom-Json
+Check ($i2.installationId -eq $i1.installationId -and $i2.localPlayerId -eq $i1.localPlayerId -and $i2.operationId -ne $i1.operationId -and $i2.sessionId -ne $i1.sessionId) 'same binding, new operation/session ids'
+$bt = Get-Content -Raw (Join-Path $o2 'batch.json') | ConvertFrom-Json
+Check ((Get-FileHash -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes([string]$bt.operations[0].canonicalEnvelope))) -Algorithm SHA256).Hash.ToLower() -eq $bt.operations[0].payloadHash) 'payloadHash = SHA-256 of the canonical envelope (deterministic from the stored bytes)'
+$x1 = Node-Code @((Join-Path $Tools 'second.mjs'), $Backend, $firstRun, $o2)
+Check ($x1.Code -ne 0) 'the builder refuses a non-empty output folder'
+$x2 = Node-Code @((Join-Path $Tools 'second.mjs'), $Backend, $firstRun, (Join-Path (Split-Path -Parent $Backend) 'inside-project'))
+Check ($x2.Code -ne 0 -and -not (Test-Path (Join-Path (Split-Path -Parent $Backend) 'inside-project'))) 'the builder refuses an output folder inside the project'
+
+# ================================================================================================ 10b. DPAPI hardening (B41)
+Write-Host '[10b] DPAPI file ACL, decryption failure, interrupted writes, temporaries, stage G cleanup'
+function Acl-Of([string]$p) { return (New-Object IO.FileInfo $p).GetAccessControl() }
+function Sids-Of($acl) { return @($acl.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique) }
+function Reqs { return @((FakeLog) | Where-Object { $_.path -like '/api/*' }).Count }
+$meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+# 1. ACL applied to the file itself, verified after creation; resume keeps the same identity and credential
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+$crash = Staged 'C' $run @('-TestFaultAfterStep', 'session'); $sec = Join-Path $run 'secrets.dpapi'
+Check ($crash.Code -eq 99 -and (Test-Path $sec)) 'DPAPI: the file exists after the simulated crash'
+$acl = Acl-Of $sec; $sids = @(Sids-Of $acl)
+Check ($acl.AreAccessRulesProtected) 'DPAPI ACL: inheritance is disabled on secrets.dpapi itself'
+Check ($sids.Count -eq 1 -and $sids[0] -eq $meSid) 'DPAPI ACL: only the current user has an explicit rule (no Everyone/Users/Authenticated)'
+Check (@(Get-ChildItem $run -Force | Where-Object { $_.Name -like '*.tmp*' }).Count -eq 0) 'DPAPI: no temporary file is left by a normal write'
+$before = Unprotect-Blob $run; $acct = (State $run).account; $idsHash = (Get-FileHash (Join-Path $run 'run-ids.json')).Hash
+$res = Staged 'C' $run @('-Resume')
+$after = Unprotect-Blob $run
+Check ($res.Code -eq 0 -and $after.credential -eq $before.credential -and (State $run).account -eq $acct -and (Get-FileHash (Join-Path $run 'run-ids.json')).Hash -eq $idsHash) 'DPAPI: resume reuses the same account, credential and identifiers'
+Check (@((FakeDb).registrations.PSObject.Properties).Count -eq 1 -and @((FakeDb).operations.PSObject.Properties).Count -eq 1) 'DPAPI: still one registration and one operation after the resume'
+Check (-not $AllOutput.ToString().Contains([string]$before.credential)) 'DPAPI: the credential never appeared in any output'
+Check (-not (Test-Path (Join-Path $run 'secrets.dpapi.tmp'))) 'DPAPI: no secrets.dpapi.tmp after completion'
+Stop-Fake
+
+# 2. wrong ACL (extra Users rule / inheritance re-enabled): fail closed, nothing sent, nothing regenerated
+foreach ($variant in @(@{ n = 'extra Users rule'; args = @('/grant', '*S-1-5-32-545:(R)') }, @{ n = 'inheritance re-enabled'; args = @('/inheritance:e') })) {
+    Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+    $null = Staged 'C' $run @('-TestFaultAfterStep', 'session'); $sec = Join-Path $run 'secrets.dpapi'
+    & icacls $sec @($variant.args) | Out-Null
+    $secHash = (Get-FileHash $sec).Hash; $acct = (State $run).account; $idsHash = (Get-FileHash (Join-Path $run 'run-ids.json')).Hash; $n0 = Reqs
+    $r = Staged 'C' $run @('-Resume')
+    Check ($r.Code -eq 21 -and $r.Json.reason -eq 'secrets-unavailable') ('DPAPI ACL (' + $variant.n + '): C -Resume fails closed (21, secrets-unavailable)')
+    Check ((Reqs) -eq $n0) ('DPAPI ACL (' + $variant.n + '): no request of any kind was sent')
+    Check ((Get-FileHash $sec).Hash -eq $secHash -and (State $run).account -eq $acct -and (Get-FileHash (Join-Path $run 'run-ids.json')).Hash -eq $idsHash) ('DPAPI ACL (' + $variant.n + '): file, account and identifiers unchanged')
+    Check ($r.Err.Trim() -eq '' -and $r.Out -notmatch 'Exception|at <ScriptBlock>') ('DPAPI ACL (' + $variant.n + '): controlled error, no stack trace')
+    $g = Staged 'G' $run
+    Check ($g.Code -eq 0 -and $g.Json.secretsWiped -eq $true -and -not (Test-Path $sec)) ('DPAPI ACL (' + $variant.n + '): stage G still removes the file')
+    Stop-Fake
+}
+
+# 3. decryption failure BEFORE the registration: controlled error, no request, no new identity
+foreach ($variant in @('random bytes', 'blob of another run (wrong entropy)', 'empty file')) {
+    Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+    $crash = Staged 'C' $run @('-TestFaultAfterStep', 'secrets-written'); $sec = Join-Path $run 'secrets.dpapi'
+    Check ($crash.Code -eq 99 -and (Test-Path $sec) -and $null -eq (State $run).account) ('DPAPI decrypt (' + $variant + '): crashed after protecting, before any registration')
+    switch ($variant) {
+        'random bytes' { $junk = New-Object byte[] 200; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($junk); [IO.File]::WriteAllBytes($sec, $junk) }
+        'empty file' { [IO.File]::WriteAllBytes($sec, [byte[]]@()) }
+        default { [IO.File]::WriteAllBytes($sec, [Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::UTF8.GetBytes('{"credential":"x","token":null}'), [Text.Encoding]::UTF8.GetBytes('another-run-id'), 'CurrentUser')) }
+    }
+    $idsHash = (Get-FileHash (Join-Path $run 'run-ids.json')).Hash; $n0 = Reqs
+    $r = Staged 'C' $run @('-Resume')
+    Check ($r.Code -eq 21 -and $r.Json.reason -eq 'secrets-unavailable') ('DPAPI decrypt (' + $variant + '): controlled failure (21, secrets-unavailable)')
+    Check ((Reqs) -eq $n0 -and @((FakeDb).registrations.PSObject.Properties).Count -eq 0) ('DPAPI decrypt (' + $variant + '): no request sent, no registration')
+    Check ($null -eq (State $run).account -and (Get-FileHash (Join-Path $run 'run-ids.json')).Hash -eq $idsHash -and (State $run).logins -eq 0) ('DPAPI decrypt (' + $variant + '): no new identity, account or login')
+    Check ($r.Err.Trim() -eq '' -and $r.Out -notmatch 'Exception|at <ScriptBlock>') ('DPAPI decrypt (' + $variant + '): no stack trace or raw error')
+    Stop-Fake
+}
+# decryption failure in a later stage: nothing is re-sent
+Start-Fake; $run = New-Run; Fast-To 'C' $run
+$junk = New-Object byte[] 120; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($junk); [IO.File]::WriteAllBytes((Join-Path $run 'secrets.dpapi'), $junk)
+$batches0 = @((FakeLog) | Where-Object { $_.path -eq '/api/v2/sync/batches' }).Count
+$rd = Staged 'D' $run
+Check ($rd.Code -eq 21 -and $rd.Json.reason -eq 'secrets-unavailable' -and @((FakeLog) | Where-Object { $_.path -eq '/api/v2/sync/batches' }).Count -eq $batches0) 'DPAPI decrypt: stage D fails closed and re-sends nothing (21)'
+Stop-Fake
+
+# 4. interruption before the write is finished (abandoned secrets.dpapi.tmp)
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+$crash = Staged 'C' $run @('-TestFaultAfterStep', 'secrets-tmp')
+Check ($crash.Code -eq 99 -and (Test-Path (Join-Path $run 'secrets.dpapi.tmp')) -and -not (Test-Path (Join-Path $run 'secrets.dpapi'))) 'interrupted write: a temporary is abandoned and the final file does not exist'
+Check (@((FakeDb).registrations.PSObject.Properties).Count -eq 0) 'interrupted write: nothing had been sent'
+$idsHash = (Get-FileHash (Join-Path $run 'run-ids.json')).Hash
+$res = Staged 'C' $run @('-Resume')
+Check ($res.Code -eq 0 -and -not (Test-Path (Join-Path $run 'secrets.dpapi.tmp')) -and (Test-Path (Join-Path $run 'secrets.dpapi'))) 'interrupted write: resume replaces the abandoned temporary and completes'
+Check (@(Sids-Of (Acl-Of (Join-Path $run 'secrets.dpapi'))).Count -eq 1 -and (Acl-Of (Join-Path $run 'secrets.dpapi')).AreAccessRulesProtected) 'interrupted write: the final file has the restrictive ACL'
+Check ((Get-FileHash (Join-Path $run 'run-ids.json')).Hash -eq $idsHash -and @((FakeDb).registrations.PSObject.Properties).Count -eq 1 -and @((FakeDb).operations.PSObject.Properties).Count -eq 1) 'interrupted write: same identifiers, one registration, one operation'
+Stop-Fake
+
+# 5. stage G: removal of own temporaries only, verified absence, honest wording
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+$null = Staged 'C' $run @('-TestFaultAfterStep', 'session')
+$hex = ('a' * 32)
+'x' | Set-Content (Join-Path $run 'secrets.dpapi.tmp'); 'x' | Set-Content (Join-Path $run ('stage-state.json.tmp-' + $hex))
+'keep' | Set-Content (Join-Path $run 'keep.tmp'); 'keep' | Set-Content (Join-Path $run 'stage-state.json.tmp-NOTHEX'); 'keep' | Set-Content (Join-Path $run 'notes.txt')
+$g = Staged 'G' $run
+Check ($g.Code -eq 0 -and $g.Json.secretsWiped -eq $true -and $g.Json.temporariesRemoved -eq 2 -and $g.Json.absenceVerified -eq $true) 'G: secrets and the 2 own temporaries removed, absence verified (0)'
+Check (-not (Test-Path (Join-Path $run 'secrets.dpapi')) -and -not (Test-Path (Join-Path $run 'secrets.dpapi.tmp')) -and -not (Test-Path (Join-Path $run ('stage-state.json.tmp-' + $hex)))) 'G: nothing of ours is left on disk'
+Check ((Test-Path (Join-Path $run 'keep.tmp')) -and (Test-Path (Join-Path $run 'stage-state.json.tmp-NOTHEX')) -and (Test-Path (Join-Path $run 'notes.txt')) -and (Test-Path (Join-Path $run 'batch.json'))) 'G: files that are not its own temporaries (and the run material) are untouched'
+Check ($g.Json.erasureNote -match 'not a guarantee' -and $g.Out -notmatch 'securely erased|irrecoverabl[ey]? (erased|deleted)') 'G: wording does not claim irrecoverable physical erasure'
+$g2 = Staged 'G' $run
+Check ($g2.Code -eq 0 -and $g2.Json.secretsWiped -eq $false -and $g2.Json.absenceVerified -eq $true -and $g2.Json.temporariesRemoved -eq 0) 'G is idempotent (second run: nothing to remove, absence verified)'
+Stop-Fake
+# G cannot remove a file that is held open: it must say so (40), then succeed once released
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run
+$null = Staged 'C' $run @('-TestFaultAfterStep', 'session'); $sec = Join-Path $run 'secrets.dpapi'
+$hold = [IO.File]::Open($sec, 'Open', 'Read', 'None')
+try { $gh = Staged 'G' $run } finally { $hold.Dispose() }
+Check ($gh.Code -eq 40 -and $gh.Json.absenceVerified -eq $false -and $gh.Json.secretsFilePresent -eq $true) 'G: a held-open secrets file is reported as NOT removed (40)'
+$gh2 = Staged 'G' $run
+Check ($gh2.Code -eq 0 -and $gh2.Json.absenceVerified -eq $true -and -not (Test-Path $sec)) 'G: once released, a second G removes it and verifies the absence (0)'
+Stop-Fake
+
+# ================================================================================================ 10c. capture of the launchers' report (B42)
+Write-Host '[10c] launcher output capture: console-inheriting child, provenance checks, wrappers'
+# 1. pinned hashes in the controller equal the templates
+$ctlText = Get-Content -Raw (Join-Path $ToolsSource 'sync-test-staged.ps1.template')
+foreach ($pin in @(@{ n = 'run-main-inspection-captured.ps1'; f = 'run-main-inspection-captured.ps1.template' }, @{ n = 'run-verify-synthetic.ps1'; f = 'run-verify-synthetic.ps1.template' })) {
+    $m = [regex]::Match($ctlText, "'" + [regex]::Escape($pin.n) + "' = '([0-9A-F]{64})'")
+    Check ($m.Success -and $m.Groups[1].Value -ceq (Get-FileHash (Join-Path $ToolsSource $pin.f) -Algorithm SHA256).Hash) ('the controller pins the SHA-256 of ' + $pin.n)
+}
+$wrapText = Get-Content -Raw (Join-Path $ToolsSource 'run-main-inspection-captured.ps1.template')
+Check ($wrapText -match 'RedirectStandardOutput = \$true' -and $wrapText -match 'Environment\.Clear\(\)' -and $wrapText -match 'Read-Host -Prompt .*-AsSecureString') 'wrapper: redirects the child output, empties its environment, keeps the hidden prompt'
+Check ($wrapText -notmatch 'ConvertFrom-SecureString|Out-File|Set-Content|Add-Content|Export-|\$env:|mongodb(\+srv)?://') 'wrapper: no persistence of the password, no environment reads, no connection string'
+Check ((Staged 'A' (New-Run) @('-TestMode', '-BaseUrl', "http://127.0.0.1:$Port", '-InspectionLauncher', 'C:\x\run-main-inspection-captured.ps1', '-VerifyLauncher', $FakeVer, '-VerifierScript', $Dummy) $false @{} $false).Code -eq 2) 'TestMode refuses the capturing launcher too (2)'
+
+# 2. controller: console-inheriting child and every provenance/format failure -> closed (21), nothing recorded as a baseline, nothing sent
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal)
+$idsHash = (Get-FileHash (Join-Path $run 'run-ids.json')).Hash; $runIdBefore = (State $run).runId; $opBefore = (Get-Content -Raw (Join-Path $run 'run-ids.json') | ConvertFrom-Json).operationId
+$cases = @(
+    @{ n = 'child with inherited console (the real defect)'; e = @{ FAKE_INSPECT_MODE = 'inherit' }; m = 'printed nothing capturable' },
+    @{ n = 'empty output'; e = @{ FAKE_INSPECT_MODE = 'empty' }; m = 'printed nothing capturable' },
+    @{ n = 'malformed JSON'; e = @{ FAKE_INSPECT_MODE = 'badjson' }; m = 'no JSON report' },
+    @{ n = 'valid JSON but exit code 5'; e = @{ FAKE_INSPECT_MODE = 'exit5' }; m = 'exit code 5' },
+    @{ n = 'report with another executionId'; e = @{ FAKE_INSPECT_BADID = '1' }; m = 'executionId differs' },
+    @{ n = 'no local record (report cannot be tied to the launcher)'; e = @{ FAKE_INSPECT_NOREC = '1' }; m = 'no local record' },
+    @{ n = 'old record reused'; e = @{ FAKE_INSPECT_OLD = '1' }; m = 'stale' },
+    @{ n = 'record altered (verdict differs)'; e = @{ FAKE_INSPECT_ALTER = '1' }; m = 'does not confirm' },
+    @{ n = 'writes != 0'; e = @{ FAKE_INSPECT_WRITES = '1' }; m = 'writes is not 0' },
+    @{ n = 'closed != true'; e = @{ FAKE_INSPECT_CLOSED = 'false' }; m = 'closed is not true' },
+    @{ n = 'verdict not ready'; e = @{ FAKE_INSPECT_VERDICT = 'partial' }; m = '' })
+$first = $true
+foreach ($c in $cases) {
+    $r = if ($first) { Staged 'B' $run @() $true $c.e } else { Staged 'B' $run @('-Resume') $true $c.e }; $first = $false
+    Check ($r.Code -eq 21 -and ($c.m -eq '' -or $r.Out -match [regex]::Escape($c.m))) ('B fails closed (21): ' + $c.n)
+}
+$stB = State $run
+Check ($stB.stages.B.status -eq 'failed' -and $null -eq $stB.baseline) 'B stays failed and no baseline was recorded by any rejected output'
+Check (@((FakeLog) | Where-Object { $_.path -like '/api/v2/*' }).Count -eq 0) 'no API request of the test was sent while B was failing'
+Check ((Staged 'B' $run @() $true @{}).Code -eq 12) 'B after a failure needs -Resume (12)'
+Check ((Staged 'C' $run).Code -eq 11) 'C stays blocked while B is failed (11)'
+# 3. resume from B=failed with the same identifiers, tolerating stderr/stdout noise
+$rb = Staged 'B' $run @('-Resume') $true @{ FAKE_INSPECT_MODE = 'noise' }
+Check ($rb.Code -eq 0 -and $rb.Json.status -eq 'ok') 'B -Resume succeeds with warnings mixed into stdout/stderr (0)'
+$stB2 = State $run
+Check ($stB2.stages.B.status -eq 'ok' -and $null -ne $stB2.baseline -and $stB2.runId -eq $runIdBefore -and (Get-FileHash (Join-Path $run 'run-ids.json')).Hash -eq $idsHash -and (Get-Content -Raw (Join-Path $run 'run-ids.json') | ConvertFrom-Json).operationId -eq $opBefore) 'resume: baseline recorded; runId, operationId and run-ids.json unchanged'
+Check ($null -eq $stB2.account -and $stB2.logins -eq 0) 'resume: no account or login was created'
+Stop-Fake
+
+# 4. controller: verification launcher (stages D/E) with the same provenance rules; a rejected verification never triggers the re-send
+Start-Fake; $run = New-Run; $null = Staged 'A' $run @('-ManifestPath', $ManifestReal); $null = Staged 'B' $run; $null = Staged 'C' $run
+$batches0 = @((FakeLog) | Where-Object { $_.path -eq '/api/v2/sync/batches' }).Count
+$vcases = @(@{ n = 'empty output'; e = @{ FAKE_VERIFY_MODE = 'empty' } }, @{ n = 'another executionId'; e = @{ FAKE_VERIFY_BADID = '1' } }, @{ n = 'no local record'; e = @{ FAKE_VERIFY_NOREC = '1' } }, @{ n = 'old record'; e = @{ FAKE_VERIFY_OLD = '1' } })
+$first = $true
+foreach ($c in $vcases) {
+    $r = if ($first) { Staged 'D' $run @() $true $c.e } else { Staged 'D' $run @('-Resume') $true $c.e }; $first = $false
+    Check ($r.Code -eq 21 -and $r.Json.reason -eq 'verification' -and $r.Out -match 'REJECTED|printed nothing') ('D stops (21) on a rejected verification: ' + $c.n)
+}
+Check (@((FakeLog) | Where-Object { $_.path -eq '/api/v2/sync/batches' }).Count -eq $batches0) 'no re-send was made after any rejected verification'
+$rd = Staged 'D' $run @('-Resume') $true @{ FAKE_VERIFY_MODE = 'noise' }
+Check ($rd.Code -eq 0 -and $rd.Json.resultStatus -eq 'duplicate') 'D -Resume succeeds with noise in the verification output; the identical re-send is a duplicate'
+Stop-Fake
+
+# 5. the capturing wrappers themselves (copies with ONLY the hidden prompt and the backend path substituted; every other line is the shipped code)
+$fakeBackend = Join-Path $WorkDir 'fake-backend'; New-Item -ItemType Directory (Join-Path $fakeBackend 'scripts') -Force | Out-Null
+@'
+const fs = require('fs'); const a = process.argv.slice(2); const cfg = JSON.parse(fs.readFileSync(a[a.indexOf('--authorization') + 1], 'utf8'));
+let buf = Buffer.alloc(0); process.stdin.on('data', d => { buf = Buffer.concat([buf, d]); });
+process.stdin.on('end', () => {
+  const len = buf.length >= 4 ? buf.readUInt32BE(0) : -1;
+  if (cfg.mode === 'empty') process.exit(0);
+  if (cfg.mode === 'exit7') { console.error('boom_code'); process.exit(7); }
+  if (cfg.mode === 'stderr') console.error('reason_code_x');
+  console.log('a harmless notice');
+  console.log(JSON.stringify({ mainSchemaInspection: 'finished', syntheticRunVerification: 'finished', frameBytes: len, frameOk: len === buf.length - 4, envKeys: Object.keys(process.env).length, leak: process.env.FAKE_DB !== undefined, argvHasSecret: process.argv.join(' ').includes('dummy-pass-9') }));
+  process.exit(0);
+});
+'@ | Set-Content (Join-Path $fakeBackend 'scripts\run-main-inspection.js') -Encoding UTF8
+Copy-Item (Join-Path $fakeBackend 'scripts\run-main-inspection.js') (Join-Path $fakeBackend 'verify-fake.js')
+function Make-WrapperCopy([string]$source, [string]$dest, [string]$promptPattern) {
+    $t = Get-Content -Raw $source
+    $t2 = [regex]::Replace($t, '(?m)^\$backend = .*$', ('$backend = ''' + $fakeBackend + ''''))
+    $t3 = [regex]::Replace($t2, $promptPattern, '$secure = ConvertTo-SecureString ''dummy-pass-9'' -AsPlainText -Force')
+    if ($t -eq $t2 -or $t2 -eq $t3) { throw 'wrapper substitution anchors not found' }
+    Set-Content -Path $dest -Value $t3 -Encoding UTF8
+}
+$wInsp = Join-Path $Tools 'wrapper-inspection-test.ps1'; $wVer = Join-Path $Tools 'wrapper-verify-test.ps1'
+Make-WrapperCopy (Join-Path $Tools 'wrapper-inspection.ps1') $wInsp '(?m)^\$secure = Read-Host .*$'
+Make-WrapperCopy (Join-Path $Tools 'wrapper-verify.ps1') $wVer '(?m)^\$secure = Read-Host .*$'
+function Run-Wrapper([string]$script, [string]$mode, [string[]]$more = @()) {
+    $authFile = Join-Path $Auth ('wrapper-' + [guid]::NewGuid().ToString('N') + '.json'); (@{ mode = $mode } | ConvertTo-Json -Compress) | Set-Content $authFile
+    $info = New-Object Diagnostics.ProcessStartInfo; $info.FileName = 'powershell.exe'; $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.CreateNoWindow = $true
+    $info.Arguments = '-NoProfile -File "' + $script + '" -Enable -Authorization "' + $authFile + '"' + ($more -join ' ')
+    $info.EnvironmentVariables['FAKE_DB'] = 'must-not-leak'
+    $p = [Diagnostics.Process]::Start($info); $o = $p.StandardOutput.ReadToEnd(); $e = $p.StandardError.ReadToEnd(); $p.WaitForExit()
+    return [pscustomobject]@{ Code = $p.ExitCode; Out = $o; Err = $e }
+}
+$w1 = Run-Wrapper $wInsp 'normal'; $jl = @($w1.Out -split "`r?`n" | Where-Object { $_.StartsWith('{') }) | Select-Object -Last 1; $jr = if ($jl) { ConvertFrom-Json $jl } else { $null }
+Check ($w1.Code -eq 0 -and $null -ne $jr -and $jr.mainSchemaInspection -eq 'finished') 'inspection wrapper: the child JSON reaches the output stream (0)'
+Check ($jr.frameBytes -eq 12 -and $jr.frameOk -eq $true -and $jr.argvHasSecret -eq $false -and -not $w1.Out.Contains('dummy-pass-9') -and -not $w1.Err.Contains('dummy-pass-9')) 'inspection wrapper: the password goes only through the stdin frame (never argv/output)'
+Check ($jr.leak -eq $false -and $jr.envKeys -le 4) 'inspection wrapper: the child environment is emptied (nothing inherited)'
+$w2 = Run-Wrapper $wInsp 'stderr'
+Check ($w2.Code -eq 0 -and $w2.Out -match 'reason_code_x' -and $w2.Out -match '"mainSchemaInspection"') 'inspection wrapper: child stderr is shown, stdout still captured'
+$w3 = Run-Wrapper $wInsp 'empty'; Check ($w3.Code -eq 3) 'inspection wrapper: empty child output is exit 3, never success'
+$w4 = Run-Wrapper $wInsp 'exit7'; Check ($w4.Code -eq 7 -and $w4.Out -notmatch '"mainSchemaInspection"') 'inspection wrapper: the child exit code is propagated (7)'
+# the defect itself: a caller that captures the pipeline now receives the report
+@'
+param([string]$Wrapper, [string]$AuthFile)
+$global:LASTEXITCODE = 0
+$lines = & $Wrapper -Enable -Authorization $AuthFile 2>&1 | ForEach-Object { $_.ToString() }
+"exit=$LASTEXITCODE json=" + @($lines | Where-Object { $_.StartsWith('{') }).Count
+'@ | Set-Content (Join-Path $Tools 'caller.ps1') -Encoding UTF8
+$cAuth = Join-Path $Auth 'caller-auth.json'; '{"mode":"normal"}' | Set-Content $cAuth
+$ci = New-Object Diagnostics.ProcessStartInfo; $ci.FileName = 'powershell.exe'; $ci.UseShellExecute = $false; $ci.RedirectStandardOutput = $true; $ci.CreateNoWindow = $true
+$ci.Arguments = '-NoProfile -File "' + (Join-Path $Tools 'caller.ps1') + '" -Wrapper "' + $wInsp + '" -AuthFile "' + $cAuth + '"'
+$cp = [Diagnostics.Process]::Start($ci); $co = $cp.StandardOutput.ReadToEnd(); $cp.WaitForExit()
+Check ($co -match 'exit=0 json=1') 'a pipeline-capturing caller now receives exactly one JSON report from the wrapper'
+$verArgs = @(' -RunDir "' + $Runs + '" -Account 3f2b8c1e-4d5a-4b6c-8d7e-9f0a1b2c3d4e -Verifier "' + (Join-Path $fakeBackend 'verify-fake.js') + '"')
+$v1 = Run-Wrapper $wVer 'normal' $verArgs; $vl = @($v1.Out -split "`r?`n" | Where-Object { $_.StartsWith('{') }) | Select-Object -Last 1; $vr = if ($vl) { ConvertFrom-Json $vl } else { $null }
+Check ($v1.Code -eq 0 -and $null -ne $vr -and $vr.syntheticRunVerification -eq 'finished' -and $vr.frameBytes -eq 12 -and $vr.leak -eq $false -and -not $v1.Out.Contains('dummy-pass-9')) 'verification launcher: report captured, password only via stdin, environment emptied'
+$v2 = Run-Wrapper $wVer 'empty' $verArgs; Check ($v2.Code -eq 3) 'verification launcher: empty child output is exit 3'
+$v3 = Run-Wrapper $wVer 'exit7' $verArgs; Check ($v3.Code -eq 7) 'verification launcher: child exit code propagated (7)'
+} finally { Stop-Fake }
+
+# ================================================================================================ 11. integrity after
+Write-Host '[11] integrity after'
+$treeAfter = & $Node -e "const fs=require('fs'),c=require('crypto'),p=require('path');const out=[];const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){const f=p.join(d,e.name);e.isDirectory()?walk(f):out.push(f)}};process.chdir(process.argv[1]);walk('src');walk('scripts');['package.json','package-lock.json','vitest.config.js'].forEach(f=>out.push(f));const h=c.createHash('sha256');for(const f of out.sort())h.update(f+':'+c.createHash('sha256').update(fs.readFileSync(f)).digest('hex')+'\n');console.log(h.digest('hex'))" $Backend
+Check ($treeAfter -eq $treeBefore) 'src/, scripts/ and package files are byte-identical'
+$v1 = & $Node (Join-Path $Backend 'scripts\backend-integrity.js') verify $ManifestReal
+Check ($v1 -match '"ok":true') 'manifest v4 still verifies'
+Check (@(Get-Process node, caddy -ErrorAction SilentlyContinue).Count -eq 0) 'no test process left (node/caddy)'
+Check (@(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in 3000, 8443 }).Count -eq 0) 'no listener on 3000/8443'
+Write-Host ("RESULT: passed=$pass failed=$fail")
+if ($fail) { $failures | ForEach-Object { Write-Host ('  - ' + $_) }; exit 1 }
+exit 0

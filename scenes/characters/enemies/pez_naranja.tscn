@@ -1,0 +1,131 @@
+[gd_scene format=3 uid="uid://d3q7kp56hvtf7"]
+
+[ext_resource type="Script" uid="uid://bwcrlxofy8kac" path="res://scripts/enemies/NpcPez.cs" id="1_tbmof"]
+[ext_resource type="PackedScene" uid="uid://brjccjw4mabge" path="res://scenes/props/item_comida.tscn" id="2_d6cj2"]
+[ext_resource type="Texture2D" uid="uid://b05bj65uym5uv" path="res://assets/sprites/fondos/oceano/PEZ NARANJA.png" id="3_tbmof"]
+[ext_resource type="Script" uid="uid://cq8jxkyuk8uqv" path="res://scripts/globals/Hitbox.cs" id="4_5elhq"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_qtx4q"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(0, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_x7cqw"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(16, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_jc4kv"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(32, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_21duc"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(48, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_6qvjy"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(64, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_7i4k5"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(80, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_fg8yw"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(0, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_ouier"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(16, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_jai6e"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(32, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_jxu36"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(48, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_fn0ac"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(64, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_smhwr"]
+atlas = ExtResource("3_tbmof")
+region = Rect2(80, 0, 16, 16)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_rjl7x"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_qtx4q")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_x7cqw")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_jc4kv")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_21duc")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_6qvjy")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_7i4k5")
+}],
+"loop": true,
+"name": &"idle",
+"speed": 7.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_fg8yw")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_ouier")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_jai6e")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_jxu36")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_fn0ac")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_smhwr")
+}],
+"loop": true,
+"name": &"run",
+"speed": 7.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_deen4"]
+size = Vector2(17, 14)
+
+[sub_resource type="CapsuleShape2D" id="CapsuleShape2D_jeood"]
+radius = 8.0
+height = 26.0
+
+[node name="pez naranja" type="CharacterBody2D" unique_id=178621319]
+script = ExtResource("1_tbmof")
+EscenaComida = ExtResource("2_d6cj2")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=2088407011]
+sprite_frames = SubResource("SpriteFrames_rjl7x")
+animation = &"run"
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=2147287748]
+position = Vector2(0.5, 0)
+shape = SubResource("RectangleShape2D_deen4")
+
+[node name="Hitbox" type="Area2D" parent="." unique_id=491663390]
+script = ExtResource("4_5elhq")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Hitbox" unique_id=1747225898]
+position = Vector2(1, 0)
+rotation = 1.5707964
+shape = SubResource("CapsuleShape2D_jeood")
+debug_color = Color(0.9500951, 3.272891e-06, 0.57267934, 0.41960785)

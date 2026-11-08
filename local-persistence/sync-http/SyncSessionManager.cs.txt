@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Concurrent;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+using TwoSides.LocalPersistence;
+
+namespace TwoSides.Integration.SyncHttp;
+
+// The 32-byte account secret created by THIS client at registration. It is never written to a text file or logged. The default
+// store is process memory only; a protected persistent store (needed to log in again after the game restarts) is a pending requirement.
+public interface ISyncSecretStore
+{
+    string? ReadCredential(SyncBinding binding);
+    void WriteCredential(SyncBinding binding,string credential);
+    void Forget(SyncBinding binding);
+    // The technical account id (not a secret) is remembered with the credential so a later session of the same player logs in instead of registering again.
+    string? ReadAccount(SyncBinding binding)=>null;
+    void WriteAccount(SyncBinding binding,string account){}
+    // Idempotency key of the registration: kept so a registration whose answer was lost is retried with the SAME id instead of creating a second account.
+    string? ReadRegistrationId(SyncBinding binding)=>null;
+    void WriteRegistrationId(SyncBinding binding,string registrationId){}
+    // True when a stored credential exists but cannot be used (undecryptable, corrupt, foreign). The client must then NOT register a new account.
+    bool IsUnavailable(SyncBinding binding)=>false;
+}
+public sealed class InMemorySyncSecretStore:ISyncSecretStore
+{
+    private readonly ConcurrentDictionary<string,string> _values=new();
+    private static string Key(SyncBinding b)=>b.LocalPlayerId+"|"+b.InstallationId+"|"+b.BindingGeneration;
+    public string? ReadCredential(SyncBinding binding)=>_values.TryGetValue(Key(binding),out var v)?v:null;
+    public void WriteCredential(SyncBinding binding,string credential)=>_values[Key(binding)]=credential;
+    private readonly ConcurrentDictionary<string,string> _accounts=new();
+    public string? ReadAccount(SyncBinding binding)=>_accounts.TryGetValue(Key(binding),out var v)?v:null;
+    public void WriteAccount(SyncBinding binding,string account)=>_accounts[Key(binding)]=account;
+    public void Forget(SyncBinding binding){_values.TryRemove(Key(binding),out _);_accounts.TryRemove(Key(binding),out _);}
+}
+
+public sealed record SyncAuthResult(bool Ok,SyncHttpFailure Failure,TimeSpan? RetryAfter=null)
+{
+    public static SyncAuthResult Success=>new(true,SyncHttpFailure.None);
+}
+
+// Registers (once) and opens a JWT v2 session. The access token lives only in this object's memory and is never exposed outside the assembly.
+public sealed class SyncSessionManager
+{
+    private readonly SyncHttpTransport _transport;
+    private readonly SyncBinding _binding;
+    private readonly ISyncSecretStore _store;
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly SemaphoreSlim _gate=new(1,1);
+    private string _registrationId=Guid.NewGuid().ToString("D");
+    private string? _account,_token;
+    private DateTimeOffset _expires=DateTimeOffset.MinValue;
+    public SyncSessionManager(SyncHttpTransport transport,SyncBinding binding,ISyncSecretStore? store=null,Func<DateTimeOffset>? clock=null)
+    {
+        SaveValidation.Id(binding.LocalPlayerId);SaveValidation.Id(binding.InstallationId);
+        SaveValidation.Require(binding.BindingGeneration==1,"UNSUPPORTED_SYNC_BINDING");   // contract v2 registers generation 1
+        _transport=transport;_binding=binding;_store=store??new InMemorySyncSecretStore();_account=_store.ReadAccount(binding);_registrationId=_store.ReadRegistrationId(binding)??_registrationId;_clock=clock??(()=>DateTimeOffset.UtcNow);
+    }
+    public bool HasSession=>_token is not null && _clock()<_expires;
+    public void Invalidate(){_token=null;_expires=DateTimeOffset.MinValue;}
+
+    // The only way to use the access token: it is attached here and never returned. One transparent re-login on 401.
+    public async Task<SyncHttpResponse> SendAsync(HttpMethod method,string path,byte[]? body,CancellationToken cancellation)
+    {
+        var auth=await EnsureAsync(cancellation).ConfigureAwait(false);
+        if(!auth.Ok)return new(0,auth.Failure,null,auth.RetryAfter);
+        var response=await _transport.SendAsync(method,path,body,_token,cancellation).ConfigureAwait(false);
+        if(response.Failure==SyncHttpFailure.Unauthorized)
+        {
+            Invalidate();
+            auth=await EnsureAsync(cancellation).ConfigureAwait(false);
+            if(!auth.Ok)return new(0,auth.Failure,null,auth.RetryAfter);
+            response=await _transport.SendAsync(method,path,body,_token,cancellation).ConfigureAwait(false);
+        }
+        return response;
+    }
+    // Authenticated reachability check (GET /api/v2/technical/me). Safe to call at any time; changes no local state.
+    public Task<SyncHttpResponse> ProbeAsync(CancellationToken cancellation)=>SendAsync(HttpMethod.Get,"/api/v2/technical/me",null,cancellation);
+
+    private static string NewSecret()=>Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_');
+
+    public async Task<SyncAuthResult> EnsureAsync(CancellationToken cancellation)
+    {
+        await _gate.WaitAsync(cancellation).ConfigureAwait(false);
+        try
+        {
+            if(HasSession)return SyncAuthResult.Success;
+            try
+            {
+            if(_store.IsUnavailable(_binding))return new(false,SyncHttpFailure.CredentialUnavailable);   // fail closed: never a new account over an unreadable one
+            for(int round=0;round<2;round++)
+            {
+                if(_account is null){var registered=await RegisterAsync(cancellation).ConfigureAwait(false);if(!registered.Ok)return registered;}
+                var login=await LoginAsync(cancellation).ConfigureAwait(false);
+                if(login.Ok)return login;
+                // The account is unknown to the server (for example a restarted offline server): register again once.
+                if(login.Failure==SyncHttpFailure.Unauthorized && round==0){_account=null;_registrationId=Guid.NewGuid().ToString("D");continue;}
+                return login;
+            }
+            return new(false,SyncHttpFailure.Unauthorized);
+            }
+            catch(SaveException){return new(false,SyncHttpFailure.CredentialUnavailable);}
+        }
+        finally{_gate.Release();}
+    }
+
+    private static SyncAuthResult Fail(SyncHttpResponse r)=>new(false,r.Failure==SyncHttpFailure.None?SyncHttpFailure.InvalidResponse:r.Failure,r.RetryAfter);
+
+    private async Task<SyncAuthResult> RegisterAsync(CancellationToken cancellation)
+    {
+        string credential=_store.ReadCredential(_binding)??NewSecret();
+        _store.WriteCredential(_binding,credential);_store.WriteRegistrationId(_binding,_registrationId);
+        var body=SyncHttpTransport.Json(new{schemaVersion=2,registrationId=_registrationId,credential,installationId=_binding.InstallationId,
+            localPlayerId=_binding.LocalPlayerId,bindingGeneration=_binding.BindingGeneration});
+        var response=await _transport.SendAsync(HttpMethod.Post,"/api/v2/technical/registrations",body,null,cancellation).ConfigureAwait(false);
+        if(!response.Ok||response.Body is not {ValueKind:JsonValueKind.Object} json||!json.TryGetProperty("technicalAccountId",out var id)||
+           id.ValueKind!=JsonValueKind.String||id.GetString() is not string account||!Guid.TryParseExact(account,"D",out _))
+            return Fail(response);
+        _account=account;_store.WriteAccount(_binding,account);
+        return SyncAuthResult.Success;
+    }
+
+    private async Task<SyncAuthResult> LoginAsync(CancellationToken cancellation)
+    {
+        string? credential=_store.ReadCredential(_binding);
+        if(credential is null||_account is null)return new(false,SyncHttpFailure.Unauthorized);
+        var body=SyncHttpTransport.Json(new{schemaVersion=2,technicalAccountId=_account,credential,installationId=_binding.InstallationId,localPlayerId=_binding.LocalPlayerId});
+        var response=await _transport.SendAsync(HttpMethod.Post,"/api/v2/technical/sessions",body,null,cancellation).ConfigureAwait(false);
+        if(!response.Ok||response.Body is not {ValueKind:JsonValueKind.Object} json||!json.TryGetProperty("accessToken",out var token)||
+           token.ValueKind!=JsonValueKind.String||string.IsNullOrEmpty(token.GetString())||!json.TryGetProperty("expiresIn",out var ttl)||
+           ttl.ValueKind!=JsonValueKind.Number||!ttl.TryGetInt32(out int seconds)||seconds<60)
+            return Fail(response);
+        _token=token.GetString();_expires=_clock().AddSeconds(seconds-30);   // renew before the server-side expiry
+        return SyncAuthResult.Success;
+    }
+}

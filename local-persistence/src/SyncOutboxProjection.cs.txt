@@ -1,0 +1,108 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+namespace TwoSides.LocalPersistence;
+
+internal sealed record SyncProjection(string SourceKey,string Type,string? GameId,string Payload);
+internal static class SyncOutboxProjection
+{
+    internal const long MaxInteger=9007199254740991;
+    internal static string Utc(DateTimeOffset time)=>time.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'",CultureInfo.InvariantCulture);
+    internal static string Utc(string time)=>Utc(DateTimeOffset.Parse(time,CultureInfo.InvariantCulture));
+    internal static void Number(long n)=>SaveValidation.Require(n>=0 && n<=MaxInteger,"UNSUPPORTED_SYNC_VALUE");
+    internal static void Key(string key)=>SaveValidation.Require(key is not null && Regex.IsMatch(key,"\\A[A-Za-z0-9._-]{1,64}\\z"),"UNSUPPORTED_SYNC_VALUE");
+    internal static string Json(object value)=>SaveValidation.JsonObject(JsonSerializer.Serialize(value),16384);
+    internal static string Digest(string canonical)=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
+    internal static string SourceKey(SyncFact fact)
+    {
+        SaveValidation.Id(fact.SourceId);
+        SaveValidation.Require(Enum.IsDefined(fact.Kind) && fact.Origin is "live_capture" or "historical_import","INVALID_SYNC_FACT");
+        if(fact.Kind==SyncFactKind.GameReport){SaveValidation.Require(fact.Revision.HasValue && fact.Phase is null);Number(fact.Revision!.Value);return $"game:{fact.SourceId}:{fact.Revision}";}
+        if(fact.Kind==SyncFactKind.SessionReport){SaveValidation.Require(fact.Revision is null && fact.Phase is "open" or "terminal");return $"session:{fact.SourceId}:{fact.Phase}";}
+        SaveValidation.Require(fact.Revision is null && fact.Phase is null);
+        return (fact.Kind==SyncFactKind.GameplayEvent?"event:":"interval:")+fact.SourceId;
+    }
+    internal static SyncProjection Read(SQLiteRepository r,string owner,SyncFact fact)
+    {
+        string sourceKey=SourceKey(fact);
+        SaveValidation.Require(r.Profile()?.LocalPlayerId==owner,"NOT_FOUND");
+        object Coverage(bool incomplete)=>new {origin=fact.Origin,historicalCoverageUnknown=true,incomplete};
+        if(fact.Kind==SyncFactKind.GameReport)
+        {
+            var g=r.Game(owner,fact.SourceId);SaveValidation.Require(g is not null,"NOT_FOUND");
+            SaveValidation.Require(g!.Revision==fact.Revision,"SOURCE_REVISION_UNAVAILABLE");
+            Number(g.Revision);Key(g.RulesVersion);Key(g.ContentVersion);
+            SaveValidation.Require(g.SaveFormatVersion==1 && g.Status is "in_progress" or "final_pending" or "completed" or "archived","UNSUPPORTED_SYNC_VALUE");
+            var biomes=r.Biomes(g.GameId);var decisions=r.Decisions(g.GameId,limit:6);
+            var environments=r.Environments(g.GameId);
+            SaveValidation.Require(biomes.Count==5 && biomes.Select(b=>b.BiomeId).OrderBy(x=>x).SequenceEqual(new[]{"desert","forest","jungle","ocean","tundra"}) && decisions.Count<=5,"UNSUPPORTED_SYNC_VALUE");
+            SaveValidation.Require(environments.Count==5 && decisions.Select(d=>d.BiomeId).Distinct().Count()==decisions.Count,"SOURCE_CONTENT_CONFLICT");
+            foreach(var biome in biomes)
+            {
+                var decision=decisions.SingleOrDefault(d=>d.BiomeId==biome.BiomeId);
+                var environment=environments.SingleOrDefault(e=>e.BiomeId==biome.BiomeId);
+                SaveValidation.Require(environment is not null,"SOURCE_CONTENT_CONFLICT");
+                if(decision is null)SaveValidation.Require(biome.Status=="human_pending" && environment!.LastDecisionId is null && environment.StateKind is null,"SOURCE_CONTENT_CONFLICT");
+                else
+                {
+                    string state=SaveValidation.DecisionState(decision.ConsequencesJson,decision.ConsequencesVersion);
+                    SaveValidation.Require(biome.Status is "animal_pending" or "completed" && environment!.LastDecisionId==decision.DecisionId &&
+                        environment.StateKind==state && (biome.Status!="completed" || biome.Result==(state=="healthy"?"good":"bad")),"SOURCE_CONTENT_CONFLICT");
+                }
+            }
+            var ds=decisions.Select(d=>{
+                SaveValidation.Id(d.DecisionId);SaveValidation.Id(d.OperationId);Number(d.DecisionOrder);Key(d.DecisionKey);Key(d.RulesVersion);
+                SaveValidation.Require(d.OptionId is "reject" or "approve" && biomes.Any(b=>b.BiomeId==d.BiomeId),"UNSUPPORTED_SYNC_VALUE");
+                string state=SaveValidation.DecisionState(d.ConsequencesJson,d.ConsequencesVersion);
+                SaveValidation.Require(state==(d.OptionId=="reject"?"healthy":"degraded"),"UNSUPPORTED_SYNC_VALUE");
+                return new {decisionId=d.DecisionId,operationId=d.OperationId,biomeId=d.BiomeId,decisionKey=d.DecisionKey,optionId=d.OptionId,
+                    decisionOrder=d.DecisionOrder,consequencesVersion=d.ConsequencesVersion,stateKind=state,
+                    classification=d.Classification is null?null:new {kind=d.Classification.Kind,version=d.Classification.Version},
+                    rulesVersion=d.RulesVersion,occurredAtUtc=Utc(d.OccurredAt)};
+            }).ToArray();
+            if(g.Status is "final_pending" or "completed")
+            {
+                SaveValidation.Require(biomes.All(b=>b.Status=="completed") && ds.Length==5 && g.EndingRulesVersion=="local-ending-reject-count-1","UNSUPPORTED_SYNC_VALUE");
+                var rejects=ds.Count(d=>d.optionId=="reject");SaveValidation.Require(g.Ending==(rejects==5?"good":rejects>=3?"medium":"bad"),"UNSUPPORTED_SYNC_VALUE");
+            }
+            return new(sourceKey,"game.report",g.GameId,Json(new {gameId=g.GameId,revision=g.Revision,rulesVersion=g.RulesVersion,contentVersion=g.ContentVersion,
+                saveFormatVersion=g.SaveFormatVersion,status=g.Status,isCurrent=g.IsCurrent,createdAtUtc=Utc(g.CreatedAt),savedAtUtc=Utc(g.SavedAt),
+                ending=g.Ending,endingRulesVersion=g.EndingRulesVersion,preparedAtUtc=g.CompletedAt is null?null:Utc(g.CompletedAt),
+                closedAtUtc=g.Status=="completed" && g.ArchivedAt is not null?Utc(g.ArchivedAt):null,
+                biomes=biomes.Select(b=>new {biomeId=b.BiomeId,status=b.Status,result=b.Result,humanCompletedAtUtc=b.HumanCompletedAt is null?null:Utc(b.HumanCompletedAt),
+                    animalCompletedAtUtc=b.AnimalCompletedAt is null?null:Utc(b.AnimalCompletedAt)}).ToArray(),decisions=ds,coverage=Coverage(true)}));
+        }
+        GameplayEventSchema.Verify(r);var events=new GameplayEventRepository(r);
+        if(fact.Kind==SyncFactKind.SessionReport)
+        {
+            var s=events.Session(fact.SourceId);SaveValidation.Require(s is not null && s.LocalPlayerId==owner,"NOT_FOUND");
+            bool open=fact.Phase=="open";SaveValidation.Require(open || s!.Status is "closed" or "interrupted","SOURCE_NOT_COMMITTED");
+            if(!open && s!.EndOffsetMs.HasValue)Number(s.EndOffsetMs.Value);
+            return new(sourceKey,"session.report",null,Json(new {sessionId=s!.SessionId,phase=fact.Phase,status=open?"open":s.Status,
+                startedAtUtc=Utc(s.StartedAtUtc),endedAtUtc=open || s.EndedAtUtc is null?null:Utc(s.EndedAtUtc),
+                endOffsetMs=open?null:s.EndOffsetMs,coverage=Coverage(open || s.Status!="closed")}));
+        }
+        if(fact.Kind==SyncFactKind.GameplayEvent)
+        {
+            var e=events.FindEvent(fact.SourceId)?.Event;SaveValidation.Require(e is not null && e.LocalPlayerId==owner,"NOT_FOUND");
+            Number(e!.OffsetMs);SaveValidation.Require(e.Version==1 && Enum.IsDefined(e.Kind),"UNSUPPORTED_SYNC_VALUE");
+            return new(sourceKey,"gameplay.event",e.GameId,Json(new {eventId=e.EventId,sessionId=e.SessionId,kind=e.Kind.ToString(),occurredAtUtc=Utc(e.OccurredAtUtc),
+                offsetMs=e.OffsetMs,gameId=e.GameId,biomeId=e.BiomeId,animalRunId=e.AnimalRunId,deathCause=e.DeathCause?.ToString(),sessionEnd=e.SessionEnd?.ToString(),version=e.Version}));
+        }
+        using var cmd=r.Command("SELECT session_id,game_id,biome_id,animal_run_id,start_ms,end_ms,state,contract_version FROM gameplay_intervals WHERE interval_id=$id AND local_player_id=$p;",("$id",fact.SourceId),("$p",owner));
+        using var row=cmd.ExecuteReader();SaveValidation.Require(row.Read(),"NOT_FOUND");
+        string? N(int i)=>row.IsDBNull(i)?null:row.GetString(i);
+        long start=row.GetInt64(4),end=row.GetInt64(5);Number(start);Number(end);
+        SaveValidation.Require(end>=start && row.GetInt64(7)==1 && Enum.TryParse<GameplayTimeState>(row.GetString(6),out _),"UNSUPPORTED_SYNC_VALUE");
+        string? game=N(1);
+        return new(sourceKey,"gameplay.interval",game,Json(new {intervalId=fact.SourceId,sessionId=row.GetString(0),gameId=game,biomeId=N(2),animalRunId=N(3),
+            startMs=start,endMs=end,state=row.GetString(6),version=1}));
+    }
+}
+

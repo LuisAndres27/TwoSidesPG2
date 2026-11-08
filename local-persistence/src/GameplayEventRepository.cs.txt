@@ -1,0 +1,43 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+internal sealed class GameplayEventRepository
+{
+    internal readonly SQLiteRepository Base;
+    internal GameplayEventRepository(SQLiteRepository repository)=>Base=repository;
+    private List<T> Rows<T>(string sql,Func<SqliteDataReader,T> map,params (string,object?)[] args)
+    {using var q=Base.Command(sql,args);using var r=q.ExecuteReader();var rows=new List<T>();while(r.Read())rows.Add(map(r));return rows;}
+    private static string S(SqliteDataReader r,string key)=>r.GetString(r.GetOrdinal(key));
+    private static string? N(SqliteDataReader r,string key)=>r.IsDBNull(r.GetOrdinal(key))?null:S(r,key);
+    private static long L(SqliteDataReader r,string key)=>r.GetInt64(r.GetOrdinal(key));
+    private static GameplayEvent Event(SqliteDataReader r)=>new(S(r,"event_id"),S(r,"local_player_id"),S(r,"session_id"),Enum.Parse<GameplayEventKind>(S(r,"kind")),
+        DateTimeOffset.Parse(S(r,"occurred_at_utc"),CultureInfo.InvariantCulture),L(r,"offset_ms"),N(r,"game_id"),N(r,"biome_id"),N(r,"animal_run_id"),
+        N(r,"death_cause") is string cause?Enum.Parse<GameplayDeathCause>(cause):null,N(r,"session_end") is string end?Enum.Parse<GameplaySessionEnd>(end):null,(int)L(r,"contract_version"));
+    internal (GameplayEvent Event,string Digest)? FindEvent(string id)
+    {var rows=Rows("SELECT * FROM gameplay_events WHERE event_id=$id;",r=>(Event(r),S(r,"payload_digest")),("$id",id));return rows.Count==0?null:rows[0];}
+    internal string? IntervalDigest(string id)
+    {var rows=Rows("SELECT payload_digest FROM gameplay_intervals WHERE interval_id=$id;",r=>S(r,"payload_digest"),("$id",id));return rows.Count==0?null:rows[0];}
+    internal GameplaySession? Session(string id)
+    {var rows=Rows("SELECT * FROM gameplay_sessions WHERE session_id=$id;",r=>new GameplaySession(S(r,"session_id"),S(r,"local_player_id"),S(r,"started_at_utc"),S(r,"status"),N(r,"ended_at_utc"),r.IsDBNull(r.GetOrdinal("end_offset_ms"))?null:L(r,"end_offset_ms")),("$id",id));return rows.Count==0?null:rows[0];}
+    internal IReadOnlyList<GameplaySession> Sessions(string owner)=>Rows("SELECT * FROM gameplay_sessions WHERE local_player_id=$p ORDER BY started_at_utc,session_id;",
+        r=>new GameplaySession(S(r,"session_id"),S(r,"local_player_id"),S(r,"started_at_utc"),S(r,"status"),N(r,"ended_at_utc"),r.IsDBNull(r.GetOrdinal("end_offset_ms"))?null:L(r,"end_offset_ms")),("$p",owner)).AsReadOnly();
+    internal IReadOnlyList<GameplayEvent> Events(string owner,string? game=null,string? biome=null,string? session=null)=>Rows("""
+SELECT * FROM gameplay_events WHERE local_player_id=$p AND ($g IS NULL OR game_id=$g) AND ($b IS NULL OR biome_id=$b) AND ($s IS NULL OR session_id=$s) ORDER BY session_id,offset_ms,event_id;
+""",Event,("$p",owner),("$g",game),("$b",biome),("$s",session)).AsReadOnly();
+    internal IReadOnlyList<GameplayInterval> Intervals(string owner,string? game=null,string? biome=null,string? session=null)=>Rows("""
+SELECT * FROM gameplay_intervals WHERE local_player_id=$p AND ($g IS NULL OR game_id=$g) AND ($b IS NULL OR biome_id=$b) AND ($s IS NULL OR session_id=$s) ORDER BY session_id,start_ms,end_ms,interval_id;
+""",r=>new GameplayInterval(S(r,"interval_id"),S(r,"local_player_id"),S(r,"session_id"),L(r,"start_ms"),L(r,"end_ms"),Enum.Parse<GameplayTimeState>(S(r,"state")),N(r,"game_id"),N(r,"biome_id"),N(r,"animal_run_id"),(int)L(r,"contract_version")),("$p",owner),("$g",game),("$b",biome),("$s",session)).AsReadOnly();
+    internal long DurableOffset(string session)=>Base.Number("""
+SELECT max(coalesce((SELECT max(offset_ms) FROM gameplay_events WHERE session_id=$s),0),coalesce((SELECT max(end_ms) FROM gameplay_intervals WHERE session_id=$s),0));
+""",("$s",session));
+    internal void Insert(GameplayEvent e,string digest,string key)=>Base.Execute("""
+INSERT INTO gameplay_events VALUES($id,$p,$s,$k,$at,$offset,$g,$b,$run,$cause,$end,$version,$digest,$key);
+""",("$id",e.EventId),("$p",e.LocalPlayerId),("$s",e.SessionId),("$k",e.Kind.ToString()),("$at",SaveValidation.Timestamp(e.OccurredAtUtc)),("$offset",e.OffsetMs),("$g",e.GameId),("$b",e.BiomeId),("$run",e.AnimalRunId),("$cause",e.DeathCause?.ToString()),("$end",e.SessionEnd?.ToString()),("$version",e.Version),("$digest",digest),("$key",key));
+    internal void Insert(GameplayInterval i,string digest)=>Base.Execute("""
+INSERT INTO gameplay_intervals VALUES($id,$p,$s,$start,$end,$state,$g,$b,$run,$version,$digest);
+""",("$id",i.IntervalId),("$p",i.LocalPlayerId),("$s",i.SessionId),("$start",i.StartMs),("$end",i.EndMs),("$state",i.State.ToString()),("$g",i.GameId),("$b",i.BiomeId),("$run",i.AnimalRunId),("$version",i.Version),("$digest",digest));
+}

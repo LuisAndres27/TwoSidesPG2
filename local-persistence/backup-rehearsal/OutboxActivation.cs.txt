@@ -1,0 +1,95 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static partial class Program
+{
+    private static object ActivationPass(SQLiteRepository r,SyncBinding binding)
+    {
+        SyncReconciliationCursor? cursor=null;int inserted=0,pages=0;
+        do
+        {
+            var page=SyntheticOutboxReconciler.PrepareSyntheticPage(r,binding,DateTimeOffset.UtcNow,25,cursor);
+            Require(page.Diagnostics.Count==0,"ACTIVATION_RECONCILIATION_CONFLICT");
+            inserted+=page.Inserted;cursor=page.Next;pages++;Require(pages<10000,"ACTIVATION_BUDGET");
+        }while(cursor is not null);
+        return new{Inserted=inserted,Pages=pages};
+    }
+    private static int ActivateRuntimeOutbox()
+    {
+        Require(Same(Environment.CurrentDirectory,Project),"WRONG_PROJECT");
+        WriterCheck();RequireRuntimePath(RuntimePath);
+        long available=new DriveInfo(Path.GetPathRoot(Local)!).AvailableFreeSpace;
+        Require(available>=new FileInfo(RuntimePath).Length*20+128L*1024*1024,"INSUFFICIENT_DISK_SPACE");
+        // Fresh consistent backup, independent migrated copy, two passes across processes, data/statistics comparison.
+        OutboxTrial(forActivation:true);
+        string root=_latestOutboxTrialRoot??throw new SaveException("ACTIVATION_PREPARATION_MISSING");
+        using var manifest=JsonDocument.Parse(File.ReadAllText(Path.Combine(root,"backup-manifest.json")));
+        var preMetadata=manifest.RootElement.GetProperty("SourceMetadata").Deserialize<FileMetadata>()!;
+        string backup=Path.Combine(root,manifest.RootElement.GetProperty("BackupFile").GetString()!);
+        string expectedBackupHash=manifest.RootElement.GetProperty("BackupMetadata").GetProperty("Sha256").GetString()!;
+        Require(FileHash(backup)==expectedBackupHash,"FRESH_BACKUP_HASH_CHANGED");
+        var baseline=Inspect(backup);
+        string statsBefore=StatisticsFingerprint(new CopyDatabase(root,backup,Role.Backup));
+        using var runtime=new RuntimeCapability(); // Native file ID, ownership, path and byte-range lease.
+        Require(Metadata(RuntimePath)==preMetadata,"RUNTIME_CHANGED_SINCE_FRESH_BACKUP");
+        Equal(baseline,Inspect(RuntimePath));SchemaManager.Verify(runtime);GameplayEventSchema.Verify(runtime);
+        Require(!baseline.Tables.Any(t=>t.Name.StartsWith("sync_",StringComparison.Ordinal)),"RUNTIME_SYNC_ALREADY_PRESENT");
+        string sql=(string)typeof(SyncOutboxSchema).GetField("Sql",BindingFlags.NonPublic|BindingFlags.Static)!.GetRawConstantValue()!;
+        Require(Hash(sql.ReplaceLineEndings("\n"))==SyncOutboxSchema.Checksum,"SYNC_MIGRATION_DIFFERS_FROM_TRIAL");
+        var privateBefore=Metadata(backup);bool committed=false;
+        object? first=null,second=null;long pending=0,dependencies=0;
+        try
+        {
+            WriterCheck();runtime.AuthorizeOneWrite();
+            using(var c=runtime.OpenMigration())
+            {
+                using(var pragma=c.CreateCommand()){pragma.CommandText="PRAGMA synchronous=FULL;PRAGMA busy_timeout=1000;";pragma.ExecuteNonQuery();}
+                using var tx=c.BeginTransaction(deferred:false);Equal(baseline,Inspect(c,tx));
+                var r=new SQLiteRepository(c,tx);
+                r.Execute(sql);
+                r.Execute("INSERT INTO sync_schema_migrations VALUES(1,'local-sync-outbox-v1',$hash,$at);",
+                    ("$hash",SyncOutboxSchema.Checksum),("$at",SaveValidation.Timestamp(DateTimeOffset.UtcNow)));
+                // Exactly the migration trial's constant/version, no domain command is invoked.
+                string owner=r.Profile()?.LocalPlayerId??throw new SaveException("PROFILE_REQUIRED");
+                var binding=new SyncBinding(owner,Guid.NewGuid().ToString("D"),1);
+                first=ActivationPass(r,binding);
+                var one=Inspect(c,tx);DomainEqual(baseline,one);
+                second=ActivationPass(r,binding);
+                var two=Inspect(c,tx);Equal(one,two);
+                Require(r.Number("SELECT count(*) FROM sync_outbox WHERE state!='pending' OR attempts!=0 OR receipt_json IS NOT NULL;")==0,"UNEXPECTED_REMOTE_STATE");
+                pending=r.Number("SELECT count(*) FROM sync_outbox;");
+                dependencies=r.Number("SELECT count(*) FROM sync_dependencies;");
+                tx.Commit();committed=true;
+            }
+            runtime.ProtectRead();SyncOutboxSchema.Verify(runtime);GameplayEventSchema.Verify(runtime);
+            var after=Inspect(RuntimePath);DomainEqual(baseline,after);
+            Require(StatisticsFingerprint(runtime)==statsBefore,"RUNTIME_STATISTICS_CHANGED");
+            var metadata=Metadata(RuntimePath);Require(metadata.SecuritySha256==preMetadata.SecuritySha256,"RUNTIME_ACL_CHANGED");
+            Require(Metadata(backup)==privateBefore,"FRESH_BACKUP_CHANGED");
+            var result=new{Status="COMPLETED_IN_CODE",Phase="B05.3B.2B",DateUtc=DateTimeOffset.UtcNow,PrivateRoot=root,
+                Backup=backup,BackupSha256=expectedBackupHash,BackupSize=privateBefore.Size,FreeSpaceBytes=available,
+                RuntimeBefore=preMetadata,RuntimeAfter=metadata,RuntimeFileIdentityPreserved=true,
+                BaseVersion=2,GameplayVersion=1,SyncVersion=1,FirstPass=first,SecondPass=second,
+                Pending=pending,Dependencies=dependencies,Integrity=after.Integrity,ForeignKeysValid=after.ForeignKeysValid,
+                DomainUnchanged=true,StatisticsUnchanged=true,BackupUnchanged=true,NoRemoteConfirmed=true,ManualGodotValidation="PENDING"};
+            File.WriteAllText(Path.Combine(root,"activation-result.json"),JsonSerializer.Serialize(result,Json),new UTF8Encoding(false));
+            Console.WriteLine(JsonSerializer.Serialize(result));return 0;
+        }
+        catch(Exception error)
+        {
+            // No restore. Stop and record whether commit actually happened; do not attempt further writes.
+            string code=error is SaveException safe?safe.Code:"ACTIVATION_FAILED";
+            File.WriteAllText(Path.Combine(root,"activation-failure.json"),JsonSerializer.Serialize(new{Phase="B05.3B.2B",DateUtc=DateTimeOffset.UtcNow,
+                Code=code,Committed=committed,RestorePerformed=false},Json),new UTF8Encoding(false));
+            throw new SaveException(code);
+        }
+    }
+}
+

@@ -1,0 +1,88 @@
+[gd_scene format=3 uid="uid://drukiydc1ox56"]
+
+[ext_resource type="Script" uid="uid://ccqe0omeaa3t0" path="res://scripts/FuenteRecurso.cs" id="1_nndm1"]
+[ext_resource type="PackedScene" uid="uid://k03pj44sgqi" path="res://scenes/props/item_platano.tscn" id="2_vtp7p"]
+[ext_resource type="Texture2D" uid="uid://ctey6hw17nvds" path="res://assets/sprites/fondos/selva/PALMERAS DERECHA.png" id="3_nndm1"]
+[ext_resource type="Texture2D" uid="uid://c1s6hahpe4cxa" path="res://assets/sprites/fondos/selva/PALMERAS MAL ESTADO DERECHA.png" id="4_vtp7p"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_eull6"]
+atlas = ExtResource("3_nndm1")
+region = Rect2(0, 0, 32, 96)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_3jawc"]
+atlas = ExtResource("3_nndm1")
+region = Rect2(32, 0, 32, 96)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_8rbca"]
+atlas = ExtResource("3_nndm1")
+region = Rect2(64, 0, 32, 96)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_nndm1"]
+atlas = ExtResource("4_vtp7p")
+region = Rect2(64, 0, 32, 96)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_vtp7p"]
+atlas = ExtResource("4_vtp7p")
+region = Rect2(32, 0, 32, 96)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_61y3k"]
+atlas = ExtResource("4_vtp7p")
+region = Rect2(0, 0, 32, 96)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_g5x2f"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_eull6")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_3jawc")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_8rbca")
+}],
+"loop": true,
+"name": &"palmera",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_nndm1")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_vtp7p")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_61y3k")
+}],
+"loop": true,
+"name": &"palmera_bad",
+"speed": 5.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_7rqrc"]
+size = Vector2(32, 98)
+
+[node name="FuentePalmera2" type="Area2D" unique_id=113170801]
+script = ExtResource("1_nndm1")
+EscenaRecurso = ExtResource("2_vtp7p")
+AnimacionBase = "palmera"
+
+[node name="PuntoDrop" type="Marker2D" parent="." unique_id=342570844]
+position = Vector2(0, -30)
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=1174918]
+position = Vector2(0, -8)
+sprite_frames = SubResource("SpriteFrames_g5x2f")
+animation = &"palmera"
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=1297744957]
+position = Vector2(0, -9)
+shape = SubResource("RectangleShape2D_7rqrc")
+
+[node name="Indicador" type="Label" parent="." unique_id=1347437028]
+offset_left = -13.0
+offset_top = -1.0
+offset_right = 7.0
+offset_bottom = 22.0
+text = "[E]"

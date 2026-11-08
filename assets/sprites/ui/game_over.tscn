@@ -1,0 +1,73 @@
+[gd_scene format=3 uid="uid://c4dva2dlnhjua"]
+
+[ext_resource type="Script" uid="uid://dikbywrylaxt5" path="res://assets/sprites/ui/GameOver.cs" id="1_dwt0w"]
+[ext_resource type="Texture2D" uid="uid://31ixg0jb2n4v" path="res://assets/sprites/ui/gameover.jpg" id="1_wwd4q"]
+[ext_resource type="Texture2D" uid="uid://uxcn0ifbg8ug" path="res://assets/sprites/ui/BOTONES 1_0001.png" id="2_tw8f4"]
+[ext_resource type="PackedScene" uid="uid://bxw8mxlhurrf8" path="res://scenes/levels/menu_niveles.tscn" id="2_vtuc7"]
+[ext_resource type="Texture2D" uid="uid://dawc1fb4wan0m" path="res://assets/sprites/ui/BOTONES 1_0004.png" id="3_dwt0w"]
+[ext_resource type="Script" uid="uid://d27kpos4abex5" path="res://scripts/EfectoBoton.cs" id="5_wnsi2"]
+
+[node name="GameOver" type="CanvasLayer" unique_id=302705380]
+script = ExtResource("1_dwt0w")
+EscenaMenuNiveles = ExtResource("2_vtuc7")
+metadata/_edit_vertical_guides_ = [319.0]
+
+[node name="Pantalla" type="Control" parent="." unique_id=1538753738]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="FondoImagen" type="TextureRect" parent="Pantalla" unique_id=263078588]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -47.0
+offset_top = -14.0
+offset_right = 19.666687
+offset_bottom = 23.5
+grow_horizontal = 2
+grow_vertical = 2
+texture = ExtResource("1_wwd4q")
+expand_mode = 1
+
+[node name="Oscurecer" type="ColorRect" parent="Pantalla" unique_id=999964812]
+z_index = -1
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 882.0
+offset_top = -100.0
+offset_right = 882.0
+offset_bottom = -100.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(1, 1, 1, 0)
+
+[node name="Botones" type="HBoxContainer" parent="Pantalla" unique_id=794427084]
+layout_mode = 1
+anchors_preset = -1
+offset_left = 237.25
+offset_top = 268.79
+offset_right = 330.25018
+offset_bottom = 308.79007
+scale = Vector2(1.845, 1.845)
+theme_override_constants/separation = 13
+
+[node name="BotonReintentar" type="Button" parent="Pantalla/Botones" unique_id=1757004404]
+layout_mode = 2
+icon = ExtResource("2_tw8f4")
+
+[node name="Efecto" type="Node" parent="Pantalla/Botones/BotonReintentar" unique_id=1375787172]
+script = ExtResource("5_wnsi2")
+
+[node name="BotonNiveles" type="Button" parent="Pantalla/Botones" unique_id=914133126]
+layout_mode = 2
+icon = ExtResource("3_dwt0w")
+
+[node name="Efecto" type="Node" parent="Pantalla/Botones/BotonNiveles" unique_id=1768477172]
+script = ExtResource("5_wnsi2")

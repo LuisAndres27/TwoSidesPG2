@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <RuntimeFrameworkVersion>8.0.30</RuntimeFrameworkVersion>
+    <TargetLatestRuntimePatch>false</TargetLatestRuntimePatch>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../src/TwoSides.LocalPersistence.csproj" />
+    <Compile Include="Program.cs.txt" />
+    <Compile Include="OutboxTrial.cs.txt" />
+    <Compile Include="OutboxActivation.cs.txt" />
+    <Compile Include="../../integration/sqlite/RealGameCatalog.cs" Link="RealGameCatalog.cs" />
+  </ItemGroup>
+</Project>

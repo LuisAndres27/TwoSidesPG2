@@ -1,0 +1,417 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
+using Microsoft.Data.Sqlite;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static partial class Program
+{
+    private const string Project=@"C:\Users\luis2\OneDrive\Desktop\PRUEBA\TWO SIDES PRUEBA\Two-Sides PRUEBA";
+    private static readonly string Local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    private static readonly string Store=Path.Combine(Local,"TwoSides","ReconstructionTests","copy-06dc7ade-b3cd-425b-8d79-90dde8ef1ac6");
+    private static readonly (string Alias,string Path)[] Sources={
+        ("historical-progress",Path.Combine(Store,"game-progress","save.sqlite3")),
+        ("historical-infrastructure",Path.Combine(Store,"persistence","save.sqlite3")),
+        ("runtime-game",Path.Combine(Project,"local-persistence",".work","runtime-game","save.sqlite3"))};
+    private static readonly JsonSerializerOptions Json=new(){WriteIndented=true};
+    private enum Role{Backup,Rehearsal,Failure,Restored,WalTest}
+    private sealed record FileMetadata(long Size,long ModifiedUtcTicks,string Sha256,string SecuritySha256);
+    private sealed record TableState(string Name,long Rows,string Sha256,string DefinitionSha256);
+    private sealed record Snapshot(int Version,long ApplicationId,string Integrity,bool ForeignKeysValid,TableState[] Tables,string SchemaSha256);
+    private sealed class CopyDatabase:ISaveDatabase
+    {
+        internal readonly string Path;internal readonly Role Role;private readonly string _root;
+        internal CopyDatabase(string root,string path,Role role){_root=root;Path=path;Role=role;Check();}
+        internal void Check(){Require(System.IO.Path.GetDirectoryName(Path)==_root && File.Exists(Path),"UNOWNED_COPY");Guard(_root);Guard(Path);Require(!Sources.Any(s=>Same(s.Path,Path)),"PROTECTED_SOURCE");}
+        public SqliteConnection Open(){Check();return Connection(Path,Role is Role.Rehearsal or Role.Failure);}
+    }
+    private static void Require(bool ok,string code){if(!ok)throw new SaveException(code);}
+    private static bool Same(string a,string b)=>string.Equals(Path.GetFullPath(a),Path.GetFullPath(b),StringComparison.OrdinalIgnoreCase);
+    private static string Hash(byte[] bytes)=>Convert.ToHexString(SHA256.HashData(bytes));
+    private static string Hash(string text)=>Hash(Encoding.UTF8.GetBytes(text));
+    private static string FileHash(string path){using var s=File.OpenRead(path);return Convert.ToHexString(SHA256.HashData(s));}
+    private static void Guard(string path)=>Require((File.GetAttributes(path)&FileAttributes.ReparsePoint)==0,"LINKED_PATH");
+    private static void GuardChain(string path,string anchor)
+    {
+        Require(Same(path,anchor)||Path.GetFullPath(path).StartsWith(Path.GetFullPath(anchor)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase),"OUTSIDE_ANCHOR");
+        for(string? p=path;p is not null;p=Path.GetDirectoryName(p)){Guard(p);if(Same(p,anchor))return;}
+        throw new SaveException("INVALID_ANCHOR");
+    }
+    private static SqliteConnection Connection(string path,bool writable=false)
+    {
+        var c=new SqliteConnection(new SqliteConnectionStringBuilder{DataSource=path,Mode=writable?SqliteOpenMode.ReadWrite:SqliteOpenMode.ReadOnly,Pooling=false,Cache=SqliteCacheMode.Private,ForeignKeys=true,DefaultTimeout=2}.ToString());
+        try{c.Open();return c;}catch{c.Dispose();throw;}
+    }
+    private static FileMetadata Metadata(string path)
+    {
+        var f=new FileInfo(path);string security="";
+        if(OperatingSystem.IsWindows())security=f.GetAccessControl(AccessControlSections.Access|AccessControlSections.Owner|AccessControlSections.Group).GetSecurityDescriptorSddlForm(AccessControlSections.Access|AccessControlSections.Owner|AccessControlSections.Group);
+        return new(f.Length,f.LastWriteTimeUtc.Ticks,FileHash(path),Hash(security));
+    }
+    private static void WriterCheck()
+    {
+        foreach(var p in Process.GetProcesses())
+        {
+            using(p){string name=p.ProcessName;Require(!name.Contains("Godot",StringComparison.OrdinalIgnoreCase)&&!name.Contains("TwoSides",StringComparison.OrdinalIgnoreCase)&&!name.Contains("Two-Sides",StringComparison.OrdinalIgnoreCase)&&!name.Contains("GameSave.Checks",StringComparison.OrdinalIgnoreCase)&&!name.Contains("Infrastructure.Checks",StringComparison.OrdinalIgnoreCase)&&!name.Equals("dotnet",StringComparison.OrdinalIgnoreCase),"WRITER_PROCESS_OR_GODOT_OPEN");}
+        }
+    }
+    private static List<FileStream> LockSource(string source)
+    {
+        string anchor=source.StartsWith(Project,StringComparison.OrdinalIgnoreCase)?Project:Local;
+        GuardChain(source,anchor);
+        foreach(string suffix in new[]{"-wal","-shm","-journal"})Require(!File.Exists(source+suffix)&&!Directory.Exists(source+suffix),"SIDECAR_PRESENT_NO_SOURCE_RECOVERY_ALLOWED");
+        var locks=new List<FileStream>();
+        try
+        {
+            foreach(string path in new[]{source,Path.Combine(Path.GetDirectoryName(source)!,"store.lease"),Path.Combine(Path.GetDirectoryName(source)!,"ownership.json")})
+            {Guard(path);locks.Add(new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read));}
+            var db=locks[0];db.Position=18;Require(db.ReadByte()==1 && db.ReadByte()==1,"WAL_OR_UNKNOWN_HEADER_REQUIRES_DIFFERENT_PLAN");db.Position=0;
+            return locks;
+        }
+        catch{foreach(var s in locks)s.Dispose();throw;}
+    }
+    private static string Quote(string name)=>"\""+name.Replace("\"","\"\"")+"\"";
+    private static Snapshot Inspect(string path)
+    {
+        using var c=Connection(path);using var tx=c.BeginTransaction(deferred:true);
+        var result=Inspect(c,tx);tx.Commit();return result;
+    }
+    private static Snapshot Inspect(SqliteConnection c,SqliteTransaction tx)
+    {
+        object? Scalar(string sql){using var q=c.CreateCommand();q.Transaction=tx;q.CommandText=sql;return q.ExecuteScalar();}
+        Require((string?)Scalar("PRAGMA integrity_check;")=="ok","INTEGRITY_FAILED");
+        using(var fk=c.CreateCommand()){fk.Transaction=tx;fk.CommandText="PRAGMA foreign_key_check;";using var r=fk.ExecuteReader();Require(!r.Read(),"FOREIGN_KEYS_FAILED");}
+        var schema=new List<string>();var definitions=new List<(string Name,string Sql)>();
+        using(var q=c.CreateCommand())
+        {
+            q.Transaction=tx;q.CommandText="SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name;";using var r=q.ExecuteReader();
+            while(r.Read()){schema.Add(JsonSerializer.Serialize(new object?[]{r.GetString(0),r.GetString(1),r.GetString(2),r.IsDBNull(3)?null:r.GetString(3)}));if(r.GetString(0)=="table")definitions.Add((r.GetString(1),r.GetString(3)));}
+        }
+        var tables=new List<TableState>();
+        foreach(var d in definitions.OrderBy(d=>d.Name,StringComparer.Ordinal))
+        {
+            var rowHashes=new List<string>();using var q=c.CreateCommand();q.Transaction=tx;q.CommandText="SELECT * FROM "+Quote(d.Name)+";";using var r=q.ExecuteReader();
+            while(r.Read())
+            {
+                var values=new string[r.FieldCount];for(int i=0;i<values.Length;i++){object v=r.GetValue(i);values[i]=v is DBNull?"null":v is byte[] blob?"blob:"+Convert.ToBase64String(blob):v.GetType().Name+":"+Convert.ToString(v,CultureInfo.InvariantCulture);}
+                rowHashes.Add(Hash(JsonSerializer.Serialize(values)));
+            }
+            rowHashes.Sort(StringComparer.Ordinal);tables.Add(new(d.Name,rowHashes.Count,Hash(string.Join("\n",rowHashes)),Hash(d.Sql)));
+        }
+        return new Snapshot(Convert.ToInt32(Scalar("PRAGMA user_version;")),Convert.ToInt64(Scalar("PRAGMA application_id;")),"ok",true,tables.ToArray(),Hash(string.Join("\n",schema)));
+    }
+    private static CopyDatabase Backup(string source,string root,string alias,Role role)
+    {
+        string path=Path.Combine(root,$"{alias}-{DateTimeOffset.UtcNow:yyyyMMddTHHmmssZ}-{Guid.NewGuid():N}.{role.ToString().ToLowerInvariant()}.sqlite3");
+        using(new FileStream(path,FileMode.CreateNew,FileAccess.Write,FileShare.None)){}
+        using(var from=Connection(source))using(var to=Connection(path,true))from.BackupDatabase(to);
+        return new(root,path,role);
+    }
+    private static string MigrationSql()
+    {
+        string sql=(string)typeof(GameplayEventSchema).GetField("Sql",BindingFlags.NonPublic|BindingFlags.Static)!.GetRawConstantValue()!;
+        Require(Hash(sql.ReplaceLineEndings("\n"))==GameplayEventSchema.Checksum,"MIGRATION_SQL_DIVERGENCE");return sql;
+    }
+    // Harness only: exact production SQL, constrained to second copies created by this tool.
+    private static bool Migrate(CopyDatabase db,bool fail=false)
+    {
+        db.Check();Require(db.Role is Role.Rehearsal or Role.Failure,"MIGRATION_ROLE_DENIED");SchemaManager.Verify(db);
+        var before=Inspect(db.Path);long extensionTables=before.Tables.LongCount(t=>t.Name.StartsWith("gameplay_",StringComparison.Ordinal));
+        if(extensionTables!=0){GameplayEventSchema.Verify(db);return false;}
+        using var c=db.Open();using var tx=c.BeginTransaction(deferred:false);ExecuteVersionedMigration(c,tx);
+        if(fail)throw new SaveException("SIMULATED_MIGRATION_FAILURE");tx.Commit();return true;
+    }
+    private static void ExecuteVersionedMigration(SqliteConnection c,SqliteTransaction tx)
+    {
+        using var q=c.CreateCommand();q.Transaction=tx;q.CommandText=MigrationSql();q.ExecuteNonQuery();
+        q.CommandText="INSERT INTO gameplay_schema_migrations VALUES(1,'local-gameplay-extension-v1',$hash,$at);";q.Parameters.AddWithValue("$hash",GameplayEventSchema.Checksum);q.Parameters.AddWithValue("$at",SaveValidation.Timestamp(DateTimeOffset.UtcNow));q.ExecuteNonQuery();
+    }
+    private static void Equal(Snapshot a,Snapshot b,bool extended=false)
+    {
+        Require(a.Version==b.Version && a.ApplicationId==b.ApplicationId,"HEADER_CHANGED");
+        foreach(var table in a.Tables)Require(b.Tables.SingleOrDefault(t=>t.Name==table.Name)==table,"BASE_TABLE_CHANGED");
+        if(!extended)Require(a.SchemaSha256==b.SchemaSha256 && a.Tables.Length==b.Tables.Length,"SCHEMA_CHANGED");
+        else Require(b.Tables.Length==a.Tables.Length+4 && b.Tables.Where(t=>t.Name.StartsWith("gameplay_",StringComparison.Ordinal)&&t.Name!="gameplay_schema_migrations").All(t=>t.Rows==0),"RETROACTIVE_OR_UNEXPECTED_DATA");
+    }
+    private static string BaseCompatibility(ISaveDatabase db)
+    {
+        SchemaManager.Verify(db);
+        var stats=new StatisticsService(db,RealGameCatalog.InitialState());var local=stats.GetLocalStatistics();
+        if(local.Data is null)return "empty-profile-valid";
+        var save=new GameSaveService(db,RealGameCatalog.InitialState());string owner=local.Data.LocalPlayerId;
+        _=save.GetLocalProfile();_=save.GetActiveGame(owner);
+        for(int offset=0;;offset+=100){var games=save.GetGameHistory(owner,offset,100);foreach(var g in games){_=save.LoadGame(owner,g.GameId);_=save.GetDecisions(owner,g.GameId);_=save.GetBiomeProgress(owner,g.GameId);}if(games.Count<100)break;}
+        Require(local.Data.Uncollected.Deaths.Value is null,"UNKNOWN_CHANGED_TO_ZERO");
+        return "current-local-services-compatible";
+    }
+    private static string Compatibility(ISaveDatabase db)
+    {
+        string result=BaseCompatibility(db);var local=new StatisticsService(db,RealGameCatalog.InitialState()).GetLocalStatistics();
+        if(local.Data is not null)
+        {
+            string owner=local.Data.LocalPlayerId;var events=new GameplayEventService(db);
+            Require(events.GetEvents(owner).Count==0 && events.GetSessions(owner).Count==0,"RETROACTIVE_EVENTS");
+            Require(events.GetTotals(owner).Deaths.Value is null,"UNKNOWN_CHANGED_TO_ZERO");
+        }
+        return result;
+    }
+    private static object Rehearse(CopyDatabase backup)
+    {
+        string root=Path.GetDirectoryName(backup.Path)!;var baseline=Inspect(backup.Path);
+        var work=Backup(backup.Path,root,"migration-trial",Role.Rehearsal);Require(Migrate(work),"EXPECTED_FIRST_MIGRATION");GameplayEventSchema.Verify(work);var migrated=Inspect(work.Path);Equal(baseline,migrated,true);
+        string h=FileHash(work.Path);Require(!Migrate(work)&&h==FileHash(work.Path),"MIGRATION_NOT_IDEMPOTENT");
+        string compatible;
+        try{compatible=Compatibility(work);}catch(SaveException e){compatible="blocked:"+e.Code;}
+        var failure=Backup(backup.Path,root,"rollback-trial",Role.Failure);string failureHash=FileHash(failure.Path);
+        try{Migrate(failure,true);throw new SaveException("FAILURE_NOT_INJECTED");}catch(SaveException e)when(e.Code=="SIMULATED_MIGRATION_FAILURE"){}
+        Require(failureHash==FileHash(failure.Path),"ROLLBACK_CHANGED_BYTES");Equal(baseline,Inspect(failure.Path));
+        var restored=Backup(backup.Path,root,"restore-trial",Role.Restored);Equal(baseline,Inspect(restored.Path));
+        return new{WorkingCopy=work.Path,WorkingCopyHash=FileHash(work.Path),BaseVersion=2,ExtensionVersion=1,NewTablesEmpty=true,BaseRowsPreserved=true,Idempotent=true,Compatibility=compatible,RollbackCopy=failure.Path,RollbackVerified=true,RestorationCopy=restored.Path,RestorationVerified=true};
+    }
+    private static void SecureRoot(string root)
+    {
+        Require(!Directory.Exists(root),"BACKUP_ROOT_EXISTS");Directory.CreateDirectory(root);GuardChain(root,Local);
+        if(!OperatingSystem.IsWindows())throw new SaveException("WINDOWS_REQUIRED");
+        var security=new DirectorySecurity();security.SetAccessRuleProtection(true,false);
+        foreach(var sid in new[]{WindowsIdentity.GetCurrent().User!,new SecurityIdentifier(WellKnownSidType.LocalSystemSid,null),new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid,null)})
+            security.AddAccessRule(new FileSystemAccessRule(sid,FileSystemRights.FullControl,InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit,PropagationFlags.None,AccessControlType.Allow));
+        new DirectoryInfo(root).SetAccessControl(security);
+    }
+    private const string ReferenceDirectory=@"C:\Users\luis2\AppData\Local\TwoSides\PrivateBackups\D4A1\20261027T052236Z-f814aa070086466c8237dd714f51d9a6";
+    private const string ReferenceManifestHash="7EC1E7101973BC33FB884A778100EF6EF8BD4C27ADA7B123220A50C69DCBEBFF";
+    private const string ReferenceBackupHash="7D791333A03326FF2A4E91DEA0E1BCF5F9F40A8C0D0DB6BA34365305C33A5E0D";
+    private static string RuntimePath=>Sources[2].Path;
+    private static void RequireRuntimePath(string path)=>Require(Path.IsPathFullyQualified(path) && Same(path,RuntimePath) && Same(path,CopyGameDatabase.RuntimePath),"RUNTIME_PATH_NOT_AUTHORIZED");
+    private static T NativeGuard<T>(string method,params object[] args)
+    {
+        var type=typeof(CopyGameDatabase).Assembly.GetType("TwoSides.LocalPersistence.WindowsGuard",true)!;
+        try{return (T)type.GetMethod(method,BindingFlags.Static|BindingFlags.NonPublic)!.Invoke(null,args)!;}
+        catch(TargetInvocationException e)when(e.InnerException is SaveException s){throw new SaveException(s.Code);}
+    }
+    private static void VerifyOwnership(string path,string identity)
+    {
+        Require(new FileInfo(path).Length<=1024,"INVALID_OWNERSHIP");using var document=JsonDocument.Parse(File.ReadAllText(path));var o=document.RootElement;
+        Require(o.GetProperty("Format").GetInt32()==1 && o.GetProperty("Copy").GetString()=="06dc7ade-b3cd-425b-8d79-90dde8ef1ac6" && o.GetProperty("Purpose").GetString()=="copy-runtime-game" && o.GetProperty("Ready").GetBoolean() && o.GetProperty("FileIdentity").GetString()==identity,"RUNTIME_IDENTITY_MISMATCH");
+    }
+    private sealed class RuntimeCapability:ISaveDatabase,IDisposable
+    {
+        private readonly List<SafeFileHandle> _guards=new();private FileStream? _lease,_owner,_read;
+        private SafeFileHandle? _database;private bool _locked,_allowed,_attempted;
+        internal string Identity {get;private set;}="";
+        internal bool Attempted=>_attempted;
+        internal RuntimeCapability()
+        {
+            RequireRuntimePath(RuntimePath);WriterCheck();
+            try
+            {
+                string current=Project;_guards.Add(NativeGuard<SafeFileHandle>("Lock",current,true));
+                foreach(string part in new[]{"local-persistence",".work","runtime-game"}){current=Path.Combine(current,part);_guards.Add(NativeGuard<SafeFileHandle>("Lock",current,true));}
+                _database=NativeGuard<SafeFileHandle>("Lock",RuntimePath,false);_guards.Add(_database);
+                string owner=Path.Combine(current,"ownership.json"),lease=Path.Combine(current,"store.lease");
+                _guards.Add(NativeGuard<SafeFileHandle>("Lock",owner,false));_guards.Add(NativeGuard<SafeFileHandle>("Lock",lease,false));
+                _owner=new FileStream(owner,FileMode.Open,FileAccess.Read,FileShare.Read);
+                _lease=new FileStream(lease,FileMode.Open,FileAccess.ReadWrite,FileShare.Read);
+                if(OperatingSystem.IsWindows()){_lease.Lock(0,1);_locked=true;}else throw new SaveException("WINDOWS_REQUIRED");
+                Identity=NativeGuard<string>("Identity",_database);VerifyOwnership(owner,Identity);ProtectRead();
+            }
+            catch{Dispose();throw;}
+        }
+        private void Ensure()
+        {
+            RequireRuntimePath(RuntimePath);Require(_database is not null && !_database.IsClosed,"RUNTIME_CAPABILITY_CLOSED");
+            using var check=NativeGuard<SafeFileHandle>("Lock",RuntimePath,false);Require(NativeGuard<string>("Identity",check)==Identity,"RUNTIME_IDENTITY_CHANGED");
+            VerifyOwnership(Path.Combine(Path.GetDirectoryName(RuntimePath)!,"ownership.json"),Identity);
+        }
+        internal void ProtectRead()
+        {
+            Ensure();foreach(string suffix in new[]{"-wal","-shm","-journal"})Require(!File.Exists(RuntimePath+suffix)&&!Directory.Exists(RuntimePath+suffix),"RUNTIME_SIDECAR_PRESENT");
+            _read??=new FileStream(RuntimePath,FileMode.Open,FileAccess.Read,FileShare.Read);
+            _read.Position=18;Require(_read.ReadByte()==1&&_read.ReadByte()==1,"RUNTIME_WAL_HEADER");_read.Position=0;
+        }
+        public SqliteConnection Open(){Ensure();return Connection(RuntimePath);}
+        internal void AuthorizeOneWrite(){Ensure();Require(_read is not null && !_attempted,"RUNTIME_WRITE_GATE");WriterCheck();_allowed=true;_read!.Dispose();_read=null;}
+        internal SqliteConnection OpenMigration()
+        {Ensure();Require(_allowed&&!_attempted&&_read is null,"RUNTIME_WRITE_GATE");_attempted=true;return Connection(RuntimePath,true);}
+        public void Dispose()
+        {
+            _read?.Dispose();_read=null;_owner?.Dispose();_owner=null;
+            if(_locked&&_lease is not null&&OperatingSystem.IsWindows()){_lease.Unlock(0,1);_locked=false;}
+            _lease?.Dispose();_lease=null;foreach(var h in _guards)h.Dispose();_guards.Clear();
+        }
+    }
+    private static CopyDatabase ReferenceBackup()
+    {
+        string manifest=Path.Combine(ReferenceDirectory,"manifest.json");GuardChain(manifest,Local);
+        Require(FileHash(manifest)==ReferenceManifestHash,"REFERENCE_MANIFEST_HASH_MISMATCH");
+        using var document=JsonDocument.Parse(File.ReadAllText(manifest));
+        var matches=document.RootElement.GetProperty("Results").EnumerateArray().Where(r=>r.GetProperty("Alias").GetString()=="runtime-game").ToArray();
+        Require(matches.Length==1,"REFERENCE_RUNTIME_AMBIGUOUS");var entry=matches[0];
+        Require(Same(entry.GetProperty("Source").GetString()!,RuntimePath) && entry.GetProperty("Status").GetString()=="verified","REFERENCE_SOURCE_MISMATCH");
+        string path=entry.GetProperty("Backup").GetString()!;Require(Path.GetDirectoryName(path)==ReferenceDirectory,"REFERENCE_BACKUP_PATH_MISMATCH");GuardChain(path,Local);
+        Require(entry.GetProperty("Sha256").GetString()==ReferenceBackupHash && FileHash(path)==ReferenceBackupHash,"REFERENCE_BACKUP_HASH_MISMATCH");
+        var reference=new CopyDatabase(ReferenceDirectory,path,Role.Backup);var snapshot=Inspect(path);
+        Require(snapshot.Version==2 && snapshot.ApplicationId==0x54535254,"REFERENCE_SCHEMA_MISMATCH");_=BaseCompatibility(reference);return reference;
+    }
+    private static int MigrateRuntimeControlled()
+    {
+        Require(Same(Environment.CurrentDirectory,Project),"WRONG_PROJECT");WriterCheck();
+        using var runtime=new RuntimeCapability();var reference=ReferenceBackup();
+        var before=Metadata(RuntimePath);var baseline=Inspect(RuntimePath);
+        Require(baseline.Version==2 && baseline.ApplicationId==0x54535254,"RUNTIME_SCHEMA_MISMATCH");
+        Require(!baseline.Tables.Any(t=>t.Name.StartsWith("gameplay_",StringComparison.Ordinal)),"RUNTIME_ALREADY_EXTENDED_NO_REPEAT");
+        Require(BaseCompatibility(runtime)=="current-local-services-compatible","RUNTIME_BASE_INCOMPATIBLE");
+        long required=checked(before.Size*12+64L*1024*1024);long available=new DriveInfo(Path.GetPathRoot(Local)!).AvailableFreeSpace;Require(available>=required,"INSUFFICIENT_BACKUP_SPACE");
+        string root=Path.Combine(Local,"TwoSides","PrivateBackups","D4A2",DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssZ")+"-"+Guid.NewGuid().ToString("N"));SecureRoot(root);
+        var referenceSnapshot=Inspect(reference.Path);bool referenceMatchesCurrent=JsonSerializer.Serialize(referenceSnapshot)==JsonSerializer.Serialize(baseline);
+        string preManifest=Path.Combine(root,"before.json");
+        File.WriteAllText(preManifest,JsonSerializer.Serialize(new{Phase="B04.2B.2B.2D.4A.2",DateUtc=DateTimeOffset.UtcNow,Runtime=RuntimePath,Identity=runtime.Identity,Before=before,Baseline=baseline,ReferenceBackup=reference.Path,ReferenceBackupSha256=ReferenceBackupHash,ReferenceMatchesCurrentLogical=referenceMatchesCurrent,AvailableBytes=available,RequiredBytes=required},Json),new UTF8Encoding(false));
+        bool committed=false;CopyDatabase? backup=null;object? rehearsal=null;
+        try
+        {
+            backup=Backup(RuntimePath,root,"runtime-immediate",Role.Backup);Equal(baseline,Inspect(backup.Path));
+            Require(BaseCompatibility(backup)=="current-local-services-compatible","IMMEDIATE_BACKUP_INCOMPATIBLE");
+            rehearsal=Rehearse(backup);Require((string?)rehearsal.GetType().GetProperty("Compatibility")!.GetValue(rehearsal)=="current-local-services-compatible","FINAL_REHEARSAL_FAILED");
+            Require(before==Metadata(RuntimePath),"RUNTIME_CHANGED_DURING_PREPARATION");WriterCheck();
+            runtime.AuthorizeOneWrite();
+            using(var c=runtime.OpenMigration())
+            {
+                using(var q=c.CreateCommand()){q.CommandText="PRAGMA synchronous=FULL; PRAGMA busy_timeout=1000;";q.ExecuteNonQuery();}
+                using var tx=c.BeginTransaction(deferred:false);Equal(baseline,Inspect(c,tx));
+                ExecuteVersionedMigration(c,tx);Equal(baseline,Inspect(c,tx),true);tx.Commit();committed=true;
+            }
+            runtime.ProtectRead();GameplayEventSchema.Verify(runtime);var after=Inspect(RuntimePath);Equal(baseline,after,true);
+            Require(Compatibility(runtime)=="current-local-services-compatible","POST_MIGRATION_INCOMPATIBLE");
+            var metadata=Metadata(RuntimePath);Require(metadata.SecuritySha256==before.SecuritySha256,"RUNTIME_SECURITY_CHANGED");
+            File.WriteAllText(Path.Combine(root,"after.json"),JsonSerializer.Serialize(new{Phase="B04.2B.2B.2D.4A.2",DateUtc=DateTimeOffset.UtcNow,Status="COMPLETED",Runtime=RuntimePath,Identity=runtime.Identity,After=metadata,Snapshot=after,Backup=backup.Path,BackupSha256=FileHash(backup.Path),BeforeManifest=preManifest,Rehearsal=rehearsal,BasePreserved=true,EventsEmpty=true,IdentityPreserved=true,SecurityPreserved=true,RestorationPerformed=false},Json),new UTF8Encoding(false));
+            Console.WriteLine(JsonSerializer.Serialize(new{Status="COMPLETED",Manifest=Path.Combine(root,"after.json"),Backup=backup.Path,BackupSha256=FileHash(backup.Path),RuntimeBeforeSha256=before.Sha256,RuntimeAfterSha256=metadata.Sha256,BaseVersion=2,ExtensionVersion=1,Integrity="ok",BasePreserved=true,IdentityPreserved=true,SecurityPreserved=true,EventsEmpty=true,ReferenceMatchesCurrentLogical=referenceMatchesCurrent}));return 0;
+        }
+        catch(Exception e)
+        {
+            string code=e is SaveException s?s.Code:e.GetType().Name;bool rollbackVerified=false;
+            try{runtime.ProtectRead();Equal(baseline,Inspect(RuntimePath));rollbackVerified=true;}catch{}
+            File.WriteAllText(Path.Combine(root,"stopped.json"),JsonSerializer.Serialize(new{Phase="B04.2B.2B.2D.4A.2",DateUtc=DateTimeOffset.UtcNow,Status="STOPPED",Code=code,WriteAttempted=runtime.Attempted,Committed=committed,RollbackVerified=rollbackVerified,Backup=backup?.Path,BeforeManifest=preManifest,Rehearsal=rehearsal,RestorationPerformed=false},Json),new UTF8Encoding(false));
+            Console.WriteLine(JsonSerializer.Serialize(new{Status="STOPPED",Code=code,Manifest=Path.Combine(root,"stopped.json"),Committed=committed,RollbackVerified=rollbackVerified}));return 1;
+        }
+    }
+    private static int RealRun()
+    {
+        Require(Same(Environment.CurrentDirectory,Project),"WRONG_PROJECT");WriterCheck();
+        string root=Path.Combine(Local,"TwoSides","PrivateBackups","D4A1",DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssZ")+"-"+Guid.NewGuid().ToString("N"));
+        Require(!root.Contains("OneDrive",StringComparison.OrdinalIgnoreCase),"CLOUD_DESTINATION");SecureRoot(root);
+        var results=new List<object>();bool runtimeValidated=false;
+        foreach(var source in Sources)
+        {
+            List<FileStream>? locks=null;FileMetadata? before=null;
+            try
+            {
+                WriterCheck();locks=LockSource(source.Path);before=Metadata(source.Path);
+                var original=Inspect(source.Path);Require(original.Version==2,"UNSUPPORTED_SCHEMA");
+                var backup=Backup(source.Path,root,source.Alias,Role.Backup);var verified=Inspect(backup.Path);Equal(original,verified);
+                var rehearsal=Rehearse(backup);Require(before==Metadata(source.Path),"ORIGINAL_METADATA_CHANGED");
+                string compatible=(string)rehearsal.GetType().GetProperty("Compatibility")!.GetValue(rehearsal)!;
+                if(source.Alias=="runtime-game")runtimeValidated=compatible=="current-local-services-compatible";
+                results.Add(new{Source=source.Path,Alias=source.Alias,Status="verified",Backup=backup.Path,DateUtc=DateTimeOffset.UtcNow,Size=new FileInfo(backup.Path).Length,Sha256=FileHash(backup.Path),SchemaVersion=verified.Version,Method="SQLite BackupDatabase; source mode=ReadOnly; deny-write read handles; no sidecars; private unsynced destination",Integrity=verified.Integrity,ForeignKeysValid=verified.ForeignKeysValid,SourceMetadata=before,Snapshot=verified,Rehearsal=rehearsal});
+                Console.WriteLine(JsonSerializer.Serialize(new{Alias=source.Alias,Backup=backup.Path,Size=new FileInfo(backup.Path).Length,Sha256=FileHash(backup.Path),Integrity="ok",BaseRowsPreserved=true,Compatibility=compatible}));
+            }
+            catch(Exception e)
+            {
+                bool untouched=before is null || before==Metadata(source.Path);
+                results.Add(new{Source=source.Path,Alias=source.Alias,Status="blocked",Code=e is SaveException s?s.Code:e.GetType().Name,OriginalUnchanged=untouched});
+                Console.WriteLine(JsonSerializer.Serialize(new{Alias=source.Alias,Status="blocked",Code=e is SaveException problem?problem.Code:e.GetType().Name,OriginalUnchanged=untouched}));
+            }
+            finally{if(locks is not null)foreach(var handle in locks)handle.Dispose();}
+        }
+        string manifest=Path.Combine(root,"manifest.json");File.WriteAllText(manifest,JsonSerializer.Serialize(new{Phase="B04.2B.2B.2D.4A.1",DateUtc=DateTimeOffset.UtcNow,RuntimeValidated=runtimeValidated,Results=results},Json),new UTF8Encoding(false));
+        Console.WriteLine(JsonSerializer.Serialize(new{Manifest=manifest,ManifestSha256=FileHash(manifest),RuntimeValidated=runtimeValidated,Status=runtimeValidated?"COMPLETED":"PARTIAL"}));return 0;
+    }
+    private static int SelfTest()
+    {
+        using var sandbox=new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot);var source=sandbox.CreateDatabase();SchemaManager.Initialize(source);
+        var save=new GameSaveService(source,RealGameCatalog.InitialState());string owner=Guid.NewGuid().ToString("D"),game=Guid.NewGuid().ToString("D");
+        save.CreateLocalProfile(Guid.NewGuid().ToString("D"),owner,"Respaldo sintético");save.CreateNewGame(new(Guid.NewGuid().ToString("D"),owner,game));
+        string root=Path.Combine(Project,"local-persistence",".work","backup-rehearsal-tests",Guid.NewGuid().ToString("N"));Directory.CreateDirectory(root);
+        try
+        {
+            string hash=FileHash(source.Path);var backup=Backup(source.Path,root,"synthetic",Role.Backup);Equal(Inspect(source.Path),Inspect(backup.Path));Console.WriteLine("PASS SQLite backup preserves all base rows schema and relations");
+            try{Migrate(backup);throw new Exception("Backup role writable");}catch(SaveException e)when(e.Code=="MIGRATION_ROLE_DENIED"){}Console.WriteLine("PASS immutable backup role cannot be migrated");
+            var trial=Rehearse(backup);Require(trial.GetType().GetProperty("Compatibility")!.GetValue(trial)?.ToString()=="current-local-services-compatible","COMPATIBILITY_FAILED");Console.WriteLine("PASS migration exact SQL preserves data and adds empty extension");Console.WriteLine("PASS second migration is byte-idempotent");Console.WriteLine("PASS failed migration rolls back schema and bytes");Console.WriteLine("PASS restoration into isolated second copy is logically identical");
+            using(var writer=new FileStream(source.Path,FileMode.Open,FileAccess.ReadWrite,FileShare.ReadWrite))
+            {try{using var denied=new FileStream(source.Path,FileMode.Open,FileAccess.Read,FileShare.Read);throw new Exception("Writer not detected");}catch(IOException){}}Console.WriteLine("PASS read guard refuses existing write handle");
+            var wal=sandbox.CreateDatabase();
+            using(var writer=Connection(wal.Path,true))
+            {
+                using(var q=writer.CreateCommand()){q.CommandText="PRAGMA journal_mode=WAL; CREATE TABLE wal_probe(v INTEGER); INSERT INTO wal_probe VALUES(7);";q.ExecuteNonQuery();}
+                Require(File.Exists(wal.Path+"-wal"),"WAL_TEST_NOT_ACTIVE");var walCopy=Backup(wal.Path,root,"wal-synthetic",Role.WalTest);
+                using var read=walCopy.Open();using var query=read.CreateCommand();query.CommandText="SELECT v FROM wal_probe;";Require(Convert.ToInt32(query.ExecuteScalar())==7,"WAL_TRANSACTION_OMITTED");
+            }
+            Console.WriteLine("PASS SQLite backup includes committed WAL transaction on synthetic source");
+            Require(FileHash(source.Path)==hash,"SYNTHETIC_SOURCE_CHANGED");Console.WriteLine("PASS source file bytes remain intact");Console.WriteLine("Backup rehearsal: 9 passed, 0 failed; synthetic sources only.");return 0;
+        }
+        finally
+        {
+            Require(root.StartsWith(Path.Combine(Project,"local-persistence",".work","backup-rehearsal-tests")+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase),"UNSAFE_CLEANUP");
+            foreach(string file in Directory.GetFiles(root)){Guard(file);File.Delete(file);}Directory.Delete(root,false);
+        }
+    }
+    private static int RuntimeMigrationSelfTest()
+    {
+        Require(SelfTest()==0,"BACKUP_REGRESSION_FAILED");
+        RequireRuntimePath(RuntimePath);
+        foreach(string path in new[]{Sources[0].Path,Sources[1].Path,RuntimePath+".other"})
+        {try{RequireRuntimePath(path);throw new Exception("Alternative runtime allowed");}catch(SaveException e)when(e.Code=="RUNTIME_PATH_NOT_AUTHORIZED"){}}
+        Console.WriteLine("PASS runtime gate accepts only the exact authorized path");
+        using var sandbox=new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot);var db=sandbox.CreateDatabase();SchemaManager.Initialize(db);
+        string root=Path.Combine(Project,"local-persistence",".work","backup-rehearsal-tests",Guid.NewGuid().ToString("N"));Directory.CreateDirectory(root);
+        try
+        {
+            using var native=NativeGuard<SafeFileHandle>("Lock",db.Path,false);string identity=NativeGuard<string>("Identity",native);
+            string ownership=Path.Combine(root,"ownership-test.json");
+            void Owner(string id)=>File.WriteAllText(ownership,JsonSerializer.Serialize(new{Format=1,Copy="06dc7ade-b3cd-425b-8d79-90dde8ef1ac6",Purpose="copy-runtime-game",Ready=true,FileIdentity=id}));
+            Owner(identity);VerifyOwnership(ownership,identity);Console.WriteLine("PASS native identity and ownership match without opening real stores");
+            Owner("different-file");try{VerifyOwnership(ownership,identity);throw new Exception("Identity mismatch allowed");}catch(SaveException e)when(e.Code=="RUNTIME_IDENTITY_MISMATCH"){}
+            Console.WriteLine("PASS ownership mismatch fails closed");
+            var trial=Backup(db.Path,root,"transaction-gate",Role.Rehearsal);var baseline=Inspect(trial.Path);string h=FileHash(trial.Path);
+            using(var c=trial.Open())
+            {
+                using var tx=c.BeginTransaction(deferred:false);Equal(baseline,Inspect(c,tx));ExecuteVersionedMigration(c,tx);Equal(baseline,Inspect(c,tx),true);
+            }
+            Require(FileHash(trial.Path)==h,"TRANSACTION_ROLLBACK_FAILED");Console.WriteLine("PASS in-transaction conservation checks roll back without commit");
+            var before=Metadata(db.Path);GameplayEventSchema.MigrateSynthetic(db);
+            using(var second=NativeGuard<SafeFileHandle>("Lock",db.Path,false))Require(NativeGuard<string>("Identity",second)==identity,"IDENTITY_CHANGED");
+            Require(Metadata(db.Path).SecuritySha256==before.SecuritySha256,"SECURITY_CHANGED");Console.WriteLine("PASS in-place DDL preserves native file identity owner and ACL");
+            var current=sandbox.CreateDatabase();SchemaManager.Initialize(current);var save=new GameSaveService(current,RealGameCatalog.InitialState());string player=Guid.NewGuid().ToString("D");save.CreateLocalProfile(Guid.NewGuid().ToString("D"),player,"Referencia sintética");
+            var old=Backup(current.Path,root,"older-reference",Role.Backup);var profile=save.GetLocalProfile()!;save.UpdateDisplayName(Guid.NewGuid().ToString("D"),player,profile.Revision,"Estado nuevo sintético");
+            Require(Inspect(current.Path).Tables.Single(t=>t.Name=="local_profiles").Sha256!=Inspect(old.Path).Tables.Single(t=>t.Name=="local_profiles").Sha256,"OLD_REFERENCE_ASSUMED_CURRENT");
+            var immediate=Backup(current.Path,root,"new-immediate",Role.Backup);Equal(Inspect(current.Path),Inspect(immediate.Path));Console.WriteLine("PASS old backup is not assumed current and new snapshot matches current state");
+            Console.WriteLine("Runtime migration safeguards: 15 passed, 0 failed; synthetic stores only.");return 0;
+        }
+        finally
+        {
+            Require(root.StartsWith(Path.Combine(Project,"local-persistence",".work","backup-rehearsal-tests")+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase),"UNSAFE_CLEANUP");
+            foreach(string file in Directory.GetFiles(root)){Guard(file);File.Delete(file);}Directory.Delete(root,false);
+        }
+    }
+    public static int Main(string[] args)
+    {
+        try
+        {
+            if(args.Length==1 && args[0]=="--outbox-trial")return OutboxTrial();
+            if(args.Length==1 && args[0]=="--activate-runtime-outbox")return ActivateRuntimeOutbox();
+            if(args.Length==2 && args[0]=="--outbox-trial-restart")return OutboxTrialRestart(args[1]);
+            Require(OperatingSystem.IsWindows(),"WINDOWS_REQUIRED");Require(args.Length==1,"INVALID_MODE");
+            return args[0] switch{"--self-test"=>SelfTest(),"--runtime-migration-self-test"=>RuntimeMigrationSelfTest(),"--backup-and-rehearse"=>RealRun(),"--migrate-runtime-controlled"=>MigrateRuntimeControlled(),_=>throw new SaveException("INVALID_MODE")};
+        }
+        catch(Exception e){Console.WriteLine("BLOCKED "+(e is SaveException s?s.Code:e.GetType().Name));return 1;}
+    }
+}

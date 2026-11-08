@@ -1,0 +1,138 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class Program
+{
+ static int count;static string Id()=>Guid.NewGuid().ToString("D");
+ static void Check(bool ok,string label){if(!ok)throw new Exception(label);count++;Console.WriteLine("PASS "+label);}
+ static void Reject(Action action,string code){try{action();throw new Exception("expected rejection "+code);}catch(SaveException e){Check(e.Code==code,code+" actual="+e.Code);}}
+ sealed class F:IDisposable {
+  public readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);public readonly SyntheticDatabase Db;public readonly string Owner=Id(),Game=Id();public StatisticsTelemetry Stats;public GameSaveService Save;
+  public F(bool initialize=true){Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);if(initialize)StatisticsTelemetry.Initialize(Db);Stats=new(Db);Save=new(Db,RealGameCatalog.InitialState(),extension:initialize?Stats:null);}
+  public long N(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+  public string Text(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return (string)q.ExecuteScalar()!;}
+  public void Sql(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;q.ExecuteNonQuery();}
+  public void Start(){Save.CreateLocalProfile(Id(),Owner,"PRIVATE-PLAYER-B77");Save.CreateNewGame(new(Id(),Owner,Game));}
+  public long Revision=>Save.LoadGame(Owner,Game).Game.Revision;
+  public RecordDecisionCommand Decision(string biome,string option)=>new(Id(),Id(),Owner,Game,Revision,biome,biome switch{"ocean"=>"ocean_waste_disposal","jungle"=>"jungle_transport_route","desert"=>"desert_cat_abandonment","forest"=>"forest_industrial_pesticides",_=>"tundra_fossil_extraction"},option,option=="reject"?"healthy":"degraded","{\"stateKind\":\""+(option=="reject"?"healthy":"degraded")+"\"}");
+  public void Finish(string biome,string option){Save.EnterBiome(new(Id(),Owner,Game,Revision,biome,"human"));var cmd=Decision(biome,option);Save.RecordDecision(cmd);Save.RecordDecision(cmd);Stats.BiomeIntent=biome;Save.CompleteBiome(new(Id(),Owner,Game,Revision,biome,option=="reject"?"good":"bad"));Stats.BiomeIntent=null;}
+  public void Dispose()=>Sandbox.Dispose();
+ }
+ static void MigrationTests(){
+  using(var f=new F(false)){
+   f.Start();var before=JsonSerializer.Serialize(f.Save.LoadGame(f.Owner,f.Game));
+   try{StatisticsTelemetry.Initialize(f.Db,()=>throw new InvalidOperationException("synthetic migration failure"));throw new Exception("expected migration failure");}catch(InvalidOperationException){}
+   Check(f.N("SELECT count(*) FROM sqlite_master WHERE name GLOB 'statistics_*' OR name GLOB 'gameplay_*'")==0,"migration failure rolls back both optional extensions");
+   Check(JsonSerializer.Serialize(f.Save.LoadGame(f.Owner,f.Game))==before,"migration rollback preserves progress");
+   StatisticsTelemetry.Initialize(f.Db);Check(f.N("SELECT count(*) FROM statistics_coverage WHERE code='PREEXISTING_PROGRESS_NO_BACKFILL'")==1,"existing progress marked, never silently imported");
+   StatisticsTelemetry.Initialize(f.Db);Check(f.N("SELECT count(*) FROM statistics_schema_migrations")==1,"migration repeated once");
+  }
+  using(var f=new F(false)){GameplayEventSchema.MigrateSynthetic(f.Db);SyncOutboxSchema.MigrateSynthetic(f.Db);Reject(()=>StatisticsTelemetry.Initialize(f.Db),"LEGACY_SYNC_REVIEW_REQUIRED");Check(f.N("SELECT count(*) FROM sync_schema_migrations")==1,"legacy format preserved");}
+  using(var f=new F()){f.Sql("UPDATE statistics_schema_migrations SET checksum='invalid'");Reject(()=>StatisticsTelemetry.Initialize(f.Db),"UNSUPPORTED_STATISTICS_SCHEMA");}
+  var foreign=new Foreign();Reject(()=>StatisticsTelemetry.Initialize(foreign),"STATISTICS_STORE_NOT_AUTHORIZED");Check(!foreign.Opened,"foreign capability rejected before opening a file");
+ }
+ sealed class Foreign:ISaveDatabase{public string Path=>"NOT-A-REAL-PATH";public bool Opened;public Microsoft.Data.Sqlite.SqliteConnection Open(){Opened=true;throw new Exception("Must not open");}}
+ static void FinalsAndOutbox(){
+  for(int rejects=0;rejects<=5;rejects++)using(var f=new F()){
+   f.Start();Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='installation_registered'")==1,"single installation registration");
+   Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='game_started'")==1,"game start captured");
+   var biomes=new[]{"ocean","jungle","desert","forest","tundra"};for(int i=0;i<5;i++)f.Finish(biomes[i],i<rejects?"reject":"approve");
+   Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='environmental_decision'")==5,"only confirmed decisions, retry deduplicated");
+   Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='biome_completed'")==5,"five physical completions");
+   var final=new PrepareFinalCommand(Id(),f.Owner,f.Game,f.Revision);f.Save.PrepareFinal(final);f.Save.PrepareFinal(new(Id(),f.Owner,f.Game,f.Revision));
+   Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='game_completed'")==1,"valid ending captured once across duplicate intents");
+   var expected=rejects==5?"good":rejects>=3?"medium":"bad";Check(f.Text("SELECT data FROM statistics_events WHERE event_type='game_completed'").Contains(expected),"ending rule unchanged");
+   var batch=f.Stats.Reserve(1);Check(batch.Count<=5&&batch.Count>0,"small fixed batch");
+   string json=JsonSerializer.Serialize(batch.Select(x=>x.Event));Check(!json.Contains("PRIVATE-PLAYER")&&!json.Contains(f.Owner)&&!json.Contains(f.Game)&&!json.Contains("snapshot")&&!json.Contains("password")&&!json.Contains("C:\\"),"minimal payload excludes name, local ids, save and secrets");
+   var first=batch[0];Reject(()=>f.Stats.Confirm(first.Event.EventId,first.LeaseId,new string('0',64)),"STATISTICS_RECEIPT_MISMATCH");
+   f.Stats.Fail(first.Event.EventId,first.LeaseId,2,"quota_exceeded");Check(f.Stats.Reserve(100000).Count==0,"quota pauses FIFO without dropping pending");
+   var reopen=new StatisticsTelemetry(f.Db);reopen.ResumeQuota(100001);var retry=reopen.Reserve(100002);Check(retry.Count>0&&retry[0].Event==first.Event&&retry[0].PayloadHash==first.PayloadHash,"reopen and retry keep event and hash");
+   reopen.Confirm(retry[0].Event.EventId,retry[0].LeaseId,retry[0].PayloadHash);reopen.Confirm(retry[0].Event.EventId,retry[0].LeaseId,retry[0].PayloadHash);
+   Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed'")==1,"receipt confirmation idempotent");
+  }
+  using(var f=new F()){f.Start();Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='game_completed'")==0,"incomplete game is not an ending or abandonment");var faulty=new StatisticsTelemetry(f.Db,()=>throw new InvalidOperationException("fake"));var s=new GameSaveService(f.Db,RealGameCatalog.InitialState(),extension:faulty);s.UpdateDisplayName(Id(),f.Owner,0,"Another local name");Check(s.GetLocalProfile()!.DisplayName=="Another local name"&&f.N("SELECT count(*) FROM statistics_coverage WHERE code='CAPTURE_GAP'")==1,"telemetry failure does not roll back game; gap durable");}
+  using(var f=new F()){
+   f.Sql("CREATE TRIGGER fail_statistics_capture BEFORE INSERT ON statistics_events BEGIN SELECT RAISE(FAIL,'synthetic storage error'); END;");f.Start();
+   Check(f.Save.GetActiveGame(f.Owner) is not null&&f.N("SELECT count(*) FROM statistics_coverage WHERE code='CAPTURE_GAP'")==1,"statistics SQL failure cannot undo valid game progress");
+   f.Sql("DROP TRIGGER fail_statistics_capture");f.Stats.ReconcileGameplay();long pending=f.N("SELECT count(*) FROM statistics_outbox WHERE state='pending'");
+   Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='game_started'")==1&&f.N("SELECT count(*) FROM statistics_intents WHERE projected=0")==0,"durable intents recover committed events after transient capture failure");
+   f.Sql("CREATE TRIGGER fail_statistics_reserve BEFORE UPDATE ON statistics_outbox BEGIN SELECT RAISE(ABORT,'synthetic storage error'); END;");
+   try{f.Stats.Reserve(0);throw new Exception("expected synthetic SQLite error");}catch(Microsoft.Data.Sqlite.SqliteException){}
+   Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='pending'")==pending&&f.N("SELECT sum(attempts) FROM statistics_outbox")==0,"storage failure rolls back reservation without dropping events");f.Sql("DROP TRIGGER fail_statistics_reserve");
+  }
+ }
+ static async Task TimeAndAdapter(){
+  using var f=new F(false);await using var a=GamePersistenceAdapter.CreateSyntheticStatisticsAdapter(f.Db);
+  Check((await a.OpenAsync("owned-outbox-fixture")).Success,"adapter initializes new statistics install");
+  var request=new ProfileCreationRequest(Id(),f.Owner,"Local private name");Check((await a.CreateLocalProfileAsync(request)).Success,"profile local");Check((await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game))).Success,"game local without remote URL");
+  Check(a.SyncStorage is null&&a.StatisticalOutbox is not null,"legacy snapshot transport has no production handle");
+  long clock=0;var observer=new LocalGameplayObserver(a,()=>clock,()=>DateTimeOffset.Parse("2026-11-04T12:00:00Z"));await observer.InitializeAsync(f.Owner);await observer.DrainAsync();
+  clock=30000;observer.Observe(false,false,false,true);await observer.DrainAsync();Check(f.N("SELECT coalesce(sum(duration_ms),0) FROM statistics_events WHERE event_type='playtime_interval'")==0,"main menu excludes time");
+  Check((await a.EnterBiomeAsync(new(Id(),f.Owner,f.Game,0,"ocean","human"))).Success,"human entry committed");
+  Check(a.CommittedTelemetryScope==new LocalTelemetryScope(f.Game,"ocean"),"human timing scope follows committed entry, not stale menu snapshot");
+  observer.HumanStarted(f.Game,"ocean","human-scene");observer.Observe(true,false,false,true);
+  clock+=30000;observer.Observe(true,false,false,true);await observer.DrainAsync();Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==30000,"human active heartbeat 30 seconds");
+  observer.Observe(true,true,false,true);clock+=30000;observer.Observe(true,true,false,true);await observer.DrainAsync();Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==30000,"pause excludes time");
+  observer.Observe(true,false,false,false);clock+=30000;observer.Observe(true,false,false,false);await observer.DrainAsync();Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==30000,"background excludes time");
+  observer.Observe(true,false,false,true);clock+=600000;observer.Observe(true,false,false,true);await observer.DrainAsync();Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==30000,"suspension is excluded");
+  clock+=1000;observer.Leave();await observer.DrainAsync();Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==31000,"leave flushes active time once");
+  clock+=20000;await observer.CloseAsync();Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='session_ended'")==1,"normal session close captured");
+  long intervals=f.N("SELECT count(*) FROM statistics_events WHERE event_type='playtime_interval'");a.StatisticalOutbox!.ReconcileGameplay();a.StatisticalOutbox.ReconcileGameplay();Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='playtime_interval'")==intervals,"reconcile never duplicates interval");
+  Check((await a.GetActiveGameAsync(f.Owner)).Success,"game save unaffected after telemetry close");
+ }
+ static void ProductionAndVolume(){
+  string local=Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),lab=Path.Combine(local,"TwoSidesTests","B77",Guid.NewGuid().ToString("N"));
+  try{
+   foreach(string who in new[]{"ProfileA","ProfileB"}){
+    string simulated=Path.Combine(lab,who,"AppData","Local");Directory.CreateDirectory(simulated);string file=Path.Combine(simulated,"TwoSides","PlayerData","save.sqlite3");
+    string owner=Id();using(var db=CopyGameDatabase.OpenProductionUnder(simulated,file)){
+     StatisticsTelemetry.Initialize(db);var stats=new StatisticsTelemetry(db);var s=new GameSaveService(db,RealGameCatalog.InitialState(),extension:stats);s.CreateLocalProfile(Id(),owner,"Synthetic");
+     Check(s.GetLocalProfile()!.LocalPlayerId==owner,"isolated production-profile initialization");
+    }
+    using(var db=CopyGameDatabase.OpenProductionUnder(simulated,file)){StatisticsTelemetry.Initialize(db);Check(new GameSaveService(db,RealGameCatalog.InitialState()).GetLocalProfile()!.LocalPlayerId==owner,"same production-profile data after reopen");}
+   }
+  }finally{if(!lab.StartsWith(Path.Combine(local,"TwoSidesTests","B77")+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase))throw new Exception("Unsafe cleanup");if(Directory.Exists(lab)){foreach(var p in Directory.EnumerateFiles(lab,"*",SearchOption.AllDirectories))File.Delete(p);foreach(var p in Directory.EnumerateDirectories(lab,"*",SearchOption.AllDirectories).OrderByDescending(p=>p.Length))Directory.Delete(p);Directory.Delete(lab);}}
+  using(var f=new F()){
+   f.Start();var events=new GameplayEventService(f.Db);string session=Id();events.RecordEvent(new(Id(),f.Owner,session,GameplayEventKind.SESSION_STARTED,DateTimeOffset.UtcNow,0));
+   var sample=f.Stats.Reserve(0)[0].Event;
+   foreach(var invalid in new[]{sample with {DurationMs=-1},sample with {DurationMs=60001},sample with {Data="{\"name\":\"PRIVATE-PLAYER-B77\"}"},sample with {Data="{"},sample with {SchemaVersion=2},sample with {Type="game.report"},sample with {BiomeId="unknown"}})
+       Reject(()=>StatisticsTelemetry.Canonical(invalid),"INVALID_STATISTICAL_EVENT");
+   // Release those synthetic leases via their normal expiry before testing the large queue.
+   for(int i=0;i<2200;i++)events.RecordInterval(new(Id(),f.Owner,session,i*30000L,(i+1)*30000L,GameplayTimeState.ActiveHuman,f.Game,"ocean"));
+   for(int i=0;i<20;i++)f.Stats.ReconcileGameplay(512);
+   Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='playtime_interval'")==2200,"large local queue retains 2200 intervals without remote-quota changes");
+   Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==2200*30000L,"large active queue preserves exact accumulated playtime");
+   var batch=f.Stats.Reserve(60001);Check(batch.Count==5,"large queue still reserves at most five");Check(f.Stats.Reserve(60002).Count==0,"concurrent/reserved earlier items block later leases");
+   var expired=f.Stats.Reserve(120002);Check(expired.Select(x=>x.Event.EventId).SequenceEqual(batch.Select(x=>x.Event.EventId)),"lost response/expired lease retries same IDs");
+   f.Stats.Fail(expired[0].Event.EventId,expired[0].LeaseId,120003,"network_unavailable");Check(f.Stats.Reserve(120004).Count==0,"offline backoff retains pending FIFO");
+   var retry=f.Stats.Reserve(160000);Check(retry.Count>0&&retry[0].Event==expired[0].Event,"network retry retains content");
+   f.Stats.Fail(retry[0].Event.EventId,retry[0].LeaseId,160001,"invalid_event");Check(f.Stats.Reserve(260000).Count==0,"permanent errors retained for review without deletion");
+   Check(f.N("SELECT count(*) FROM statistics_outbox")==f.N("SELECT count(*) FROM statistics_events"),"every source has durable outbox state");
+  }
+ }
+ static async Task InterruptedAndAnimal(){
+  using var f=new F(false);await using var a=GamePersistenceAdapter.CreateSyntheticStatisticsAdapter(f.Db);await a.OpenAsync("owned-outbox-fixture");await a.CreateLocalProfileAsync(new(Id(),f.Owner,"Synthetic"));await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game));
+  var decision=new RecordDecisionCommand(Id(),Id(),f.Owner,f.Game,0,"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}");await a.RecordDecisionAsync(decision);
+  long clock=0;var first=new LocalGameplayObserver(a,()=>clock);await first.InitializeAsync(f.Owner);first.AnimalStarted(f.Game,"ocean","animal1");first.Observe(true,false,false,true);clock=30000;first.Observe(true,false,false,true);await first.DrainAsync();
+  first.Died();await first.DrainAsync();first.RequestRestart(true);await first.DrainAsync();first.AnimalStarted(f.Game,"ocean","animal2");first.Observe(true,false,false,true);clock+=1000;first.Leave();await first.DrainAsync();
+  Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==31000,"animal death/retry does not double-count prior segment");
+  // Simulate process loss by abandoning the first observer, not fabricating a terminal event or elapsed UTC duration.
+  await a.DisposeAsync();await using var reopened=GamePersistenceAdapter.CreateSyntheticStatisticsAdapter(f.Db);await reopened.OpenAsync("owned-outbox-fixture");
+  var second=new LocalGameplayObserver(reopened,()=>clock);await second.InitializeAsync(f.Owner);await second.DrainAsync();
+  Check(f.N("SELECT count(*) FROM gameplay_sessions WHERE status='interrupted'")==1,"unexpected close marks old session interrupted");
+  Check(f.N("SELECT sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval'")==31000,"reopen never invents time between processes");
+  await second.CloseAsync();Check(f.N("SELECT count(*) FROM statistics_events WHERE event_type='session_started'")==2,"new statistical session on reopen");
+  var events=new GameplayEventService(f.Db);var sess=Id();events.RecordEvent(new(Id(),f.Owner,sess,GameplayEventKind.SESSION_STARTED,DateTimeOffset.UtcNow,0));
+  Reject(()=>events.RecordInterval(new(Id(),f.Owner,sess,-1,0,GameplayTimeState.Menu)),"INVALID_EVENT");
+ }
+ public static async Task<int> Main(){try{
+  using(var f=new F()){var id=f.Text("SELECT installation_id FROM statistics_installation");StatisticsTelemetry.Initialize(f.Db);Check(f.Text("SELECT installation_id FROM statistics_installation")==id,"installation stable");Check(f.N("PRAGMA user_version")==2,"schema base untouched");Check(f.N("SELECT count(*) FROM sqlite_master WHERE name='sync_outbox'")==0,"no legacy outbox created");}
+  MigrationTests();FinalsAndOutbox();await TimeAndAdapter();ProductionAndVolume();await InterruptedAndAnimal();Console.WriteLine("B77 STATISTICS CHECKS PASS "+count);return 0;
+ }catch(Exception e){Console.WriteLine("FAIL "+e.GetType().Name+": "+e.Message);return 1;}}
+}

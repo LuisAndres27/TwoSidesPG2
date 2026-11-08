@@ -1,0 +1,24 @@
+[remap]
+
+importer="wav"
+type="AudioStreamWAV"
+uid="uid://beb0da3yam8ci"
+path="res://.godot/imported/Coral Reef Ambient (Take 2).wav-69e5cea304b702865c5131ef5c598823.sample"
+
+[deps]
+
+source_file="res://assets/sprites/fondos/Music/Mar/Coral Reef Ambient (Take 2).wav"
+dest_files=["res://.godot/imported/Coral Reef Ambient (Take 2).wav-69e5cea304b702865c5131ef5c598823.sample"]
+
+[params]
+
+force/8_bit=false
+force/mono=false
+force/max_rate=false
+force/max_rate_hz=44100
+edit/trim=false
+edit/normalize=false
+edit/loop_mode=0
+edit/loop_begin=0
+edit/loop_end=-1
+compress/mode=2

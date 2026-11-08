@@ -1,0 +1,43 @@
+// build-synthetic-run.mjs.template — OFFLINE builder of the ONE synthetic operation of the first controlled Atlas write test (B29). NOT run by the repository, NOT part of src/.
+// It connects to nothing and reads no secret. It creates random identifiers, builds ONE valid `session.report` (phase "open") operation and checks it with the REAL
+// backend validator (src/modules/sync/schemas.js validateOperation) before writing three small JSON files (no credentials, no tokens) into an empty folder OUTSIDE the project:
+//   run-ids.json         the random identifiers that mark every synthetic document (needed for later manual cleanup / audit)
+//   batch.json           body of POST /api/v2/sync/batches (one operation)
+//   receipts-query.json  body of POST /api/v2/sync/receipts/query for the same operation
+// Copy this file OUTSIDE the project (e.g. %LOCALAPPDATA%\TwoSidesSyntheticRun\build.mjs) so it never becomes part of the integrity inventory, then:
+//   node build.mjs <absolute backend folder> <absolute EMPTY output folder> [<technicalAccountId>]
+// Without technicalAccountId it only validates the shape of the operation (installation/localPlayer ids are random and are the ones the registration must use).
+// The installationId/localPlayerId in run-ids.json MUST be the ones sent in the registration and the session request: the backend rejects any other binding.
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+
+const [backend, outDir] = process.argv.slice(2);
+if (!backend || !outDir || !path.isAbsolute(backend) || !path.isAbsolute(outDir) || process.argv.length > 4) { console.error('usage: node build.mjs <absolute backend dir> <absolute empty output dir>'); process.exit(1); }
+if (path.resolve(outDir).toLowerCase().startsWith(path.resolve(backend, '..').toLowerCase() + path.sep)) { console.error('refused: the output folder must be outside the project'); process.exit(1); }
+if (fs.existsSync(outDir) && fs.readdirSync(outDir).length) { console.error('refused: the output folder must be empty'); process.exit(1); }
+const load = rel => import(pathToFileURL(path.join(backend, rel)).href);
+const { validateOperation } = await load('src/modules/sync/schemas.js');
+const { canonical, digest } = await load('src/modules/sync/canonical-envelope.js');
+
+// Random UUID v4 values (the backend requires v4). Nothing here is derived from a real player, installation or save file.
+const ids = { runId: randomUUID(), registrationId: randomUUID(), installationId: randomUUID(), localPlayerId: randomUUID(), sessionId: randomUUID(), operationId: randomUUID(), leaseId: randomUUID(), batchId: randomUUID() };
+const now = new Date().toISOString();                       // ISO with milliseconds and Z, as the contract requires
+const envelope = {
+  schemaVersion: 1, type: 'session.report', installationId: ids.installationId, localPlayerId: ids.localPlayerId, bindingGeneration: 1, gameId: null,
+  sourceKey: `session:${ids.sessionId}:open`, createdAtUtc: now,
+  payload: { sessionId: ids.sessionId, phase: 'open', status: 'open', startedAtUtc: now, endedAtUtc: null, endOffsetMs: null,
+    coverage: { origin: 'live_capture', historicalCoverageUnknown: true, incomplete: true } },
+};
+const canonicalEnvelope = canonical(envelope);
+const operation = { operationId: ids.operationId, payloadHash: createHash('sha256').update(canonicalEnvelope, 'utf8').digest('hex'), leaseId: ids.leaseId, attempt: 1, canonicalEnvelope, dependencies: [] };
+const checked = validateOperation(operation);                // throws if the real backend would reject it
+if (checked.envelope.type !== 'session.report' || checked.envelope.sourceKey !== envelope.sourceKey || checked.sourceId !== ids.sessionId) throw new Error('unexpected validation result');
+
+fs.mkdirSync(outDir, { recursive: true });
+const write = (name, value) => fs.writeFileSync(path.join(outDir, name), JSON.stringify(value), { flag: 'wx' });
+write('run-ids.json', { note: 'Synthetic identifiers of the B29 write test. No secrets.', ...ids, sourceKey: envelope.sourceKey, factDigest: checked.factDigest, createdAtUtc: now });
+write('batch.json', { schemaVersion: 2, batchId: ids.batchId, operations: [operation] });
+write('receipts-query.json', { schemaVersion: 2, attempts: [{ operationId: operation.operationId, payloadHash: operation.payloadHash, leaseId: operation.leaseId, attempt: 1 }] });
+console.log(JSON.stringify({ built: true, validatedByBackendSchema: true, type: envelope.type, sourceKey: envelope.sourceKey, files: ['run-ids.json', 'batch.json', 'receipts-query.json'] }));

@@ -1,0 +1,202 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.IO;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class RuntimeMenuChecks
+{
+    private static int _count;
+    private static void Check(bool ok, string label) { if (!ok) throw new Exception(label); _count++; Console.WriteLine("PASS " + label); }
+    private static string Id() => Guid.NewGuid().ToString("D");
+    internal sealed class Failure : ITransactionalSaveExtension
+    {
+        public bool Enabled;
+        public void BeforeCommit(SqliteConnection c, SqliteTransaction tx, SaveReceipt receipt)
+        { if (Enabled) throw new SaveException("TEST_ROLLBACK"); }
+    }
+    // Real SQLite/service/UoW behind the same menu port. No motor/HTTP; fresh owned synthetic DB only.
+    internal sealed class Store : ILocalMenuStore, ILocalBiomeStore, ILocalAnimalStore
+    {
+        public readonly GameSaveService Service;
+        public int Opens;
+        public int EntryCalls;
+        public bool LostEntryResponse;
+        public Action? AfterEntry;
+        public EnterBiomeCommand? LastEntry;
+        public bool OpenFailure, ReadFailure, LostResponse, ArchivedResponse;
+        public Store(ISaveDatabase db, Failure failure) => Service = new GameSaveService(db, RealGameCatalog.InitialState(), extension: failure);
+        private Task<LocalSaveResult<T>> Run<T>(Func<LocalSaveResult<T>> work)
+        { try { return Task.FromResult(work()); } catch (SaveException e) { return Task.FromResult(new LocalSaveResult<T>(false, e.Code)); } }
+        public Task<LocalSaveResult<LocalProfile>> OpenAsync(string path)
+        {
+            Opens++;
+            return Run<LocalProfile>(() => path != "owned-fixture" ? new(false, "UNSAFE_PATH") : OpenFailure ? new(false, "STORAGE_ERROR") : new(true, "OPEN", Service.GetLocalProfile()));
+        }
+        public Task<LocalSaveResult<LocalProfile>> GetLocalProfileAsync() => Run<LocalProfile>(() => new(true, "PROFILE", Service.GetLocalProfile()));
+        public Task<LocalSaveResult<LocalProfile>> CreateLocalProfileAsync(ProfileCreationRequest request) => Run<LocalProfile>(() =>
+        {
+            var receipt = Service.CreateLocalProfile(request.OperationId, request.LocalPlayerId, request.DisplayName);
+            return new(true, "PROFILE_CREATED", Service.GetLocalProfile(), receipt);
+        });
+        public Task<LocalSaveResult<bool>> HasUnfinishedGamesAsync(string owner) => Run<bool>(() => ReadFailure ? new(false,"IO_ERROR") : new(true,"UNFINISHED_GAMES",Service.HasUnfinishedGames(owner)));
+        public Task<LocalSaveResult<GameAggregate>> GetActiveGameAsync(string owner) => Run<GameAggregate>(() =>
+        {
+            if (ReadFailure) return new(false, "IO_ERROR");
+            var game = Service.GetActiveGame(owner);
+            if (game is not null && ArchivedResponse) game = game with { Game = game.Game with { IsCurrent = false } };
+            return new(true, "ACTIVE_GAME", game);
+        });
+        public Task<LocalSaveResult<GameAggregate>> LoadGameAsync(string owner, string game) => Run<GameAggregate>(() => new(true, "GAME", Service.LoadGame(owner, game)));
+        public Task<LocalSaveResult<GameAggregate>> CreateNewGameAsync(NewGameCommand command) => Run<GameAggregate>(() =>
+        {
+            var receipt = Service.CreateNewGame(command);
+            if (LostResponse) { LostResponse = false; return new(false, "IO_ERROR"); }
+            return new(true, "CREATED", Service.LoadGame(command.LocalPlayerId, command.GameId), receipt);
+        });
+        public Task<LocalSaveResult<IReadOnlyList<BiomeAccess>>> GetGameProgressAsync(string owner, string game) => Run<IReadOnlyList<BiomeAccess>>(() => new(true, "PROGRESS", Service.GetGameProgress(owner, game)));
+        public Task<LocalSaveResult<BiomeAccess>> GetBiomeAccessAsync(string owner,string game,string biome) => Run<BiomeAccess>(() => ReadFailure ? new(false,"IO_ERROR") : new(true,"ACCESS",Service.GetBiomeAccess(owner,game,biome)));
+        public Task<LocalSaveResult<SaveReceipt>> EnterBiomeAsync(EnterBiomeCommand command) => Run<SaveReceipt>(() =>
+        {
+            EntryCalls++; LastEntry=command;
+            var receipt=Service.EnterBiome(command);
+            var after=AfterEntry;AfterEntry=null;after?.Invoke();
+            if(LostEntryResponse){LostEntryResponse=false;return new(false,"IO_ERROR");}
+            return new(true,"ENTERED",receipt,receipt);
+        });
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+    // Only synthetic fixture setup. This is NOT a production finalization API or a simulated scene event.
+    internal static void SeedTerminal(ISaveDatabase db, string game)
+    {
+        using var c=db.Open(); using var q=c.CreateCommand();
+        q.CommandText="UPDATE saved_games SET is_current=0,status='completed',ending='good',ending_rules_version=rules_version,completed_at=saved_at,archived_at=saved_at WHERE game_id=$g;";
+        q.Parameters.AddWithValue("$g",game); q.ExecuteNonQuery();
+    }
+    internal sealed class ReadOnlyFixture : ISaveDatabase
+    {
+        private readonly string _path;
+        public ReadOnlyFixture(string path)
+        {
+            string parent=Path.GetDirectoryName(path)!;
+            string expected=Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","databases");
+            if(Path.GetFullPath(path)!=path || Path.GetDirectoryName(parent)!=expected || !Guid.TryParseExact(Path.GetFileName(parent),"N",out _) || !Guid.TryParseExact(Path.GetFileNameWithoutExtension(path),"N",out _) || Path.GetExtension(path)!=".sqlite3")throw new Exception("Invalid fixture capability");
+            for(string? p=path;p is not null && p.Length>=SyntheticSandbox.AuthorizedProjectRoot.Length;p=Path.GetDirectoryName(p))
+                if((File.GetAttributes(p)&FileAttributes.ReparsePoint)!=0)throw new Exception("Linked fixture");
+            _path=path;
+        }
+        public SqliteConnection Open()
+        {
+            var c=new SqliteConnection(new SqliteConnectionStringBuilder{DataSource=_path,Mode=SqliteOpenMode.ReadOnly,Pooling=false,ForeignKeys=true}.ToString());
+            c.Open();return c;
+        }
+    }
+    public static int Probe(string path,string owner)
+    {
+        var service=new GameSaveService(new ReadOnlyFixture(path),RealGameCatalog.InitialState());
+        return service.HasUnfinishedGames(owner)&&service.GetGameHistory(owner).Count==1?0:12;
+    }
+    public static async Task<int> Run()
+    {
+        using var sandbox = new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot);
+        var db = sandbox.CreateDatabase(); SchemaManager.Initialize(db);
+        var failure = new Failure(); var store = new Store(db, failure);
+        await using var state = new LocalGameState(store, "owned-fixture");
+        var a = state.InitializeAsync(); var b = state.InitializeAsync(); await Task.WhenAll(a, b);
+        Check(ReferenceEquals(a,b) && store.Opens == 1 && state.Ready, "initialization coalesces one application store");
+        Check(state.Profile is null && state.ActiveGame is null && state.Code == "PROFILE_REQUIRED", "first execution reads absent profile without creating one");
+        Check(!await state.CreateProfileAsync(" ") && state.Code == "INVALID_NAME", "invalid display name cannot create profile");
+        Check(await state.CreateProfileAsync("  José local  ") && state.Profile?.DisplayName == "José local", "menu intent persists Unicode display name through SQLite");
+        string owner = state.Profile!.LocalPlayerId;
+        Check(!await state.CreateProfileAsync("Otro") && store.Service.GetLocalProfile()?.LocalPlayerId == owner, "second menu profile intent cannot duplicate identity");
+        Check(state.ActiveGame is null && state.CanStartNewGame && !state.CanContinue && store.Service.GetGameHistory(owner).Count == 0, "profile creation never automatically starts a game");
+        Check(await state.NewGameAsync() && state.ActiveGame is not null && state.CanContinue, "explicit new game becomes active after commit");
+        string first = state.ActiveGame!.Game.GameId;
+        Check(state.Progress.Count == 5 && state.Progress.All(x => x.Availability == "available" && x.CanEnterHuman && x.Progress.Status == "human_pending"), "five independent human entries initially available without order");
+        Check(await state.PrepareSelectionAsync() && state.CanEnterSelection, "continue prepares selection ticket from current persistent aggregate");
+        state.CancelSelection();
+        Check(!state.CanEnterSelection && state.ActiveGame.Game.GameId == first, "navigation failure cancels ticket without losing committed game");
+        await using (var reopened = new LocalGameState(new Store(db, failure), "owned-fixture"))
+        {
+            await reopened.InitializeAsync();
+            Check(reopened.Profile?.LocalPlayerId == owner && reopened.Profile.DisplayName == "José local", "new application state retrieves same profile and name");
+            Check(!reopened.CanStartNewGame && reopened.CanContinue && reopened.ActiveGame?.Game.GameId == first && store.Service.GetGameHistory(owner).Count == 1, "restart projection preserves game without automatic replacement");
+        }
+        Check(!state.CanStartNewGame && state.CanContinue && !await state.NewGameAsync() && store.Service.GetGameHistory(owner).Count==1, "active game disables New and second menu intention cannot archive it");
+        bool rejected=false; try { store.Service.CreateNewGame(GamePersistenceAdapter.PrepareNewGame(owner,state.ActiveGame!.Game)); } catch(SaveException e) { rejected=e.Code=="GAME_IN_PROGRESS"; }
+        Check(rejected && store.Service.GetActiveGame(owner)!.Game.GameId==first,"direct service rejects second game inside transaction");
+        SeedTerminal(db,first); await state.RefreshAsync();
+        Check(state.CanStartNewGame && !state.CanContinue,"terminal fixture with confirmed ending metadata permits New but not Continue");
+        Check(await state.NewGameAsync() && state.ActiveGame!.Game.GameId != first && store.Service.GetGameHistory(owner).Count == 2
+            && !store.Service.LoadGame(owner, first).Game.IsCurrent, "new game after terminal fixture preserves completed history");
+        string second = state.ActiveGame!.Game.GameId;
+        SeedTerminal(db,second); await state.RefreshAsync();
+        failure.Enabled = true;
+        Check(!await state.NewGameAsync() && state.HasPendingWrite && store.Service.GetActiveGame(owner) is null
+            && store.Service.GetGameHistory(owner).Count == 2, "SQLite precommit failure rolls back new game and preserves completed history");
+        Check(!await state.PrepareSelectionAsync(), "unresolved write cannot navigate using stale projection");
+        failure.Enabled = false;
+        Check(await state.NewGameAsync() && !state.HasPendingWrite && store.Service.GetGameHistory(owner).Count == 3, "explicit retry retains original command and commits once");
+        SeedTerminal(db,state.ActiveGame!.Game.GameId); await state.RefreshAsync();
+        store.LostResponse = true;
+        Check(!await state.NewGameAsync() && state.HasPendingWrite && store.Service.GetGameHistory(owner).Count == 4, "lost response is not displayed as success after actual commit");
+        Check(await state.NewGameAsync() && store.Service.GetGameHistory(owner).Count == 4, "same operation retry recovers receipt without duplicate game");
+        store.ArchivedResponse = true;
+        Check(!await state.RefreshAsync() && state.Code == "GAME_NOT_ACTIVE" && !state.CanContinue, "archived game cannot be continued through menu");
+        store.ArchivedResponse = false; store.ReadFailure = true;
+        Check(!await state.NewGameAsync() && store.Service.GetGameHistory(owner).Count == 4, "read error is not absence and cannot trigger replacement creation");
+        store.ReadFailure = false; await state.RefreshAsync();
+        var current = state.ActiveGame!.Game;
+        store.Service.EnterBiome(new EnterBiomeCommand(Id(), owner, current.GameId, current.Revision, "ocean", "human"));
+        await state.RefreshAsync();
+        Check(state.CanContinue && state.Code == "READY" && store.Service.GetActiveGame(owner)!.Game.ResumeKind == "human_decision", "selection can reopen from confirmed human boundary without claiming resource restoration");
+        await using (var unavailable = new LocalGameState(new Store(db, failure) { OpenFailure = true }, "owned-fixture"))
+        {
+            await unavailable.InitializeAsync();
+            Check(!unavailable.Ready && unavailable.Profile is null && !await unavailable.NewGameAsync(), "SQLite open error fails closed without volatile fallback");
+        }
+        await using (var badPath = new LocalGameState(new Store(db, failure), "unauthorized"))
+        {
+            await badPath.InitializeAsync(); Check(!badPath.Ready && badPath.Code == "UNSAFE_PATH", "menu port rejects unrecognized fixture capability");
+        }
+        await using (var runtime = new GamePersistenceAdapter(runtime: true))
+        {
+            var pathRejected = await runtime.OpenAsync(GamePersistenceAdapter.StoragePath);
+            Check(!pathRejected.Success && pathRejected.Code == "UNSAFE_PATH", "real runtime adapter refuses protected game store before access");
+        }
+        Check(typeof(LocalGameState).Assembly.GetReferencedAssemblies().All(x => x.Name != "System.Net.Http" && x.Name != "GodotSharp"), "menu coordinator and SQLite run with no HTTP or Godot dependency");
+        Check(!GamePersistenceAdapter.RuntimeStoragePath.Equals(GamePersistenceAdapter.StoragePath, StringComparison.OrdinalIgnoreCase)
+            && GamePersistenceAdapter.RuntimeStoragePath.StartsWith(SyntheticSandbox.AuthorizedProjectRoot, StringComparison.OrdinalIgnoreCase), "runtime path is fixed inside authorized copy and separate from protected databases");
+        // A historical incomplete record still blocks creation even when no row is current.
+        var legacyDb=sandbox.CreateDatabase(); SchemaManager.Initialize(legacyDb);
+        var legacy=new GameSaveService(legacyDb,RealGameCatalog.InitialState()); var legacyOwner=Id(); var old=Id();
+        legacy.CreateLocalProfile(Id(),legacyOwner,"Historial"); legacy.CreateNewGame(new(Id(),legacyOwner,old));
+        using(var c=legacyDb.Open())using(var q=c.CreateCommand()){q.CommandText="UPDATE saved_games SET is_current=0,status='archived';";q.ExecuteNonQuery();}
+        bool legacyRejected=false;try{legacy.CreateNewGame(new(Id(),legacyOwner,Id()));}catch(SaveException e){legacyRejected=e.Code=="GAME_IN_PROGRESS";}
+        Check(legacy.HasUnfinishedGames(legacyOwner)&&legacyRejected&&legacy.GetGameHistory(legacyOwner).Count==1,"archived incomplete history is not silently interpreted as finished");
+        await using(var historicalState=new LocalGameState(new Store(legacyDb,new Failure()),"owned-fixture"))
+        {
+            await historicalState.InitializeAsync();
+            Check(!historicalState.CanStartNewGame&&!historicalState.CanContinue&&historicalState.Code=="GAME_IN_PROGRESS","menu blocks New for unfinished historical record even without current game");
+        }
+        var idemDb=sandbox.CreateDatabase();SchemaManager.Initialize(idemDb);var idem=new GameSaveService(idemDb,RealGameCatalog.InitialState());var idemOwner=Id();idem.CreateLocalProfile(Id(),idemOwner,"Idempotencia");var shared=new NewGameCommand(Id(),idemOwner,Id());
+        var receipts=await Task.WhenAll(Task.Run(()=>idem.CreateNewGame(shared)),Task.Run(()=>idem.CreateNewGame(shared)));
+        Check(receipts[0]==receipts[1]&&idem.GetGameHistory(idemOwner).Count==1,"concurrent identical new-game retry returns one receipt and one game");
+        var raceDb=sandbox.CreateDatabase();SchemaManager.Initialize(raceDb);var race=new GameSaveService(raceDb,RealGameCatalog.InitialState());var raceOwner=Id();race.CreateLocalProfile(Id(),raceOwner,"Concurrencia");
+        async Task<bool> CreateConcurrent()=>await Task.Run(()=>{try{race.CreateNewGame(new(Id(),raceOwner,Id()));return true;}catch(SaveException e)when(e.Code=="GAME_IN_PROGRESS"){return false;}});
+        var results=await Task.WhenAll(CreateConcurrent(),CreateConcurrent());
+        Check(results.Count(x=>x)==1&&race.GetGameHistory(raceOwner).Count==1,"concurrent different new-game intents have exactly one winner");
+        var probe=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true};
+        foreach(string arg in new[]{"--single-game-probe",raceDb.Path,raceOwner})probe.ArgumentList.Add(arg);
+        using(var child=Process.Start(probe)){child!.WaitForExit();Check(child.ExitCode==0,"new read-only process preserves unfinished-game restriction");}
+        var activeRace=race.GetActiveGame(raceOwner)!;var profile=race.GetLocalProfile()!;
+        race.UpdateDisplayName(Id(),raceOwner,profile.Revision,"Nombre cambiado");
+        Check(race.GetActiveGame(raceOwner)!.Game.GameId==activeRace.Game.GameId&&race.HasUnfinishedGames(raceOwner),"rename preserves active game and new-game restriction");
+        Console.WriteLine($"Runtime menu checks: {_count} passed, 0 failed; real SQLite fixtures, injected port failures, no Godot runtime.");
+        return 0;
+    }
+}

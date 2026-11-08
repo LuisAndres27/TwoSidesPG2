@@ -1,0 +1,144 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+
+namespace TwoSides.LocalPersistence;
+
+// Typed local queries only. Reuses UnitOfWork.Read and existing repository mappings.
+public sealed class StatisticsService
+{
+    private readonly UnitOfWork _work;
+    private readonly SaveCatalog _catalog;
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    public StatisticsService(ISaveDatabase database, SaveCatalog catalog)
+    {
+        Safe(()=>{SchemaManager.Verify(database);return true;});
+        _work=new(database);_catalog=catalog;
+    }
+    private static T Safe<T>(Func<T> work)
+    {
+        try{return work();}
+        catch(SaveException){throw;}
+        catch(UnauthorizedAccessException){throw new SaveException("ACCESS_DENIED");}
+        catch(IOException){throw new SaveException("IO_ERROR");}
+        catch(JsonException){throw new SaveException("INVALID_STATISTICS_DATA");}
+        catch(OverflowException){throw new SaveException("INVALID_STATISTICS_DATA");}
+    }
+    private T Read<T>(Func<StatisticsRepository,T> query)=>Safe(()=>_work.Read(r=>query(new(r))));
+    private static void Valid(bool condition)=>SaveValidation.Require(condition,"INVALID_STATISTICS_DATA");
+    private static StatisticCount Count(long n)=>new(StatisticsAvailability.Available,n);
+    private static StatisticCount Missing()=>new(StatisticsAvailability.NotAvailable,null,"NOT_COLLECTED");
+    public StatisticsResult<PlayerStatistics> GetLocalStatistics()=>Read(r=>
+    {
+        var profile=r.Profile();
+        return profile is null ? new StatisticsResult<PlayerStatistics>(StatisticsAvailability.NoData,null)
+            : new(StatisticsAvailability.Available,Player(r,profile));
+    });
+    public PlayerStatistics GetPlayerStatistics(string owner)
+    {
+        SaveValidation.Id(owner);
+        return Read(r=>Player(r,Owned(r,owner)));
+    }
+    public GameStatistics GetGameStatistics(string owner,string gameId)
+    {
+        SaveValidation.Id(owner);SaveValidation.Id(gameId);
+        return Read(r=>{Owned(r,owner);var game=r.Game(owner,gameId);
+            SaveValidation.Require(game is not null,"NOT_FOUND");return Game(r,game!);});
+    }
+    private static LocalProfile Owned(StatisticsRepository r,string owner)
+    {
+        var profile=r.Profile();SaveValidation.Require(profile is not null && profile.LocalPlayerId==owner,"NOT_FOUND");return profile!;
+    }
+    private PlayerStatistics Player(StatisticsRepository r,LocalProfile profile)
+    {
+        SaveValidation.Id(profile.LocalPlayerId);Valid(SaveValidation.Name(profile.DisplayName)==profile.DisplayName);
+        var games=r.Games(profile.LocalPlayerId).Select(g=>Game(r,g)).ToArray();
+        Valid(games.All(g=>g.LocalPlayerId==profile.LocalPlayerId) && games.Select(g=>g.GameId).Distinct().Count()==games.Length);
+        var active=games.Where(g=>g.IsCurrent).ToArray();Valid(active.Length<=1);
+        var history=games.Where(g=>!g.IsCurrent).ToArray();
+        var completed=games.Where(g=>g.Status=="completed").ToArray();
+        var completedCount=completed.All(g=>g.ConfirmedCompleted) ? Count(completed.LongLength)
+            : new StatisticCount(StatisticsAvailability.Unknown,null,"UNCONFIRMED_TERMINAL_METADATA");
+        return new PlayerStatistics(profile.LocalPlayerId,profile.DisplayName,games.LongLength,active.LongLength,
+            active.SingleOrDefault()?.GameId,completedCount,games.Length==0?StatisticsAvailability.NoData:StatisticsAvailability.Available,
+            active.SingleOrDefault(),Array.AsReadOnly(history),
+            SumDecisions(games.Select(g=>g.Decisions)),SumDecisions(history.Select(g=>g.Decisions)),
+            Progress(games.SelectMany(g=>g.Biomes).ToArray()),Progress(history.SelectMany(g=>g.Biomes).ToArray()),
+            new(Missing(),Missing(),Missing(),Missing(),Missing()))
+        {Activity=Activity(r.Activity(profile.LocalPlayerId),null),HistoricalActivity=Activity(r.Activity(profile.LocalPlayerId),history.Select(g=>g.GameId).ToHashSet())};
+    }
+    private GameStatistics Game(StatisticsRepository r,SavedGame game)
+    {
+        SaveValidation.Id(game.GameId);SaveValidation.Id(game.LocalPlayerId);
+        SaveValidation.Require(game.SaveFormatVersion==1 && game.RulesVersion==_catalog.RulesVersion && game.ContentVersion==_catalog.ContentVersion,"UNKNOWN_CONTENT");
+        Valid(game.Status is "in_progress" or "final_pending" or "completed" or "archived");
+        Valid(!game.IsCurrent || game.Status is "in_progress" or "final_pending");
+        var progress=r.Biomes(game.GameId);var environments=r.Environments(game.GameId);var decisions=r.Decisions(game.GameId);
+        Valid(progress.Count==5 && environments.Count==5 && Biomes.All(b=>progress.Count(p=>p.BiomeId==b)==1 && environments.Count(e=>e.BiomeId==b)==1));
+        Valid(decisions.Select(d=>d.DecisionId).Distinct().Count()==decisions.Count && decisions.GroupBy(d=>(d.BiomeId,d.DecisionKey)).All(g=>g.Count()==1));
+        foreach(var d in decisions)
+        {
+            _catalog.Decision(d.BiomeId,d.DecisionKey,d.OptionId);SaveValidation.Id(d.DecisionId);SaveValidation.Id(d.OperationId);
+            Valid(d.GameId==game.GameId && d.RulesVersion==game.RulesVersion);
+            string state=SaveValidation.DecisionState(d.ConsequencesJson,d.ConsequencesVersion);
+            Valid((d.OptionId=="reject")==(state=="healthy"));
+            var receipt=r.Receipt(d.OperationId);
+            Valid(receipt is not null && receipt.LocalPlayerId==game.LocalPlayerId && receipt.GameId==game.GameId && receipt.OperationKind=="decision" && receipt.ResultRevision is >0 && receipt.ResultRevision<=game.Revision);
+        }
+        var rows=new List<BiomeStatistics>();
+        foreach(string id in Biomes)
+        {
+            var p=progress.Single(b=>b.BiomeId==id);var e=environments.Single(b=>b.BiomeId==id);
+            var d=decisions.LastOrDefault(b=>b.BiomeId==id);
+            Valid(p.GameId==game.GameId && e.GameId==game.GameId && p.Status is "human_pending" or "animal_pending" or "completed");
+            SaveValidation.Require(e.PayloadVersion==1 && SaveValidation.JsonObject(e.ExtensionsJson,16384)=="{}","UNKNOWN_CONTENT");
+            Valid(p.Status=="human_pending" ? d is null && e.StateKind is null && e.LastDecisionId is null
+                : d is not null && e.LastDecisionId==d.DecisionId && e.StateKind==SaveValidation.DecisionState(d.ConsequencesJson,d.ConsequencesVersion));
+            Valid(p.Status!="completed" || p.Result==(e.StateKind=="healthy"?"good":"bad"));
+            bool humanEntry=p.Status=="human_pending" && game.CurrentBiomeId==id && game.ResumeKind=="human_decision";
+            bool known=d is not null || humanEntry;
+            rows.Add(new(game.GameId,id,p.Status,p.Result,known?true:null,d is not null?"CONFIRMED_DECISION":humanEntry?"CURRENT_HUMAN_ENTRY":"NOT_RECORDED",
+                p.HumanCompletedAt,p.AnimalCompletedAt,p.UpdatedAt,d is null?StatisticsAvailability.NoData:StatisticsAvailability.Available,
+                d is null?null:new(game.GameId,id,d.DecisionId,d.OperationId,d.OptionId,e.StateKind!,d.ConsequencesJson,d.ConsequencesVersion,d.RulesVersion,d.OccurredAt)));
+        }
+        bool terminal=game.Status is "completed" or "final_pending";
+        bool endingValid=terminal && game.Ending is "good" or "medium" or "bad" &&
+            (game.EndingRulesVersion==game.RulesVersion || game.EndingRulesVersion==LocalFinalEvaluator.Version) && game.CompletedAt is not null;
+        var ending=endingValid ? new EndingStatistics(StatisticsAvailability.Available,game.Ending,game.EndingRulesVersion,null)
+            : new EndingStatistics(terminal?StatisticsAvailability.Unknown:StatisticsAvailability.NoData,null,null,terminal?"UNCONFIRMED_TERMINAL_METADATA":"NO_CONFIRMED_ENDING");
+        var summaries=Biomes.Select(b=>{var ds=decisions.Where(d=>d.BiomeId==b).ToArray();long reject=ds.LongCount(d=>d.OptionId=="reject"),approve=ds.LongCount(d=>d.OptionId=="approve");
+            return new BiomeDecisionStatistics(b,ds.LongLength,reject,approve,reject,approve);}).ToArray();
+        var counts=new DecisionStatistics(decisions.Count,summaries.Sum(d=>d.Reject),summaries.Sum(d=>d.Approve),summaries.Sum(d=>d.Healthy),summaries.Sum(d=>d.Degraded),Array.AsReadOnly(summaries));
+        return new GameStatistics(game.LocalPlayerId,game.GameId,game.Revision,game.IsCurrent,game.Status,game.RulesVersion,game.ContentVersion,
+            game.CreatedAt,game.SavedAt,game.CompletedAt,game.ArchivedAt,game.Status=="completed" && endingValid,ending,counts,Progress(rows),rows.AsReadOnly())
+        {Activity=Activity(r.Activity(game.LocalPlayerId),new HashSet<string>{game.GameId})};
+    }
+    private static ActivityStatistics Activity(ActivitySource source,HashSet<string>? games)
+    {
+        StatisticCount Absent()=>new(source.Available?StatisticsAvailability.NoData:StatisticsAvailability.NotAvailable,null,"NO_RECORDED_COVERAGE");
+        var events=source.Events.Where(e=>games is null || e.GameId is not null && games.Contains(e.GameId)).ToArray();
+        var intervals=source.Intervals.Where(i=>games is null || i.GameId is not null && games.Contains(i.GameId)).ToArray();
+        var sessions=source.Sessions.Where(s=>games is null || events.Any(e=>e.SessionId==s.SessionId) || intervals.Any(i=>i.SessionId==s.SessionId)).ToArray();
+        bool runs=events.Any(e=>e.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED);
+        StatisticCount EventCount(GameplayEventKind kind)=>runs?Count(events.LongCount(e=>e.Kind==kind)):Absent();
+        StatisticCount Time(GameplayInterval[] rows)=>rows.Length==0?Absent():Count(rows.Where(i=>i.State is GameplayTimeState.ActiveAnimal or GameplayTimeState.ActiveHuman).Sum(i=>i.EndMs-i.StartMs));
+        bool incomplete=sessions.Any(s=>s.Status!="closed" || source.Intervals.Where(i=>i.SessionId==s.SessionId).Sum(i=>i.EndMs-i.StartMs)!=s.EndOffsetMs);
+        return new(sessions.Length==0?Absent():Count(sessions.LongLength),EventCount(GameplayEventKind.ANIMAL_DIED),
+            EventCount(GameplayEventKind.ANIMAL_RESTART_REQUESTED),EventCount(GameplayEventKind.ANIMAL_RETRY_REQUESTED),Time(intervals),
+            Array.AsReadOnly(Biomes.Select(b=>new BiomeActivityStatistics(b,Time(intervals.Where(i=>i.BiomeId==b).ToArray()))).ToArray()),incomplete,true);
+    }
+    private static DecisionStatistics SumDecisions(IEnumerable<DecisionStatistics> values)
+    {
+        var all=values.ToArray();var biomes=Biomes.Select(b=>{var rows=all.SelectMany(d=>d.ByBiome).Where(d=>d.BiomeId==b).ToArray();
+            return new BiomeDecisionStatistics(b,rows.Sum(d=>d.Total),rows.Sum(d=>d.Reject),rows.Sum(d=>d.Approve),rows.Sum(d=>d.Healthy),rows.Sum(d=>d.Degraded));}).ToArray();
+        return new(all.Sum(d=>d.Total),all.Sum(d=>d.Reject),all.Sum(d=>d.Approve),all.Sum(d=>d.Healthy),all.Sum(d=>d.Degraded),Array.AsReadOnly(biomes));
+    }
+    private static ProgressStatistics Progress(IEnumerable<BiomeStatistics> values)
+    {
+        var rows=values.ToArray();long started=rows.LongCount(b=>b.Started==true),completed=rows.LongCount(b=>b.Status=="completed");
+        var start=rows.Length==0?new StatisticCount(StatisticsAvailability.NoData,null):rows.All(b=>b.Started==true)?Count(started):new(StatisticsAvailability.Unknown,null,"ENTRY_HISTORY_NOT_RECORDED");
+        return new(start,started,completed,rows.LongLength-completed,rows.LongCount(b=>b.Status=="human_pending"),rows.LongCount(b=>b.Status=="animal_pending"));
+    }
+}

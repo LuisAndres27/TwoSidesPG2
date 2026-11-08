@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <RuntimeFrameworkVersion>8.0.30</RuntimeFrameworkVersion>
+    <TargetLatestRuntimePatch>false</TargetLatestRuntimePatch>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../src/TwoSides.LocalPersistence.csproj" />
+    <ProjectReference Include="../sync-http/TwoSides.SyncHttp.csproj" />
+    <Compile Include="*.cs.txt" />
+    <Compile Include="../../integration/sqlite/LocalGameState.cs" Link="LocalGameState.cs" />
+    <Compile Include="../../integration/sqlite/LocalGameplayObserver.cs" Link="LocalGameplayObserver.cs" />
+    <Compile Include="../../integration/sqlite/LocalStatisticsScreenState.cs" Link="LocalStatisticsScreenState.cs" />
+    <Compile Include="../../integration/sqlite/GamePersistenceAdapter.cs" Link="GamePersistenceAdapter.cs" />
+    <Compile Include="../../integration/sqlite/RealGameCatalog.cs" Link="RealGameCatalog.cs" />
+    <!-- Engine-free game sources, to prove the test-storage guards without the engine. -->
+    <Compile Include="../../integration/sqlite/LocalGameState.cs" Link="LocalGameState.cs" />
+    <Compile Include="../../integration/sqlite/LocalGameplayObserver.cs" Link="LocalGameplayObserver.cs" />
+    <Compile Include="../../integration/sqlite/LocalStatisticsScreenState.cs" Link="LocalStatisticsScreenState.cs" />
+    <Compile Include="../../integration/sqlite/GamePersistenceAdapter.cs" Link="GamePersistenceAdapter.cs" />
+    <Compile Include="../../integration/sqlite/RealGameCatalog.cs" Link="RealGameCatalog.cs" />
+    <Compile Include="../../integration/sqlite/GameTestStorage.cs" Link="GameTestStorage.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,256 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+
+using TwoSides.LocalPersistence;
+
+namespace TwoSides.Integration.SyncHttp;
+
+// B05.5 stage 3. Pure C# (no Godot types) so the whole start/stop policy is testable without the engine.
+
+// Explicit test endpoints only: legacy HTTP loopback, or HTTPS localhost together with disposable storage.
+// No argument accepts a host, port, scheme or credential; unknown/ambiguous sync arguments never select an endpoint.
+public static class SyncLocalMode
+{
+    public const string Flag="--two-sides-sync-local-test";
+    public const string HttpsFlag="--two-sides-sync-local-test-https";
+    public const int Port=3000;
+    public static SyncHttpOptions? FromArguments(IEnumerable<string> userArguments)
+    {
+        var args=userArguments.ToList();
+        var related=args.Where(a=>a.StartsWith("--two-sides-sync",StringComparison.OrdinalIgnoreCase)).ToList();
+        if(related.Count!=1)return null;
+        if(related[0]==Flag)return SyncHttpOptions.LoopbackDevelopment(Port);
+        var storage=args.Where(a=>a.StartsWith("--two-sides-test-storage",StringComparison.OrdinalIgnoreCase)).ToList();
+        if(related[0]!=HttpsFlag||storage.Count!=1||storage[0]!=SyncTestStorageMode.Flag)return null;
+        return new SyncHttpOptions(new Uri("https://localhost:8443/"));
+    }
+}
+
+// Normal synchronization: a public HTTPS API origin from trusted game configuration, never a MongoDB URI or password.
+// Missing/invalid configuration keeps it disabled. Local test flags retain their separate existing behaviour.
+public static class SyncMainMode
+{
+    public static SyncHttpOptions? FromConfiguration(string? apiUrl,IEnumerable<string> userArguments)
+    {
+        if(string.IsNullOrWhiteSpace(apiUrl)||userArguments.Any(a=>a.StartsWith("--two-sides-sync",StringComparison.OrdinalIgnoreCase)||a.StartsWith("--two-sides-test-storage",StringComparison.OrdinalIgnoreCase)))return null;
+        if(!Uri.TryCreate(apiUrl,UriKind.Absolute,out var uri)||uri.Scheme!=Uri.UriSchemeHttps)return null;
+        try{return new SyncHttpOptions(uri);}catch(SaveException){return null;}
+    }
+    // Separate durable technical identities for main and test, and for different API deployments.
+    public static string CredentialNamespace(SyncHttpOptions options)
+        =>Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(options.BaseUri.AbsoluteUri))).ToLowerInvariant();
+}
+
+public enum SyncTestStorageRequest{None,Sandbox,Invalid}
+
+public static class SyncTestStorageMode
+{
+    public const string Flag="--two-sides-test-storage=sandbox";
+    // Exact storage flag plus one exact HTTP/HTTPS test sync flag. HTTPS without storage is invalid, never normal storage.
+    // It names no path: the game creates its own
+    // disposable SyntheticSandbox database. Any other "--two-sides-test-storage*" argument is Invalid and the game must fail closed.
+    public static SyncTestStorageRequest FromArguments(IEnumerable<string> userArguments)
+    {
+        var args=userArguments.ToList();
+        var related=args.Where(a=>a.StartsWith("--two-sides-test-storage",StringComparison.OrdinalIgnoreCase)).ToList();
+        if(related.Count==0)return args.Any(a=>a.StartsWith(SyncLocalMode.HttpsFlag,StringComparison.OrdinalIgnoreCase))?SyncTestStorageRequest.Invalid:SyncTestStorageRequest.None;
+        if(related.Count!=1||related[0]!=Flag)return SyncTestStorageRequest.Invalid;
+        return SyncLocalMode.FromArguments(args) is null?SyncTestStorageRequest.Invalid:SyncTestStorageRequest.Sandbox;
+    }
+}
+
+// Who may be synchronized right now. A session is active at startup (the local profile), ends on logout and begins again on login / menu entry.
+// Nothing resumes after Close() (storage is closing) and nothing resumes without an open database and a loaded profile.
+public sealed class SyncSessionGate
+{
+    private int _active=1,_closed;
+    public bool Active=>Volatile.Read(ref _active)==1&&Volatile.Read(ref _closed)==0;
+    public void End()=>Volatile.Write(ref _active,0);
+    public bool Begin(){if(Volatile.Read(ref _closed)==1)return false;Volatile.Write(ref _active,1);return true;}
+    public void Close(){Volatile.Write(ref _closed,1);Volatile.Write(ref _active,0);}
+    public bool Evaluate(bool profileLoaded,bool storageOpen)=>Active&&profileLoaded&&storageOpen;
+}
+
+public static class SyncOutboxCounts
+{
+    // Counts by delivery state only (no ids, payloads or credentials): safe for logs.
+    public static string Read(ISaveDatabase database)
+    {
+        try
+        {
+            using var connection=database.Open();using var command=connection.CreateCommand();
+            command.CommandText="SELECT state,count(*) FROM sync_outbox GROUP BY state ORDER BY state;";
+            using var rows=command.ExecuteReader();var parts=new List<string>();
+            while(rows.Read())parts.Add(rows.GetString(0)+"="+rows.GetInt64(1));
+            return parts.Count==0?"outbox=empty":string.Join(",",parts);
+        }
+        catch(Exception error) when(error is SqliteException or InvalidOperationException or SaveException){return "outbox=unavailable";}
+    }
+}
+
+// Finds the local sync identity inside the game's own SQLite file: the single profile with its single registered installation.
+// Read-only. Anything missing or ambiguous means "no valid session yet".
+public static class SyncBindingReader
+{
+    public static SyncBinding? Read(ISaveDatabase database)
+    {
+        try
+        {
+            using var connection=database.Open();using var command=connection.CreateCommand();
+            command.CommandText="SELECT p.local_player_id,i.installation_id,i.binding_generation FROM local_profiles p JOIN sync_installations i ON i.local_player_id=p.local_player_id;";
+            using var rows=command.ExecuteReader();SyncBinding? found=null;
+            while(rows.Read())
+            {
+                if(found is not null)return null;                                  // ambiguous: never choose
+                found=new(rows.GetString(0),rows.GetString(1),rows.GetInt64(2));
+            }
+            return found;
+        }
+        catch(Exception error) when(error is SqliteException or InvalidOperationException or SaveException){return null;}
+    }
+}
+
+public enum SyncLifecycleState{Disabled,Stopped,Running,Disposed}
+
+// Owns AT MOST ONE worker (and its HttpClient). Start is idempotent, stop is ordered and bounded, and every state change goes through one gate.
+// Pending operations are never touched here: a stop leaves them in the Outbox exactly as the dispatcher left them (leases expire and are recovered on the next start).
+public sealed class SyncWorkerLifecycle:IAsyncDisposable
+{
+    private readonly SyncHttpOptions? _options;
+    private readonly Func<ISaveDatabase?> _storage;
+    private readonly Func<ISyncSecretStore> _secrets;
+    private readonly TimeSpan? _idle,_failure;
+    private readonly Func<DateTimeOffset>? _clock;
+    private readonly Func<System.Net.Http.HttpMessageHandler?>? _handler;
+    private readonly bool _requireUnconfirmedDestination;
+    // Credentials live only in this process and are keyed by binding (player + installation): they survive logout/login of the SAME player and are never visible to another one.
+    // JWTs do not: each start builds a new SyncSessionManager, so a token is never carried across sessions or players.
+    private readonly InMemorySyncSecretStore _ownSecrets=new();
+    private readonly SemaphoreSlim _gate=new(1,1);
+    private SyncHttpTransport? _transport;
+    private SyncOutboxWorker? _worker;
+    private SyncBinding? _binding,_lastBinding;
+    private long _created,_stopped;
+    private int _state;
+    private string _code="SYNC_DISABLED";
+    public SyncWorkerLifecycle(SyncHttpOptions? options,Func<ISaveDatabase?> storage,Func<ISyncSecretStore>? secrets=null,TimeSpan? idle=null,TimeSpan? failure=null,Func<DateTimeOffset>? clock=null,Func<System.Net.Http.HttpMessageHandler?>? handler=null,bool requireUnconfirmedDestination=false)
+    {
+        _clock=clock;_handler=handler;_options=options;_storage=storage;_idle=idle;_failure=failure;
+        _requireUnconfirmedDestination=requireUnconfirmedDestination;
+        _secrets=secrets??(()=>_ownSecrets);
+        _state=(int)(options is null?SyncLifecycleState.Disabled:SyncLifecycleState.Stopped);
+        if(options is not null)_code="SYNC_STOPPED";
+    }
+    public SyncLifecycleState State=>(SyncLifecycleState)Volatile.Read(ref _state);
+    public bool Enabled=>_options is not null;
+    public long WorkersCreated=>Interlocked.Read(ref _created);
+    public long WorkersStopped=>Interlocked.Read(ref _stopped);
+    public string Code=>Volatile.Read(ref _code);
+    public SyncWorkerDiagnostic? WorkerDiagnostic=>_worker?.Diagnostic;
+
+    // Called periodically from a background thread. Starts the worker when (and only when) a valid local session exists; stops it when it ends.
+    public async Task<string> TickAsync(bool sessionValid)
+    {
+        if(_options is null)return Set("SYNC_DISABLED");
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if(State==SyncLifecycleState.Disposed)return "SYNC_DISPOSED";
+            if(!sessionValid)
+            {
+                if(_worker is not null)await StopCoreAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+                return Set("SYNC_WAITING_SESSION");
+            }
+            if(_worker is not null)return Set("SYNC_RUNNING");                      // already running: never a second worker
+            var database=_storage();
+            if(database is null)return Set("SYNC_WAITING_STORAGE");
+            var binding=SyncBindingReader.Read(database);
+            if(binding is null)return Set("SYNC_WAITING_BINDING");
+            var secretStore=_secrets();
+            if(_requireUnconfirmedDestination && secretStore.ReadAccount(binding) is null)
+            {
+                // Receipts are not partitioned by destination in the current SQLite contract. Never treat old integration ACKs as main ACKs.
+                using var c=database.Open();using var q=c.CreateCommand();
+                q.CommandText="SELECT 1 FROM sync_outbox WHERE local_player_id=$p AND installation_id=$i AND binding_generation=$g AND state='confirmed' LIMIT 1;";
+                q.Parameters.AddWithValue("$p",binding.LocalPlayerId);q.Parameters.AddWithValue("$i",binding.InstallationId);q.Parameters.AddWithValue("$g",binding.BindingGeneration);
+                if(q.ExecuteScalar() is not null)return Set("SYNC_DESTINATION_MIGRATION_REQUIRED");
+            }
+            var transport=new SyncHttpTransport(_options,_handler?.Invoke());
+            try
+            {
+                var outbox=new SyncOutboxService(database,_clock);
+                var session=new SyncSessionManager(transport,binding,secretStore);
+                var dispatcher=new SyncOutboxDispatcher(outbox,session,binding);
+                _worker=new SyncOutboxWorker(dispatcher.RunPassAsync,_idle,_failure);
+            }
+            catch{transport.Dispose();throw;}
+            _transport=transport;_binding=binding;_lastBinding=binding;
+            Interlocked.Increment(ref _created);Volatile.Write(ref _state,(int)SyncLifecycleState.Running);
+            _worker.Request();
+            return Set("SYNC_STARTED");
+        }
+        catch(Exception error) when(error is SaveException or SqliteException or InvalidOperationException){return Set("SYNC_START_FAILED");}
+        finally{_gate.Release();}
+    }
+
+    // Explicit "sign out of this device": stops the worker, then removes the stored credential for the current binding. The player can keep playing
+    // offline; to synchronize again the backend must accept a new registration for that player/installation (see the stage 5 report).
+    public async Task<string> ForgetCredentialAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if(State==SyncLifecycleState.Disposed)return "SYNC_DISPOSED";
+            var known=_binding??_lastBinding;
+            await StopCoreAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            if(known is null){var database=_storage();known=database is null?null:SyncBindingReader.Read(database);}
+            if(known is null)return Set("SYNC_NO_BINDING");
+            try{_secrets().Forget(known);}catch(SaveException){return Set("SYNC_CREDENTIAL_FORGET_FAILED");}
+            _lastBinding=null;
+            return Set("SYNC_CREDENTIAL_FORGOTTEN");
+        }
+        finally{_gate.Release();}
+    }
+
+    // Wakes the worker after new local facts were captured. Cheap, never blocks, no-op when stopped.
+    public void Request()=>_worker?.Request();
+
+    public async Task<string> StopAsync(TimeSpan budget)
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try{if(State==SyncLifecycleState.Disposed)return "SYNC_DISPOSED";return await StopCoreAsync(budget).ConfigureAwait(false);}
+        finally{_gate.Release();}
+    }
+
+    private async Task<string> StopCoreAsync(TimeSpan budget)
+    {
+        var worker=_worker;var transport=_transport;_worker=null;_transport=null;_binding=null;
+        string code="SYNC_STOPPED";
+        if(worker is not null)
+        {
+            var closing=worker.DisposeAsync().AsTask();
+            // Cancelling the worker also cancels the in-flight request. If it does not finish in time, closing the HttpClient aborts the socket.
+            if(await Task.WhenAny(closing,Task.Delay(budget)).ConfigureAwait(false)!=closing)code="SYNC_STOP_TIMEOUT";
+            transport?.Dispose();
+            if(code=="SYNC_STOP_TIMEOUT")
+                try{await Task.WhenAny(closing,Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false);}catch{/* the worker ends on its own */}
+            Interlocked.Increment(ref _stopped);
+        }
+        else transport?.Dispose();
+        if(State!=SyncLifecycleState.Disabled)Volatile.Write(ref _state,(int)SyncLifecycleState.Stopped);
+        return Set(code);
+    }
+
+    private string Set(string code){Volatile.Write(ref _code,code);return code;}
+
+    public async ValueTask DisposeAsync()
+    {
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try{if(State==SyncLifecycleState.Disposed)return;await StopCoreAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);Volatile.Write(ref _state,(int)SyncLifecycleState.Disposed);}
+        finally{_gate.Release();}
+    }
+}

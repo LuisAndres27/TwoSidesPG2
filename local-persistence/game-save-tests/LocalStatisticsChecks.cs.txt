@@ -1,0 +1,177 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class LocalStatisticsChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static void Check(bool ok){if(!ok)throw new Exception("Local statistics assertion failed");}
+    private static void Error(string code,Action action)
+    {try{action();throw new Exception("Expected "+code);}catch(SaveException e){Check(e.Code==code);}}
+    private sealed class ReadOnly:ISaveDatabase
+    {
+        private readonly ISaveDatabase _db;internal int Opens;
+        internal ReadOnly(ISaveDatabase db)=>_db=db;
+        public SqliteConnection Open()
+        {
+            Opens++;var c=_db.Open();using var q=c.CreateCommand();q.CommandText="PRAGMA query_only=ON;";q.ExecuteNonQuery();return c;
+        }
+    }
+    private sealed class Broken:ISaveDatabase
+    {
+        public SqliteConnection Open()=>throw new UnauthorizedAccessException("synthetic");
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly GameSaveService Save;
+        internal readonly string Owner=Id();
+        internal string Game="";
+        internal F(bool profile=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState());
+            if(profile)Save.CreateLocalProfile(Id(),Owner,"Estadísticas sintéticas");
+        }
+        internal void NewGame(){Game=Id();Save.CreateNewGame(new(Id(),Owner,Game));}
+        internal void Decide(int index,bool healthy=true)
+        {
+            var g=Save.LoadGame(Owner,Game).Game;Save.EnterBiome(new(Id(),Owner,Game,g.Revision,Biomes[index],"human"));
+            g=Save.LoadGame(Owner,Game).Game;Save.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,Biomes[index],Keys[index],healthy?"reject":"approve",healthy?"healthy":"degraded",healthy?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));
+        }
+        internal void Terminal(string ending="good")
+        {
+            // Fixture setup, not a production implementation of finalization.
+            using var c=Db.Open();using var q=c.CreateCommand();
+            q.CommandText="UPDATE saved_games SET is_current=0,status='completed',ending=$e,ending_rules_version=rules_version,completed_at=saved_at WHERE game_id=$g;";
+            q.Parameters.AddWithValue("$e",ending);q.Parameters.AddWithValue("$g",Game);q.ExecuteNonQuery();
+        }
+        internal StatisticsService Stats()=>new(new ReadOnly(Db),RealGameCatalog.InitialState());
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        internal void Sql(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;q.ExecuteNonQuery();}
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work,bool profile=true)
+    {using var f=new F(profile);await work(f);_count++;Console.WriteLine("PASS "+name);}
+    public static async Task<int> Run()
+    {
+        await Case("initialized empty database returns NoData without creating profile",f=>
+        {string h=f.Hash();var r=f.Stats().GetLocalStatistics();Check(r.State==StatisticsAvailability.NoData && r.Data is null && f.Hash()==h);return Task.CompletedTask;},false);
+        await Case("profile without games has measured zero decisions and no history",f=>
+        {var p=f.Stats().GetPlayerStatistics(f.Owner);Check(p.LocalPlayerId==f.Owner && p.DisplayName=="Estadísticas sintéticas" && p.TotalGames==0 && p.AllDecisions.Total==0 && p.GamesState==StatisticsAvailability.NoData && p.HistoricalGames.Count==0);return Task.CompletedTask;});
+        await Case("one active game is separate from historical games",f=>
+        {f.NewGame();var p=f.Stats().GetPlayerStatistics(f.Owner);Check(p.TotalGames==1 && p.ActiveGames==1 && p.ActiveGameId==f.Game && p.ActiveGame?.GameId==f.Game && p.HistoricalGames.Count==0);return Task.CompletedTask;});
+        await Case("five precreated human pending rows do not mean five started biomes",f=>
+        {f.NewGame();var g=f.Stats().GetGameStatistics(f.Owner,f.Game);Check(g.Progress.Pending==5 && g.Progress.Completed==0 && g.Progress.ConfirmedStartedMinimum==0 && g.Progress.Started.State==StatisticsAvailability.Unknown && g.Progress.Started.Value is null);return Task.CompletedTask;});
+        await Case("current human entry is explicit started evidence",f=>
+        {f.NewGame();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"desert","human"));var g=f.Stats().GetGameStatistics(f.Owner,f.Game);Check(g.Progress.ConfirmedStartedMinimum==1 && g.Biomes.Single(b=>b.BiomeId=="desert").StartedEvidence=="CURRENT_HUMAN_ENTRY");return Task.CompletedTask;});
+        for(int i=0;i<5;i++)foreach(bool healthy in new[]{true,false})
+        {
+            int index=i;
+            await Case("confirmed decision "+Biomes[i]+" "+(healthy?"reject":"approve"),f=>
+            {
+                f.NewGame();f.Decide(index,healthy);var g=f.Stats().GetGameStatistics(f.Owner,f.Game);
+                var b=g.Biomes.Single(b=>b.BiomeId==Biomes[index]);
+                Check(g.Decisions.Total==1 && g.Decisions.Reject==(healthy?1:0) && g.Decisions.Approve==(healthy?0:1) && g.Decisions.Healthy==(healthy?1:0) && g.Decisions.Degraded==(healthy?0:1));
+                Check(b.Consequence?.StateKind==(healthy?"healthy":"degraded") && b.Consequence.GameId==f.Game && b.Consequence.OperationId==f.Save.LoadGame(f.Owner,f.Game).Decisions.Single().OperationId);
+                Check(g.Progress.Completed==0 && g.Progress.Pending==5 && b.Status=="animal_pending" && b.Started==true);
+                return Task.CompletedTask;
+            });
+        }
+        await Case("free biome order retains each option and scope",f=>
+        {f.NewGame();foreach(int i in new[]{4,0,3,1,2})f.Decide(i,i%2==0);var g=f.Stats().GetGameStatistics(f.Owner,f.Game);Check(g.Decisions.Total==5 && g.Decisions.Reject==3 && g.Decisions.Approve==2 && g.Progress.Started.Value==5 && g.Decisions.ByBiome.All(b=>b.Total==1));return Task.CompletedTask;});
+        await Case("idempotent decision retry and repeated queries do not duplicate counts",f=>
+        {
+            f.NewGame();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            var command=new RecordDecisionCommand(Id(),Id(),f.Owner,f.Game,1,"ocean",Keys[0],"reject","healthy","{\"stateKind\":\"healthy\"}");
+            f.Save.RecordDecision(command);string h=f.Hash();f.Save.RecordDecision(command);
+            for(int i=0;i<3;i++)Check(f.Stats().GetPlayerStatistics(f.Owner).AllDecisions.Total==1);
+            Check(f.Hash()==h);return Task.CompletedTask;
+        });
+        await Case("animal restart query does not increase decisions",async f=>
+        {
+            f.NewGame();f.Decide(0);var store=new RuntimeMenuChecks.Store(f.Db,new RuntimeMenuChecks.Failure());
+            await using var state=new LocalGameState(store,"owned-fixture");await state.InitializeAsync();string h=f.Hash();
+            var restart=new LocalAnimalRestart();Check(await restart.RestartAsync(state,LocalBiomeSelection.AnimalSceneFor("ocean")!,_=>true,(_,_)=>Task.FromResult(true)));
+            Check(f.Stats().GetPlayerStatistics(f.Owner).AllDecisions.Total==1 && f.Hash()==h);
+        });
+        await Case("multiple historical games and active decisions stay separate",f=>
+        {
+            f.NewGame();f.Decide(0);string first=f.Game;f.Terminal("medium");f.NewGame();f.Decide(1,false);
+            var p=f.Stats().GetPlayerStatistics(f.Owner);
+            Check(p.TotalGames==2 && p.CompletedGames.Value==1 && p.HistoricalGames.Single().GameId==first && p.ActiveGame?.Decisions.Approve==1 && p.ActiveGame.Decisions.Reject==0 && p.AllDecisions.Total==2 && p.AllDecisions.Reject==1 && p.HistoricalDecisions.Total==1 && p.HistoricalDecisions.Reject==1 && p.HistoricalDecisions.Approve==0);
+            return Task.CompletedTask;
+        });
+        await Case("complete history exceeds default game and decision page sizes",f=>
+        {
+            for(int n=0;n<55;n++){f.NewGame();f.Decide(0);f.Decide(1,false);f.Terminal();}
+            f.NewGame();f.Decide(2);var p=f.Stats().GetPlayerStatistics(f.Owner);
+            Check(p.TotalGames==56 && p.HistoricalGames.Count==55 && p.AllDecisions.Total==111 && p.AllDecisions.Reject==56 && p.AllDecisions.Approve==55);
+            return Task.CompletedTask;
+        });
+        await Case("repository pagination continues past its own 128-row page",f=>
+        {for(int n=0;n<129;n++){f.NewGame();f.Terminal();}var p=f.Stats().GetPlayerStatistics(f.Owner);Check(p.TotalGames==129 && p.CompletedGames.Value==129 && p.HistoricalGames.Count==129);return Task.CompletedTask;});
+        await Case("only genuinely stored completed biome counts as completed",f=>
+        {
+            f.NewGame();f.Decide(0);var old=f.Save.LoadGame(f.Owner,f.Game).Game;
+            f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,old.Revision,"ocean","good"));
+            var g=f.Stats().GetGameStatistics(f.Owner,f.Game);
+            Check(g.Progress.Completed==1 && g.Progress.Pending==4 && g.Biomes.Single(b=>b.BiomeId=="ocean").AnimalCompletedAt is not null && g.Status=="in_progress");return Task.CompletedTask;
+        });
+        await Case("terminal metadata is read without evaluating a new ending",f=>
+        {f.NewGame();f.Terminal("bad");var g=f.Stats().GetGameStatistics(f.Owner,f.Game);Check(g.ConfirmedCompleted && g.Ending.Kind=="bad" && g.Ending.State==StatisticsAvailability.Available && g.CompletedAt is not null);return Task.CompletedTask;});
+        await Case("unconfirmed completed metadata is Unknown rather than zero",f=>
+        {f.NewGame();f.Terminal();f.Sql("UPDATE saved_games SET ending=NULL,ending_rules_version=NULL;");var p=f.Stats().GetPlayerStatistics(f.Owner);Check(p.CompletedGames.State==StatisticsAvailability.Unknown && p.CompletedGames.Value is null && p.HistoricalGames.Single().Ending.State==StatisticsAvailability.Unknown);return Task.CompletedTask;});
+        await Case("current final-pending record stays separate from terminal history",f=>
+        {f.NewGame();f.Sql("UPDATE saved_games SET status='final_pending',ending='medium',ending_rules_version=rules_version,completed_at=saved_at,resume_kind='ending';");var p=f.Stats().GetPlayerStatistics(f.Owner);Check(p.ActiveGames==1 && p.ActiveGame?.Status=="final_pending" && p.ActiveGame.Ending.Kind=="medium" && p.CompletedGames.Value==0 && p.HistoricalGames.Count==0);return Task.CompletedTask;});
+        await Case("uncollected time deaths restarts sessions retries are NotAvailable with null values",f=>
+        {var p=f.Stats().GetPlayerStatistics(f.Owner);foreach(var m in new[]{p.Uncollected.PlayedMilliseconds,p.Uncollected.Deaths,p.Uncollected.Restarts,p.Uncollected.Sessions,p.Uncollected.Retries})Check(m.State==StatisticsAvailability.NotAvailable && m.Value is null);Check(p.AllDecisions.Total==0 && p.CompletedGames.Value==0);return Task.CompletedTask;});
+        await Case("schema-v2 older compatible rows and consequence version 2 are supported",f=>
+        {
+            f.NewGame();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            f.Save.RecordDecision(new(Id(),Id(),f.Owner,f.Game,1,"ocean",Keys[0],"reject","healthy","{\"stateKind\":\"healthy\"}",new("favorable","audit-v1")));
+            var g=f.Stats().GetGameStatistics(f.Owner,f.Game);Check(g.Biomes[0].Consequence?.ConsequencesVersion==2 && SchemaManager.ReadVersion(f.Db)==2);return Task.CompletedTask;
+        });
+        await Case("read-only connection preserves database bytes timestamps schema and operation receipts",f=>
+        {
+            f.NewGame();f.Decide(0);string h=f.Hash();long time=File.GetLastWriteTimeUtc(f.Db.Path).Ticks;
+            var stats=new StatisticsService(new RuntimeMenuChecks.ReadOnlyFixture(f.Db.Path),RealGameCatalog.InitialState());
+            stats.GetLocalStatistics();stats.GetPlayerStatistics(f.Owner);stats.GetGameStatistics(f.Owner,f.Game);
+            Check(f.Hash()==h && File.GetLastWriteTimeUtc(f.Db.Path).Ticks==time && SchemaManager.ReadVersion(f.Db)==2);return Task.CompletedTask;
+        });
+        await Case("whole player summary uses exactly one snapshot connection",f=>
+        {f.NewGame();f.Decide(0);var guard=new ReadOnly(f.Db);var stats=new StatisticsService(guard,RealGameCatalog.InitialState());guard.Opens=0;stats.GetPlayerStatistics(f.Owner);Check(guard.Opens==1);return Task.CompletedTask;});
+        await Case("foreign player cannot obtain local name or game",f=>
+        {f.NewGame();var s=f.Stats();string other=Id();Error("NOT_FOUND",()=>s.GetPlayerStatistics(other));Error("NOT_FOUND",()=>s.GetGameStatistics(other,f.Game));return Task.CompletedTask;});
+        await Case("independent profiles in independent stores remain isolated",f=>
+        {f.NewGame();f.Decide(0);using var other=new F();other.NewGame();other.Decide(1,false);Check(f.Stats().GetLocalStatistics().Data?.AllDecisions.Reject==1 && other.Stats().GetLocalStatistics().Data?.AllDecisions.Approve==1);Error("NOT_FOUND",()=>f.Stats().GetPlayerStatistics(other.Owner));return Task.CompletedTask;});
+        await Case("invalid IDs and unknown game reject without changing data",f=>
+        {f.NewGame();string h=f.Hash();var s=f.Stats();Error("INVALID_DATA",()=>s.GetPlayerStatistics("bad"));Error("INVALID_DATA",()=>s.GetGameStatistics(f.Owner,"bad"));Error("NOT_FOUND",()=>s.GetGameStatistics(f.Owner,Id()));Check(f.Hash()==h);return Task.CompletedTask;});
+        await Case("missing SQLite table becomes controlled storage error",f=>
+        {f.NewGame();var s=f.Stats();f.Sql("ALTER TABLE environmental_state RENAME TO missing_environment;");
+            Error("IO_ERROR",()=>s.GetPlayerStatistics(f.Owner));return Task.CompletedTask;
+        });
+        await Case("unsupported empty schema never auto-initializes",f=>
+        {var raw=f.Sandbox.CreateDatabase();string h=Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(raw.Path)));Error("UNSUPPORTED_SCHEMA",()=>new StatisticsService(raw,RealGameCatalog.InitialState()));Check(Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(raw.Path)))==h);return Task.CompletedTask;});
+        await Case("storage access failure exposes safe error code",f=>
+        {Error("ACCESS_DENIED",()=>new StatisticsService(new Broken(),RealGameCatalog.InitialState()));return Task.CompletedTask;});
+        await Case("older schema requiring migration is rejected without upgrading",f=>
+        {var old=f.Sandbox.CreateDatabase();SchemaManager.Initialize(old,1);string h=Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(old.Path)));Error("UNSUPPORTED_SCHEMA",()=>new StatisticsService(old,RealGameCatalog.InitialState()));Check(SchemaManager.ReadVersion(old)==1 && Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(old.Path)))==h);return Task.CompletedTask;});
+        await Case("unknown consequence version is rejected without inventing counts",f=>
+        {f.NewGame();f.Decide(0);f.Sql("UPDATE environmental_decisions SET consequences_version=3;");string h=f.Hash();Error("UNKNOWN_CONTENT",()=>f.Stats().GetPlayerStatistics(f.Owner));Check(f.Hash()==h);return Task.CompletedTask;});
+        await Case("contradictory environmental projection is rejected without repair",f=>
+        {f.NewGame();f.Decide(0);f.Sql("UPDATE environmental_state SET state_kind='degraded' WHERE state_kind='healthy';");string h=f.Hash();Error("INVALID_STATISTICS_DATA",()=>f.Stats().GetPlayerStatistics(f.Owner));Check(f.Hash()==h);return Task.CompletedTask;});
+        Check(typeof(StatisticsService).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "GodotSharp" and not "System.Net.Http" && !(a.Name??"").Contains("Mongo")));
+        Check(typeof(PlayerStatistics).GetProperties().All(p=>p.Name is not "CredentialRef" and not "InternalEmail" and not "TechnicalAccountId"));
+        _count++;Console.WriteLine("PASS typed statistics have no HTTP MongoDB Godot or credential fields");
+        Console.WriteLine($"Local statistics: {_count} passed, 0 failed; real read-only synthetic SQLite, not Godot runtime.");return 0;
+    }
+}

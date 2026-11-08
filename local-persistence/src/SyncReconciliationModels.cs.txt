@@ -1,0 +1,14 @@
+using System;
+using System.Collections.Generic;
+
+namespace TwoSides.LocalPersistence;
+
+// Local resumable hint, never a remote ACK or durable checkpoint of domain revisions.
+public sealed record SyncReconciliationCursor(SyncBinding Binding,string Origin,bool Audit,int Rank,string After,bool PreviousIssues=false);
+public sealed record SyncReconciliationPage(bool Committed,bool Completed,int Examined,int Inserted,int Existing,
+    int HistoricalSnapshots,IReadOnlyDictionary<string,int> Diagnostics,SyncReconciliationCursor? Next)
+{
+    public bool Consistent=>Committed && Diagnostics.Count==0;
+    // Safe for logs: no names, UUIDs, payload, cursor or paths.
+    public string DiagnosticSummary=>$"committed={Committed};completed={Completed};examined={Examined};inserted={Inserted};existing={Existing};historicalSnapshots={HistoricalSnapshots};issues={Diagnostics.Count}";
+}

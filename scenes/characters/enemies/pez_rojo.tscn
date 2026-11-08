@@ -1,0 +1,133 @@
+[gd_scene format=3 uid="uid://bh4oes0m7aocg"]
+
+[ext_resource type="Script" uid="uid://bwcrlxofy8kac" path="res://scripts/enemies/NpcPez.cs" id="1_deen4"]
+[ext_resource type="Script" uid="uid://cq8jxkyuk8uqv" path="res://scripts/globals/Hitbox.cs" id="1_iuxxd"]
+[ext_resource type="PackedScene" uid="uid://brjccjw4mabge" path="res://scenes/props/item_comida.tscn" id="2_b0v18"]
+[ext_resource type="Texture2D" uid="uid://bhv6qtgc1pxpi" path="res://assets/sprites/fondos/oceano/PEZ ROJO.png" id="2_jeood"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_b0v18"]
+atlas = ExtResource("2_jeood")
+region = Rect2(0, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_8ik3r"]
+atlas = ExtResource("2_jeood")
+region = Rect2(16, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_c3k8w"]
+atlas = ExtResource("2_jeood")
+region = Rect2(32, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_a0euh"]
+atlas = ExtResource("2_jeood")
+region = Rect2(48, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_ibnr2"]
+atlas = ExtResource("2_jeood")
+region = Rect2(64, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_cf4pp"]
+atlas = ExtResource("2_jeood")
+region = Rect2(80, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_csa1p"]
+atlas = ExtResource("2_jeood")
+region = Rect2(0, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_i2c4t"]
+atlas = ExtResource("2_jeood")
+region = Rect2(16, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_r55ng"]
+atlas = ExtResource("2_jeood")
+region = Rect2(32, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_s0n20"]
+atlas = ExtResource("2_jeood")
+region = Rect2(48, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_daovi"]
+atlas = ExtResource("2_jeood")
+region = Rect2(64, 0, 16, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_xrxq0"]
+atlas = ExtResource("2_jeood")
+region = Rect2(80, 0, 16, 16)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_rjl7x"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_b0v18")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_8ik3r")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_c3k8w")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_a0euh")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_ibnr2")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_cf4pp")
+}],
+"loop": true,
+"name": &"idle",
+"speed": 7.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_csa1p")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_i2c4t")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_r55ng")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_s0n20")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_daovi")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_xrxq0")
+}],
+"loop": true,
+"name": &"run",
+"speed": 7.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_deen4"]
+size = Vector2(17, 14)
+
+[sub_resource type="CapsuleShape2D" id="CapsuleShape2D_jeood"]
+radius = 8.0
+height = 26.0
+
+[node name="pez rojo" type="CharacterBody2D" unique_id=178621319]
+script = ExtResource("1_deen4")
+EscenaComida = ExtResource("2_b0v18")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=2088407011]
+sprite_frames = SubResource("SpriteFrames_rjl7x")
+animation = &"idle"
+frame = 2
+frame_progress = 0.08762613
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=2147287748]
+position = Vector2(0.5, 0)
+shape = SubResource("RectangleShape2D_deen4")
+
+[node name="Hitbox" type="Area2D" parent="." unique_id=491663390]
+script = ExtResource("1_iuxxd")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Hitbox" unique_id=1747225898]
+position = Vector2(1, 0)
+rotation = 1.5707964
+shape = SubResource("CapsuleShape2D_jeood")
+debug_color = Color(0.9500951, 3.272891e-06, 0.57267934, 0.41960785)

@@ -1,0 +1,27 @@
+{
+  "name": "two-sides-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Base local del backend de Two Sides — B01",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "npm run test:legacy && npm run test:jwt",
+    "test:legacy": "node --import ./tests/jwt/env-guard.js --test --test-concurrency=1 tests/unit/*.test.js tests/integration/*.test.js",
+    "test:jwt": "node --import ./tests/jwt/env-guard.js ./node_modules/vitest/vitest.mjs run --config vitest.config.js",
+    "bench:auth": "node scripts/benchmark-auth.js"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "2.2.2",
+    "express": "5.3.0",
+    "jose": "6.2.13",
+    "mongoose": "9.11.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "vitest": "5.0.5"
+  }
+}

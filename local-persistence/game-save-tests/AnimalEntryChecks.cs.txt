@@ -1,0 +1,131 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class AnimalEntryChecks
+{
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static int _passed;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok,string message){if(!ok)throw new Exception(message);}
+    private sealed class Store:ILocalAnimalStore
+    {
+        internal readonly GameSaveService Service;
+        internal bool NoProfile,FailRead;
+        internal Func<GameAggregate,GameAggregate>? Override;
+        internal Store(ISaveDatabase db){Service=new(db,RealGameCatalog.InitialState());}
+        public Task<LocalSaveResult<LocalProfile>> GetLocalProfileAsync()
+        {
+            try{return Task.FromResult(FailRead?new LocalSaveResult<LocalProfile>(false,"IO_ERROR"):new(true,"PROFILE",NoProfile?null:Service.GetLocalProfile()));}
+            catch(SaveException e){return Task.FromResult(new LocalSaveResult<LocalProfile>(false,e.Code));}
+        }
+        public Task<LocalSaveResult<GameAggregate>> GetActiveGameAsync(string owner)
+        {
+            try{var g=Service.GetActiveGame(owner);return Task.FromResult(new LocalSaveResult<GameAggregate>(true,"GAME",g is not null&&Override is not null?Override(g):g));}
+            catch(SaveException e){return Task.FromResult(new LocalSaveResult<GameAggregate>(false,e.Code));}
+        }
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly Store Store;
+        internal readonly string Owner=Id(),Game=Id(),Biome;
+        internal F(int index=0,bool healthy=true,bool decide=true)
+        {
+            Biome=Biomes[index];Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Store=new(Db);
+            Store.Service.CreateLocalProfile(Id(),Owner,"Entrada animal sintética");Store.Service.CreateNewGame(new(Id(),Owner,Game));
+            if(decide)Decide(index,healthy);
+        }
+        internal void Decide(int index,bool healthy)
+        {
+            var g=Store.Service.LoadGame(Owner,Game).Game;
+            Store.Service.EnterBiome(new(Id(),Owner,Game,g.Revision,Biomes[index],"human"));
+            g=Store.Service.LoadGame(Owner,Game).Game;
+            Store.Service.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,Biomes[index],Keys[index],healthy?"reject":"approve",healthy?"healthy":"degraded",healthy?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));
+        }
+        internal Task<LocalSaveResult<LocalAnimalContext>> Read(string? biome=null)=>LocalAnimalEntryReader.ReadAsync(Store,Owner,Game,biome??Biome);
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work,int biome=0,bool healthy=true,bool decide=true)
+    {using var f=new F(biome,healthy,decide);await work(f);_passed++;Console.WriteLine("PASS "+name);}
+    public static async Task<int> Probe(string path,string owner,string game,string biome)
+    {
+        var store=new Store(new RuntimeMenuChecks.ReadOnlyFixture(path));
+        var result=await LocalAnimalEntryReader.ReadAsync(store,owner,game,biome);
+        return result.Success&&result.Data?.BiomeId==biome&&result.Data.Decision.OperationId is not null?0:15;
+    }
+    public static async Task<int> Run()
+    {
+        for(int i=0;i<Biomes.Length;i++)foreach(bool healthy in new[]{true,false})
+        {
+            int index=i;bool chosen=healthy;
+            await Case(Biomes[i]+" recovers "+(healthy?"reject/healthy":"approve/degraded")+" from confirmed SQLite context",async f=>
+            {
+                string before=f.Hash();var original=f.Store.Service.LoadGame(f.Owner,f.Game);var r=await f.Read();
+                Check(r.Success&&r.Data is not null,r.Code);
+                Check(r.Data!.LocalPlayerId==f.Owner&&r.Data.GameId==f.Game&&r.Data.BiomeId==Biomes[index]&&r.Data.Healthy==chosen&&r.Data.Decision==original.Decisions.Single(),"wrong context");
+                Check(LocalAnimalEntryReader.MatchesPreparedEnvironment(r.Data,chosen)&&before==f.Hash(),"entry mutated state");
+                Check(LocalBiomeSelection.AnimalSceneFor(Biomes[index]) is not null&&original.Biomes.All(b=>b.Status!="completed"),"premature completion");
+            },i,healthy);
+        }
+        await Case("missing local profile is rejected",async f=>{f.Store.NoProfile=true;var r=await f.Read();Check(!r.Success&&r.Code=="PROFILE_REQUIRED","missing profile accepted");});
+        await Case("no current game is rejected without replacement",async f=>
+        {RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);var r=await f.Read();Check(!r.Success&&r.Code=="GAME_NOT_ACTIVE"&&f.Store.Service.GetGameHistory(f.Owner).Count==1,"missing game recreated");});
+        await Case("unknown biome rejects without mutation",async f=>{string hash=f.Hash();var r=await f.Read("invented");Check(!r.Success&&r.Code=="UNKNOWN_BIOME"&&hash==f.Hash(),"unknown biome accepted");});
+        await Case("human stage without decision cannot start animal",async f=>{var r=await f.Read();Check(!r.Success&&r.Code=="DECISION_REQUIRED","unconfirmed decision accepted");},decide:false);
+        await Case("completed biome cannot start animal",async f=>
+        {var g=f.Store.Service.LoadGame(f.Owner,f.Game).Game;f.Store.Service.CompleteBiome(new(Id(),f.Owner,f.Game,g.Revision,f.Biome,"good"));var r=await f.Read();Check(!r.Success&&r.Code=="BIOME_COMPLETED","completed reentry");});
+        await Case("another profile identity cannot use the saved decision",async f=>{var r=await LocalAnimalEntryReader.ReadAsync(f.Store,Id(),f.Game,f.Biome);Check(!r.Success&&r.Code=="PROFILE_REQUIRED","foreign profile accepted");});
+        await Case("another game ID cannot inherit current decision",async f=>{var r=await LocalAnimalEntryReader.ReadAsync(f.Store,f.Owner,Id(),f.Biome);Check(!r.Success&&r.Code=="GAME_NOT_ACTIVE","foreign game accepted");});
+        await Case("repeated validation preserves decision receipt reference revision and database bytes",async f=>
+        {string hash=f.Hash();var first=await f.Read();for(int i=0;i<5;i++){var r=await f.Read();Check(r.Success&&r.Data==first.Data,"non-idempotent context");}Check(hash==f.Hash(),"validation wrote SQLite");});
+        await Case("SQLite query failure is local and controlled",async f=>{f.Store.FailRead=true;var r=await f.Read();Check(!r.Success&&r.Code=="IO_ERROR","read failure ignored");});
+        await Case("invalid environment linkage cannot be silently repaired",async f=>
+        {string hash=f.Hash();f.Store.Override=g=>g with {Environments=g.Environments.Select(e=>e.BiomeId==f.Biome?e with {LastDecisionId=Id()}:e).ToArray()};var r=await f.Read();Check(!r.Success&&r.Code=="INVALID_ENVIRONMENT"&&hash==f.Hash(),"invalid link repaired");});
+        await Case("stored option consequence inconsistency is rejected without recalculation",async f=>
+        {f.Store.Override=g=>g with {Decisions=g.Decisions.Select(d=>d with {OptionId="approve"}).ToArray()};var r=await f.Read();Check(!r.Success&&r.Code=="INVALID_ENVIRONMENT","contradictory decision accepted");});
+        await Case("unsupported snapshot stays unchanged",async f=>
+        {string hash=f.Hash();f.Store.Override=g=>g with {Snapshot=g.Snapshot with {PayloadVersion=2}};var r=await f.Read();Check(!r.Success&&r.Code=="RESUME_UNSUPPORTED"&&hash==f.Hash(),"unsupported payload altered");});
+        await Case("already prepared environment needs no duplicate absolute assignment",async f=>
+        {var r=await f.Read();bool memory=r.Data!.Healthy;int applied=0;if(!LocalAnimalEntryReader.MatchesPreparedEnvironment(r.Data,memory)){memory=r.Data.Healthy;applied++;}Check(applied==0&&memory==r.Data.Healthy,"duplicate projection");});
+        await Case("late mismatched environment is refused rather than projected after Ready",async f=>
+        {var r=await f.Read();bool memory=!r.Data!.Healthy;Check(!LocalAnimalEntryReader.MatchesPreparedEnvironment(r.Data,memory)&&memory!=r.Data.Healthy,"late state mutation");});
+        await Case("animal selection carries confirmed environment before simulated scene initialization without writing",async f=>
+        {
+            var menuStore=new RuntimeMenuChecks.Store(f.Db,new());var selection=new LocalBiomeSelection(menuStore,f.Owner,f.Game);bool memory=true;int assignments=0;string hash=f.Hash();
+            Check(await selection.RefreshAsync()&&selection.Describe(f.Biome).Reason=="ANIMAL_FROM_START","animal entry not offered");
+            Check(await selection.EnterAsync(f.Biome,_=>true,plan=>
+            {
+                Check(plan.Scene==LocalBiomeSelection.AnimalSceneFor(f.Biome)&&plan.Environment=="degraded"&&plan.DecisionOperationId is not null,"wrong launch");
+                bool prepared=plan.Environment=="healthy";if(memory!=prepared){memory=prepared;assignments++;}
+                Check(!memory,"scene initialized with wrong environment");return Task.FromResult(true);
+            })&&assignments==1&&menuStore.EntryCalls==0&&hash==f.Hash(),"animal selection performed a write");
+        },healthy:false);
+        await Case("four confirmed biomes can be read independently of the last selected biome",async f=>
+        {
+            f.Decide(1,false);f.Decide(2,true);f.Decide(3,false);string hash=f.Hash();
+            for(int i=0;i<4;i++){var r=await f.Read(Biomes[i]);Check(r.Success&&r.Data!.Healthy==(i%2==0),"older decision inaccessible");}
+            Check(f.Store.Service.LoadGame(f.Owner,f.Game).Decisions.Count==4&&hash==f.Hash(),"manual-like history changed");
+        });
+        await Case("new read-only process recovers confirmed animal context",async f=>
+        {
+            string hash=f.Hash();var info=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true};
+            foreach(string arg in new[]{"--animal-entry-probe",f.Db.Path,f.Owner,f.Game,f.Biome})info.ArgumentList.Add(arg);
+            using var child=Process.Start(info);child!.WaitForExit();Check(child.ExitCode==0&&hash==f.Hash(),"restart validation changed data");
+        });
+        await Case("new active game does not adopt old animal context",async f=>
+        {RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);f.Store.Service.CreateNewGame(new(Id(),f.Owner,Id()));var r=await f.Read();Check(!r.Success&&r.Code=="GAME_NOT_ACTIVE","old animal decision adopted");});
+        Check(typeof(ILocalAnimalStore).GetMethods().Length==2&&typeof(ILocalAnimalStore).GetMethods().All(x=>x.Name.StartsWith("Get",StringComparison.Ordinal)),"animal port has write methods");
+        Check(typeof(LocalAnimalEntryReader).Assembly.GetReferencedAssemblies().All(x=>x.Name is not "GodotSharp" and not "System.Net.Http"&&!(x.Name??"").Contains("Mongo")),"remote or motor dependency");
+        _passed++;Console.WriteLine("PASS animal context capability is read-only with no HTTP MongoDB or Godot dependency");
+        Console.WriteLine($"Animal entry: {_passed} passed, 0 failed; synthetic SQLite queries and navigation callbacks, not Godot runtime.");return 0;
+    }
+}

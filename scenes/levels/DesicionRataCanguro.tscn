@@ -1,0 +1,120 @@
+[gd_scene format=3 uid="uid://caljlgt26vvaf"]
+
+[ext_resource type="Script" path="res://scripts/EnvironmentalDecisionNivel.cs" id="1_tgmip"]
+[ext_resource type="Texture2D" uid="uid://t28jygxygc55" path="res://assets/sprites/fondos/desierto/FONDO DESICIONES_0003.png" id="2_tgmip"]
+[ext_resource type="Texture2D" uid="uid://d13i6gnjfmtoh" path="res://assets/sprites/fondos/nieve/HUMANO.png" id="3_nwemg"]
+[ext_resource type="Texture2D" uid="uid://bcw8xcp5qn5" path="res://assets/sprites/fondos/props/TABLERO1.png" id="4_684ad"]
+[ext_resource type="Script" uid="uid://c7mqg7asc8bxd" path="res://scripts/MusicaFondo.cs" id="5_nwemg"]
+[ext_resource type="AudioStream" uid="uid://038lj14r1503" path="res://assets/sprites/fondos/Music/Menu y finales/Pixel Nature Main Theme (Take 2).wav" id="6_684ad"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_3meqi"]
+atlas = ExtResource("3_nwemg")
+region = Rect2(0, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_faf3x"]
+atlas = ExtResource("3_nwemg")
+region = Rect2(32, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_jxsir"]
+atlas = ExtResource("3_nwemg")
+region = Rect2(64, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_s780p"]
+atlas = ExtResource("3_nwemg")
+region = Rect2(96, 0, 32, 64)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_36e4i"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_3meqi")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_faf3x")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_jxsir")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_s780p")
+}],
+"loop": true,
+"name": &"default",
+"speed": 5.0
+}]
+
+[node name="DesicionZorro" type="Node2D" unique_id=1938246463]
+script = ExtResource("1_tgmip")
+BiomeId = "desert"
+Dialogo = PackedStringArray("Te encuentras en una situación difícil: tienes una camada de gatos no deseados en casa y necesitas una solución rápida. [Presiona espacio para continuar]", "Podrías abandonarlos a las afueras, en el desierto, ahorrando tiempo y dinero pensando que \'cazarán para sobrevivir\', aunque alteren el ecosistema. [Presiona espacio para continuar]", "La alternativa es asumir el costo económico y personal, invirtiendo tiempo en llevarlos a un refugio o pagando su esterilización. [Presiona espacio para continuar]")
+Pregunta = "¿Decides abandonar a los gatos en el desierto para ahorrar tiempo y dinero?"
+EscenaInfoBuena = "uid://dekxeby8v7pwq"
+EscenaInfoMala = "uid://uepwdv0h6w2u"
+
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=987870958]
+position = Vector2(369, 178)
+scale = Vector2(2.7875, 2.7875)
+texture = ExtResource("2_tgmip")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=158215570]
+position = Vector2(368, 264)
+scale = Vector2(1.90625, 1.90625)
+sprite_frames = SubResource("SpriteFrames_36e4i")
+autoplay = "default"
+frame_progress = 0.47553754
+
+[node name="BotonBuena" type="Button" parent="." unique_id=727000606]
+offset_left = 88.0
+offset_top = 138.0
+offset_right = 335.0
+offset_bottom = 169.0
+text = "No"
+
+[node name="BotonMala" type="Button" parent="." unique_id=2017679930]
+offset_left = 339.0
+offset_top = 138.0
+offset_right = 576.0
+offset_bottom = 169.0
+text = "Si"
+
+[node name="Dialogo" type="CanvasLayer" parent="." unique_id=573020373]
+
+[node name="Panel" type="NinePatchRect" parent="Dialogo" unique_id=935949914]
+custom_minimum_size = Vector2(0, 90)
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 83.0
+offset_top = 15.0
+offset_right = -63.0
+offset_bottom = -229.0
+grow_horizontal = 2
+grow_vertical = 2
+texture = ExtResource("4_684ad")
+patch_margin_left = 16
+patch_margin_top = 16
+patch_margin_right = 16
+patch_margin_bottom = 16
+
+[node name="Texto" type="RichTextLabel" parent="Dialogo/Panel" unique_id=1544121469]
+layout_mode = 0
+offset_left = 9.0
+offset_top = 19.0
+offset_right = 485.0
+offset_bottom = 108.0
+scroll_active = false
+
+[node name="Indicador" type="Label" parent="Dialogo/Panel" unique_id=2067019670]
+layout_mode = 0
+offset_left = 5.0
+offset_top = 1.0
+offset_right = 20.0
+offset_bottom = 24.0
+text = "▼"
+
+[node name="MusicaFondo" type="AudioStreamPlayer" parent="." unique_id=2040165801]
+script = ExtResource("5_nwemg")
+MusicaBuena = ExtResource("6_684ad")
+
+[connection signal="pressed" from="BotonBuena" to="." method="OnBotonBuenaPressed"]
+[connection signal="pressed" from="BotonMala" to="." method="OnBotonMalaPressed"]

@@ -1,0 +1,135 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+// Capability for files created by THIS instance only; never accepts an arbitrary database path.
+public sealed class SyntheticSandbox : IDisposable
+{
+#if TWOSIDES_DISTRIBUTION
+    // Test/historical capabilities fail closed in distributions. Production uses LocalApplicationData.
+    public static string AuthorizedProjectRoot => throw new SaveException("TEST_STORAGE_NOT_AVAILABLE");
+#else
+    public const string AuthorizedProjectRoot = @"C:\Users\luis2\OneDrive\Desktop\PRUEBA\TWO SIDES PRUEBA\Two-Sides PRUEBA\local-persistence";
+#endif
+    private readonly HashSet<string> _owned = new(StringComparer.OrdinalIgnoreCase);
+    private bool _disposed;
+    public string Root { get; }
+    public string ApprovedProjectRoot { get; }
+    public SyntheticSandbox(string isolatedProjectRoot)
+    {
+        ApprovedProjectRoot = Path.GetFullPath(isolatedProjectRoot);
+        SaveValidation.Require(string.Equals(ApprovedProjectRoot,AuthorizedProjectRoot,StringComparison.OrdinalIgnoreCase),"UNSAFE_PATH");
+        GuardDirectory(Path.GetDirectoryName(ApprovedProjectRoot)!);
+        SaveValidation.Require(Directory.Exists(ApprovedProjectRoot)
+            && Path.GetFileName(ApprovedProjectRoot) == "local-persistence", "UNSAFE_PATH");
+        GuardDirectory(ApprovedProjectRoot);
+        var work = Path.Combine(ApprovedProjectRoot, ".work");
+        var databases = Path.Combine(work, "databases");
+        CreateDirectory(work); CreateDirectory(databases);
+        Root = Path.Combine(databases, Guid.NewGuid().ToString("N"));
+        CreateDirectory(Root);
+    }
+
+    private static void GuardDirectory(string path)
+    {
+        SaveValidation.Require(Directory.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0, "UNSAFE_PATH");
+    }
+    private static void CreateDirectory(string path)
+    {
+        if (Directory.Exists(path)) GuardDirectory(path);
+        else Directory.CreateDirectory(path);
+        GuardDirectory(path);
+    }
+    private void GuardRoot()
+    {
+        SaveValidation.Require(!_disposed, "UNSAFE_PATH");
+        GuardDirectory(Path.GetDirectoryName(ApprovedProjectRoot)!);
+        GuardDirectory(ApprovedProjectRoot);
+        GuardDirectory(Path.Combine(ApprovedProjectRoot, ".work"));
+        GuardDirectory(Path.Combine(ApprovedProjectRoot, ".work", "databases"));
+        GuardDirectory(Root);
+    }
+    public SyntheticDatabase CreateDatabase()
+    {
+        GuardRoot();
+        var path = Path.Combine(Root, Guid.NewGuid().ToString("N") + ".sqlite3");
+        using (new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+        _owned.Add(path);
+        return new SyntheticDatabase(this, path);
+    }
+    public void ValidateOwnedPath(string path)
+    {
+        GuardRoot();
+        SaveValidation.Require(Path.GetFullPath(path) == path && Path.GetDirectoryName(path) == Root && _owned.Contains(path), "UNSAFE_PATH");
+        SaveValidation.Require(File.Exists(path), "NOT_FOUND");
+        SaveValidation.Require((File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0, "UNSAFE_PATH");
+        foreach (var suffix in new[] { "-journal", "-wal", "-shm" })
+        {
+            var sidecar=path+suffix;
+            SaveValidation.Require(!Directory.Exists(sidecar),"UNSAFE_PATH");
+            if(File.Exists(sidecar))
+            {
+                try{SaveValidation.Require((File.GetAttributes(sidecar)&FileAttributes.ReparsePoint)==0,"UNSAFE_PATH");}
+                // SQLite can remove a journal between Exists and GetAttributes while another synthetic connection commits.
+                // Only accept genuine disappearance; an existing file/directory or an unsafe path still fails closed.
+                catch(FileNotFoundException) when(!File.Exists(sidecar)&&!Directory.Exists(sidecar)){}
+            }
+        }
+    }
+    public void Dispose()
+    {
+        if (_disposed) return;
+        GuardRoot();
+        foreach (var file in _owned)
+        {
+            foreach (var suffix in new[] { "", "-journal", "-wal", "-shm" })
+            {
+                var target = file + suffix;
+                SaveValidation.Require(Path.GetDirectoryName(target) == Root, "UNSAFE_PATH");
+                if (!File.Exists(target)) continue;
+                SaveValidation.Require((File.GetAttributes(target) & FileAttributes.ReparsePoint) == 0, "UNSAFE_PATH");
+                File.Delete(target);
+            }
+        }
+        if (Directory.GetFileSystemEntries(Root).Length == 0) Directory.Delete(Root, false);
+        _disposed = true;
+    }
+}
+
+public sealed class SyntheticDatabase : ISaveDatabase
+{
+    private readonly SyntheticSandbox _sandbox;
+    public string Path { get; }
+    internal SyntheticDatabase(SyntheticSandbox sandbox, string path) { _sandbox = sandbox; Path = path; }
+    public SqliteConnection Open()
+    {
+        _sandbox.ValidateOwnedPath(Path);
+        var connection = new SqliteConnection(new SqliteConnectionStringBuilder {
+            DataSource = Path, Mode = SqliteOpenMode.ReadWrite, Cache = SqliteCacheMode.Private,
+            Pooling = false, ForeignKeys = true, DefaultTimeout = 1
+        }.ToString());
+        try
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "PRAGMA foreign_keys;";
+            SaveValidation.Require(Convert.ToInt32(command.ExecuteScalar()) == 1, "FOREIGN_KEYS_DISABLED");
+            command.CommandText = "PRAGMA synchronous=FULL; PRAGMA busy_timeout=1000;";
+            command.ExecuteNonQuery();
+            return connection;
+        }
+        catch (SqliteException error) { connection.Dispose(); throw StorageErrors.Map(error); }
+        catch { connection.Dispose(); throw; }
+    }
+}
+
+public static class StorageErrors
+{
+    public static SaveException Map(SqliteException error) => new(error.SqliteErrorCode switch {
+        5 or 6 => "STORAGE_BUSY", 11 or 26 => "CORRUPT_STORAGE", 13 => "DISK_FULL",
+        8 or 14 or 23 => "ACCESS_DENIED", 19 => "INVALID_DATA", _ => "IO_ERROR"
+    });
+}

@@ -1,0 +1,748 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+
+// B05.5 stage 2: the C# HTTP client against the REAL Express 'offline-test' composition (scripts/run-offline-backend.js, loopback, simulated
+// stores) with DISPOSABLE SQLite databases only. No Atlas, no real saves, no .env.
+internal static class SyncHttpChecks
+{
+    private static int _count;
+    private static readonly DateTimeOffset Start=DateTimeOffset.Parse("2026-10-27T12:00:00.000Z",CultureInfo.InvariantCulture);
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    // Disposable folder for credential-store tests; removes only what it created.
+    private sealed class TempDir:IDisposable
+    {
+        internal readonly string Path;
+        internal TempDir(){Path=System.IO.Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","credential-tests",Guid.NewGuid().ToString("N"));Directory.CreateDirectory(Path);}
+        public void Dispose(){try{if(Directory.Exists(Path)&&Path.StartsWith(System.IO.Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","credential-tests")+System.IO.Path.DirectorySeparatorChar))Directory.Delete(Path,true);}catch(IOException){}}
+    }
+    private static void Check(bool ok,string label="check"){if(!ok)throw new Exception("Sync HTTP assertion failed: "+label);}
+
+    // ---- the real Express offline backend as a child process ----
+    private sealed class OfflineServer:IDisposable
+    {
+        private Process? _process;
+        internal int Port;
+        internal string Url=>$"http://127.0.0.1:{Port}";
+        internal string ErrorOutput="";
+        private static int FreePort(){var l=new TcpListener(IPAddress.Loopback,0);l.Start();int p=((IPEndPoint)l.LocalEndpoint).Port;l.Stop();return p;}
+        internal static string BackendRoot=>Path.GetFullPath(Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,"..","backend"));
+        internal void Start(int? port=null)
+        {
+            Port=port??FreePort();
+            var info=new ProcessStartInfo(@"C:\Program Files\nodejs\node.exe"){WorkingDirectory=BackendRoot,UseShellExecute=false,CreateNoWindow=true,
+                RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true};
+            foreach(string a in new[]{"scripts/run-offline-backend.js","--port",Port.ToString(CultureInfo.InvariantCulture),"--exit-on-stdin-close"})info.ArgumentList.Add(a);
+            info.Environment.Clear();string win=Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            info.Environment["SystemRoot"]=win;info.Environment["PATH"]=Path.Combine(win,"System32");info.Environment["NODE_ENV"]="test";
+            _process=Process.Start(info)!;
+            var line=_process.StandardOutput.ReadLineAsync();
+            if(!line.Wait(30000)||line.Result is null||!line.Result.Contains("\"offlineBackend\":\"listening\"")||!line.Result.Contains(Url))throw new Exception("Offline backend did not start");
+            _=_process.StandardOutput.ReadToEndAsync();
+            var err=_process.StandardError.ReadToEndAsync();_ = err.ContinueWith(t=>ErrorOutput=t.Result);
+        }
+        // Orderly stop through the launcher's stdin command; returns the exit code (0 = clean).
+        internal int Stop()
+        {
+            if(_process is null)return -1;
+            try{_process.StandardInput.WriteLine("shutdown");_process.StandardInput.Flush();}catch(IOException){}
+            if(!_process.WaitForExit(20000)){_process.Kill(true);_process.WaitForExit();return -2;}
+            int code=_process.ExitCode;_process.Dispose();_process=null;return code;
+        }
+        // Abrupt interruption (crash / lost connection).
+        internal void Kill(){if(_process is null)return;try{_process.Kill(true);_process.WaitForExit();}catch(InvalidOperationException){}_process.Dispose();_process=null;}
+        public void Dispose(){if(_process is not null)Kill();}
+    }
+
+    // Accepts TCP connections and never answers: the request can only end by timeout.
+    private sealed class HangingServer:IDisposable
+    {
+        private readonly TcpListener _listener=new(IPAddress.Loopback,0);
+        private readonly List<TcpClient> _clients=new();
+        internal int Port=>((IPEndPoint)_listener.LocalEndpoint).Port;
+        internal HangingServer(){_listener.Start();_=Task.Run(async()=>{try{while(true){var client=await _listener.AcceptTcpClientAsync();lock(_clients)_clients.Add(client);}}catch(Exception){}});}
+        public void Dispose(){_listener.Stop();lock(_clients)foreach(var c in _clients)c.Dispose();}
+    }
+
+    // Wraps the real transport handler: counts calls, can lose a response after the server committed, and can alter bytes in flight.
+    private sealed class TapHandler:DelegatingHandler
+    {
+        internal int Batches,Queries,Registrations,Logins,LastBatchOperations;
+        internal readonly List<string> BatchTokens=new();
+        internal bool DropNextBatchResponse;
+        internal Func<string,string>? RewriteRequest,RewriteResponse;
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken cancellation)
+        {
+            string path=request.RequestUri!.AbsolutePath;bool batch=path.EndsWith("/sync/batches",StringComparison.Ordinal);
+            if(path.EndsWith("/receipts/query",StringComparison.Ordinal))Interlocked.Increment(ref Queries);
+            else if(path.EndsWith("/technical/registrations",StringComparison.Ordinal))Interlocked.Increment(ref Registrations);
+            else if(path.EndsWith("/technical/sessions",StringComparison.Ordinal))Interlocked.Increment(ref Logins);
+            if(batch)
+            {
+                Interlocked.Increment(ref Batches);
+                lock(BatchTokens)BatchTokens.Add(request.Headers.Authorization?.Parameter??"");
+                string text=await request.Content!.ReadAsStringAsync(cancellation);
+                using(var doc=JsonDocument.Parse(text))LastBatchOperations=doc.RootElement.GetProperty("operations").GetArrayLength();
+                if(RewriteRequest is not null)
+                {
+                    request.Content=new StringContent(RewriteRequest(text),new UTF8Encoding(false),"application/json");
+                }
+            }
+            var response=await base.SendAsync(request,cancellation);
+            if(batch && DropNextBatchResponse){DropNextBatchResponse=false;response.Dispose();throw new HttpRequestException("response lost after commit");}
+            if(batch && RewriteResponse is not null)
+            {
+                string text=await response.Content.ReadAsStringAsync(cancellation);
+                return new HttpResponseMessage(response.StatusCode){Content=new StringContent(RewriteResponse(text),new UTF8Encoding(false),"application/json")};
+            }
+            return response;
+        }
+    }
+
+    // ---- disposable game database (same recipe as the existing outbox checks) ----
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly string Owner=Id(),Game=Id(),Installation=Id();
+        internal readonly GameSaveService Save;
+        internal DateTimeOffset Clock=Start;
+        internal SyncBinding Binding=>new(Owner,Installation,1);
+        internal SyncOutboxService Queue=>new(Db,()=>Clock,()=>0);
+        internal F()
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState(),()=>Start);
+            Save.CreateLocalProfile(Id(),Owner,"Synthetic Http");Save.CreateNewGame(new(Id(),Owner,Game));
+            GameplayEventSchema.MigrateSynthetic(Db);SyncOutboxSchema.MigrateSynthetic(Db);Queue.RegisterInstallation(Binding);
+        }
+        internal long Revision()=>Save.LoadGame(Owner,Game).Game.Revision;
+        internal string Capture(SyncFact fact,IReadOnlyList<string>? dependencies=null)=>Queue.Capture(new(Id(),Binding,fact,dependencies)).Operation.OperationId;
+        // Two game reports (two revisions), one open session, and one interval that depends on the open session.
+        internal List<string> CaptureAll()
+        {
+            var ids=new List<string>{Capture(new(SyncFactKind.GameReport,Game,Revision()))};
+            Save.EnterBiome(new(Id(),Owner,Game,Revision(),"ocean","human"));
+            ids.Add(Capture(new(SyncFactKind.GameReport,Game,Revision())));
+            string session=Id(),interval=Id();var events=new GameplayEventService(Db);
+            events.RecordEvent(new(Id(),Owner,session,GameplayEventKind.SESSION_STARTED,Start,0));
+            events.RecordInterval(new(interval,Owner,session,0,10,GameplayTimeState.Menu));
+            string open=Capture(new(SyncFactKind.SessionReport,session,Phase:"open"));ids.Add(open);
+            ids.Add(Capture(new(SyncFactKind.GameplayInterval,interval),new[]{open}));
+            return ids;
+        }
+        internal OutboxOperation Op(string id)=>Queue.Get(Owner,id)!;
+        internal long Number(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+        internal string GameSnapshot()=>JsonSerializer.Serialize(Save.LoadGame(Owner,Game));
+        public void Dispose()=>Sandbox.Dispose();
+    }
+
+    private sealed class Client:IDisposable
+    {
+        internal readonly SyncHttpTransport Transport;
+        internal readonly SyncSessionManager Session;
+        internal readonly SyncOutboxDispatcher Dispatcher;
+        internal readonly InMemorySyncSecretStore Secrets;
+        internal readonly TapHandler? Tap;
+        internal Client(F f,string url,TimeSpan? timeout=null,bool tap=false,InMemorySyncSecretStore? secrets=null)
+        {
+            var options=new SyncHttpOptions(new Uri(url+"/"),timeout??TimeSpan.FromSeconds(10),allowLoopbackHttp:true);
+            if(tap)Tap=new TapHandler{InnerHandler=new SocketsHttpHandler{AllowAutoRedirect=false,UseProxy=false,UseCookies=false}};
+            Transport=new(options,Tap);Secrets=secrets??new InMemorySyncSecretStore();
+            Session=new(Transport,f.Binding,Secrets);Dispatcher=new(f.Queue,Session,f.Binding);
+        }
+        public void Dispose()=>Transport.Dispose();
+    }
+
+    private static async Task Case(string label,Func<F,Task> body){using var f=new F();await body(f);_count++;Console.WriteLine("PASS "+label);}
+    private static async Task<SyncPassSummary> Pass(Client c)=>await c.Dispatcher.RunPassAsync(CancellationToken.None);
+    private static async Task<List<SyncPassSummary>> Drain(Client c,int max=6)
+    {var all=new List<SyncPassSummary>();for(int i=0;i<max;i++){var s=await Pass(c);all.Add(s);if(s.Code=="SYNC_IDLE")break;}return all;}
+    private static bool All(F f,IEnumerable<string> ids,OutboxDeliveryState state)=>ids.All(id=>f.Op(id).State==state);
+
+    public static async Task<int> Run()
+    {
+        await Case("main destination refuses to adopt confirmed receipts from another deployment before registering a new account",async f=>{
+            using var server=new OfflineServer();server.Start();f.CaptureAll();using(var client=new Client(f,server.Url)){await Drain(client);}
+            string before=f.GameSnapshot();long confirmed=f.Number("SELECT count(*) FROM sync_outbox WHERE state='confirmed';");Check(confirmed>0,"old destination confirmed");
+            await using var main=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(server.Port),()=>f.Db,()=>new InMemorySyncSecretStore(),requireUnconfirmedDestination:true);
+            Check(await main.TickAsync(true)=="SYNC_DESTINATION_MIGRATION_REQUIRED","requires explicit migration");
+            Check(main.WorkersCreated==0 && f.Number("SELECT count(*) FROM sync_outbox WHERE state='confirmed';")==confirmed && f.GameSnapshot()==before,"no worker or data changes");
+        });
+        await Case("main sync configuration enables only an HTTPS API and never a database URI or a conflicting test mode",f=>{
+            var noArgs=Array.Empty<string>();
+            Check(SyncMainMode.FromConfiguration("",noArgs) is null,"unconfigured stays disabled");
+            Check(SyncMainMode.FromConfiguration("https://api.example.invalid/",noArgs) is not null,"normal HTTPS configured");
+            foreach(string bad in new[]{"http://api.example.invalid/","mongodb+srv://db.example.invalid/","https://user:pass@api.example.invalid/","https://api.example.invalid/path/","https://api.example.invalid/?secret=x"})
+                Check(SyncMainMode.FromConfiguration(bad,noArgs) is null,"unsafe origin rejected");
+            foreach(string flag in new[]{SyncLocalMode.Flag,"--two-sides-sync-other",SyncTestStorageMode.Flag})
+                Check(SyncMainMode.FromConfiguration("https://api.example.invalid/",new[]{flag}) is null,"test mode cannot silently select main");
+            return Task.CompletedTask;
+        });
+        await Case("main credential namespace is stable across restart and distinct for another API deployment",f=>{
+            var a=new SyncHttpOptions(new Uri("https://api.example.invalid/"));
+            var b=new SyncHttpOptions(new Uri("https://other.example.invalid/"));
+            Check(SyncMainMode.CredentialNamespace(a)==SyncMainMode.CredentialNamespace(new SyncHttpOptions(a.BaseUri)),"stable realm");
+            Check(SyncMainMode.CredentialNamespace(a)!=SyncMainMode.CredentialNamespace(b),"separate remote identity");
+            return Task.CompletedTask;
+        });
+        await Case("registration, JWT v2 session and authenticated probe work; a request without a valid token is rejected",async f=>{
+            using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url);
+            var anonymous=await c.Transport.SendAsync(HttpMethod.Post,"/api/v2/sync/batches",SyncHttpTransport.Json(new{schemaVersion=2,batchId=Id(),operations=Array.Empty<object>()}),null,CancellationToken.None);
+            Check(anonymous.Status==401 && anonymous.Failure==SyncHttpFailure.Unauthorized,"anonymous batch rejected");
+            var forged=await c.Transport.SendAsync(HttpMethod.Get,"/api/v2/technical/me",null,"not-a-token",CancellationToken.None);
+            Check(forged.Status==401,"forged token rejected");
+            Check(!c.Session.HasSession,"no session yet");
+            var probe=await c.Session.ProbeAsync(CancellationToken.None);
+            Check(probe.Ok && probe.Body is {} me && me.GetProperty("schemaVersion").GetInt32()==2 && me.GetProperty("role").GetString()=="player","probe");
+            Check(c.Session.HasSession,"session kept in memory");
+            Check(server.Stop()==0 && server.ErrorOutput.Length==0,"clean stop");
+        });
+
+        await Case("a valid outbox batch is confirmed only with server receipts; dependent operations wait for their parent",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url);
+            var first=await Pass(c);
+            Check(first.Code=="SYNC_OK" && first.Reserved==3 && first.Confirmed==3,first.DiagnosticSummary);   // interval is not reserved yet
+            Check(f.Op(ids[3]).State==OutboxDeliveryState.Pending,"child waits");
+            var second=await Pass(c);Check(second.Confirmed==1 && second.Code=="SYNC_OK",second.DiagnosticSummary);
+            Check(All(f,ids,OutboxDeliveryState.Confirmed),"all confirmed");
+            foreach(var id in ids){var op=f.Op(id);Check(op.ReceiptJson is not null && op.ReceiptJson.Contains(op.OperationId),"receipt stored");}
+            Check((await Pass(c)).Code=="SYNC_IDLE","nothing left to send");
+        });
+
+        await Case("sending the same operationId again returns the original receipt and never duplicates; the local receipt is untouched",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url);
+            await Drain(c);Check(All(f,ids,OutboxDeliveryState.Confirmed),"setup");
+            var op=f.Op(ids[0]);string before=op.ReceiptJson!;
+            var body=SyncHttpTransport.Json(new{schemaVersion=2,batchId=Id(),operations=new[]{new{operationId=op.OperationId,payloadHash=op.PayloadHash,leaseId=Id(),attempt=2,
+                canonicalEnvelope=op.CanonicalEnvelope,dependencies=Array.Empty<string>()}}});
+            var again=await c.Session.SendAsync(HttpMethod.Post,"/api/v2/sync/batches",body,CancellationToken.None);
+            var result=again.Body!.Value.GetProperty("results")[0];
+            Check(again.Status==200 && result.GetProperty("status").GetString()=="duplicate","duplicate");
+            using var stored=JsonDocument.Parse(before);
+            Check(result.GetProperty("receipt").GetProperty("receiptId").GetString()==stored.RootElement.GetProperty("receiptId").GetString(),"same receipt id");
+            Check(f.Op(ids[0]).ReceiptJson==before && f.Op(ids[0]).State==OutboxDeliveryState.Confirmed,"local receipt unchanged");
+        });
+
+        await Case("the receipt query finds committed operations and reports unknown ones as not_found",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url);
+            await Drain(c);
+            var known=ids.Take(2).Select(id=>f.Op(id)).ToArray();string stranger=Id();
+            var attempts=known.Select(o=>new{operationId=o.OperationId,payloadHash=o.PayloadHash,leaseId=Id(),attempt=3}).Concat(new[]{new{operationId=stranger,payloadHash=new string('a',64),leaseId=Id(),attempt=1}}).ToArray();
+            var response=await c.Session.SendAsync(HttpMethod.Post,"/api/v2/sync/receipts/query",SyncHttpTransport.Json(new{schemaVersion=2,attempts}),CancellationToken.None);
+            var results=response.Body!.Value.GetProperty("results").EnumerateArray().ToArray();
+            Check(response.Status==200 && results.Length==3 && results[0].GetProperty("status").GetString()=="found" && results[1].GetProperty("status").GetString()=="found" &&
+                results[2].GetProperty("status").GetString()=="not_found","statuses");
+        });
+
+        await Case("HTTP interruption keeps every pending operation unchanged; an unreachable server and a silent server both end as retryable",async f=>{
+            var ids=f.CaptureAll();string snapshot=f.GameSnapshot();long total=f.Number("SELECT count(*) FROM sync_outbox;");
+            var hashes=ids.ToDictionary(id=>id,id=>f.Op(id).PayloadHash);
+            using var server=new OfflineServer();server.Start();int port=server.Port;server.Kill();
+            using(var c=new Client(f,server.Url))
+            {
+                var down=await Pass(c);
+                Check(down.Transport==SyncHttpFailure.NetworkUnavailable && down.Retried==3 && down.Confirmed==0,down.DiagnosticSummary);
+            }
+            foreach(var id in ids.Take(3)){var op=f.Op(id);Check(op.State==OutboxDeliveryState.RetryableFailure && op.LastErrorCode=="network_unavailable" && op.Attempts==1,"retryable "+op.State);}
+            Check(f.Op(ids[3]).State==OutboxDeliveryState.Pending,"child still pending");
+            f.Clock=f.Clock.AddHours(1);
+            using(var hang=new HangingServer())using(var c=new Client(f,$"http://127.0.0.1:{hang.Port}",TimeSpan.FromMilliseconds(400)))
+            {
+                var silent=await Pass(c);
+                Check(silent.Transport==SyncHttpFailure.Timeout && silent.Retried==3,silent.DiagnosticSummary);
+            }
+            foreach(var id in ids.Take(3)){var op=f.Op(id);Check(op.State==OutboxDeliveryState.RetryableFailure && op.LastErrorCode=="timeout" && op.Attempts==2,"timeout "+op.LastErrorCode);}
+            Check(f.Number("SELECT count(*) FROM sync_outbox;")==total && ids.All(id=>f.Op(id).PayloadHash==hashes[id]) && f.GameSnapshot()==snapshot,"nothing lost or changed");
+            Check(port>0,"port");
+        });
+
+        await Case("after reconnecting, the same operation ids are delivered once; a restarted server (empty state) is re-registered transparently",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();int port=server.Port;server.Kill();
+            using(var c=new Client(f,server.Url))Check((await Pass(c)).Transport==SyncHttpFailure.NetworkUnavailable,"down");
+            f.Clock=f.Clock.AddHours(1);
+            using var back=new OfflineServer();back.Start(port);using var again=new Client(f,back.Url,tap:true);
+            var drain=await Drain(again);
+            Check(All(f,ids,OutboxDeliveryState.Confirmed),"delivered after reconnect");
+            Check(drain.Sum(p=>p.Confirmed)==4 && drain.Sum(p=>p.Reconciled)==0,string.Join("|",drain.Select(p=>p.DiagnosticSummary)));
+            Check(again.Tap!.Queries>=1,"uncertain operations were looked up first");
+            Check(f.Number("SELECT count(*) FROM sync_outbox;")==4,"no operation was created or removed");
+        });
+
+        await Case("a response lost after the server committed is reconciled with the receipt query and the operations are not sent twice",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url,tap:true);
+            c.Tap!.DropNextBatchResponse=true;
+            var lost=await Pass(c);
+            Check(lost.Transport==SyncHttpFailure.NetworkUnavailable && lost.Retried==3 && c.Tap.Batches==1,lost.DiagnosticSummary);
+            Check(ids.Take(3).All(id=>f.Op(id).State==OutboxDeliveryState.RetryableFailure && f.Op(id).ReceiptJson is null),"uncertain, not confirmed");
+            f.Clock=f.Clock.AddHours(1);
+            var recovered=await Pass(c);
+            Check(recovered.Reconciled==3 && recovered.Confirmed==3 && c.Tap.Batches==1 && c.Tap.Queries==1,recovered.DiagnosticSummary);   // confirmed by receipts, no second batch
+            Check(ids.Take(3).All(id=>f.Op(id).State==OutboxDeliveryState.Confirmed && f.Op(id).ReceiptJson is not null),"confirmed by receipt");
+            var rest=await Drain(c);Check(All(f,ids,OutboxDeliveryState.Confirmed) && rest.Sum(p=>p.Confirmed)==1,"child delivered");
+        });
+
+        await Case("server close and restart: confirmed operations are never re-sent, new ones are, and the session is re-established",async f=>{
+            var ids=f.CaptureAll();var server=new OfflineServer();server.Start();int port=server.Port;
+            using var c=new Client(f,server.Url,tap:true);
+            await Drain(c);Check(All(f,ids,OutboxDeliveryState.Confirmed),"first server");
+            var receipts=ids.ToDictionary(id=>id,id=>f.Op(id).ReceiptJson);
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));
+            string fresh=f.Capture(new(SyncFactKind.GameReport,f.Game,f.Revision()));
+            Check(server.Stop()==0 && server.ErrorOutput.Length==0,"orderly close");server.Dispose();
+            using var second=new OfflineServer();second.Start(port);
+            int registrations=c.Tap!.Registrations;
+            var pass=await Pass(c);
+            Check(pass.Code=="SYNC_OK" && pass.Confirmed==1 && c.Tap.LastBatchOperations==1,pass.DiagnosticSummary);
+            Check(f.Op(fresh).State==OutboxDeliveryState.Confirmed,"new operation delivered");
+            Check(c.Tap.Registrations==registrations+1,"re-registered on the restarted server");
+            Check(ids.All(id=>f.Op(id).ReceiptJson==receipts[id] && f.Op(id).State==OutboxDeliveryState.Confirmed),"old receipts untouched");
+        });
+
+        await Case("a timeout never deletes pending work and the player keeps playing and saving locally; sync does not change biome progress",async f=>{
+            var ids=f.CaptureAll();string before=f.GameSnapshot();long total=f.Number("SELECT count(*) FROM sync_outbox;");
+            using(var hang=new HangingServer())using(var c=new Client(f,$"http://127.0.0.1:{hang.Port}",TimeSpan.FromMilliseconds(300)))
+            {
+                var pass=await Pass(c);Check(pass.Transport==SyncHttpFailure.Timeout,pass.DiagnosticSummary);
+                Check(f.GameSnapshot()==before,"sync pass did not touch game or biome progress");
+                f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));       // offline play continues
+                string newer=f.Capture(new(SyncFactKind.GameReport,f.Game,f.Revision()));
+                Check(f.Op(newer).State==OutboxDeliveryState.Pending,"new work is queued while the server is silent");
+            }
+            Check(f.Number("SELECT count(*) FROM sync_outbox;")==total+1 && f.Number("SELECT count(*) FROM sync_outbox WHERE state='confirmed';")==0,"nothing deleted, nothing falsely confirmed");
+        });
+
+        await Case("a server receipt that does not match the operation is never accepted; the operation is reconciled later from the real receipt",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url,tap:true);
+            c.Tap!.RewriteResponse=t=>t.Replace("\"installationId\":\""+f.Installation+"\"","\"installationId\":\""+Id()+"\"");
+            var bad=await Pass(c);
+            Check(bad.Confirmed==0 && bad.Retried==3,bad.DiagnosticSummary);
+            Check(ids.Take(3).All(id=>f.Op(id).State==OutboxDeliveryState.RetryableFailure && f.Op(id).ReceiptJson is null),"nothing confirmed from a bad receipt");
+            c.Tap.RewriteResponse=null;f.Clock=f.Clock.AddHours(1);
+            var good=await Pass(c);Check(good.Reconciled==3 && good.Confirmed==3,good.DiagnosticSummary);
+        });
+
+        await Case("a permanent server rejection stops resending that operation but keeps it, byte for byte",async f=>{
+            var ids=f.CaptureAll();var envelopes=ids.ToDictionary(id=>id,id=>f.Op(id).CanonicalEnvelope);
+            using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url,tap:true);
+            c.Tap!.RewriteRequest=t=>t.Replace("\\u0022schemaVersion\\u0022:1","\\u0022schemaVersion\\u0022:2");   // breaks the envelope/hash on the wire only
+            var pass=await Pass(c);
+            Check(pass.Rejected+pass.Retried==3 && pass.Confirmed==0,pass.DiagnosticSummary);
+            foreach(var id in ids.Take(3)){var op=f.Op(id);Check(op.State==OutboxDeliveryState.PermanentFailure && op.LastErrorCode is "invalid_fact" or "unsupported_contract" or "payload_conflict","rejected "+op.State+" "+op.LastErrorCode);}
+            Check(ids.All(id=>f.Op(id).CanonicalEnvelope==envelopes[id]),"envelopes unchanged");
+            f.Clock=f.Clock.AddHours(1);c.Tap.RewriteRequest=null;
+            Check((await Pass(c)).Code=="SYNC_IDLE" && f.Op(ids[3]).State==OutboxDeliveryState.Pending,"rejected operations are not sent again and their dependent waits");
+        });
+
+        await Case("no secret is persisted or reported: the account secret never reaches the database, the diagnostics or new files",async f=>{
+            var ids=f.CaptureAll();string dir=Path.GetDirectoryName(f.Db.Path)!;
+            var secrets=new InMemorySyncSecretStore();
+            using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url,secrets:secrets);
+            string[] filesBefore=Directory.GetFiles(dir).Select(Path.GetFileName).Where(n=>!n!.EndsWith("-journal",StringComparison.Ordinal)).OrderBy(x=>x,StringComparer.Ordinal).ToArray()!;
+            var drain=await Drain(c);
+            string credential=secrets.ReadCredential(f.Binding)!;
+            Check(credential.Length==43 && credential.All(ch=>char.IsAsciiLetterOrDigit(ch)||ch is '-' or '_'),"credential shape");
+            Check(!Encoding.UTF8.GetString(File.ReadAllBytes(f.Db.Path)).Contains(credential),"not in the database");
+            Check(!string.Join("|",drain.Select(p=>p.DiagnosticSummary)).Contains(credential),"not in diagnostics");
+            string[] filesAfter=Directory.GetFiles(dir).Select(Path.GetFileName).Where(n=>!n!.EndsWith("-journal",StringComparison.Ordinal)).OrderBy(x=>x,StringComparer.Ordinal).ToArray()!;
+            Check(filesBefore.SequenceEqual(filesAfter),"no files were created");
+        });
+
+        await Case("the optional background worker drains the outbox and disposes quickly even when the server disappears",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();using var c=new Client(f,server.Url);
+            await using var worker=new SyncOutboxWorker(token=>c.Dispatcher.RunPassAsync(token),TimeSpan.FromMilliseconds(200),TimeSpan.FromMilliseconds(200));
+            worker.Request();
+            for(int i=0;i<100 && !All(f,ids,OutboxDeliveryState.Confirmed);i++){worker.Request();await Task.Delay(200);}
+            Check(All(f,ids,OutboxDeliveryState.Confirmed),"worker delivered everything");
+            server.Kill();worker.Request();await Task.Delay(300);
+            var clock=Stopwatch.StartNew();await worker.DisposeAsync();Check(clock.Elapsed<TimeSpan.FromSeconds(5),"prompt disposal");
+        });
+
+        await Case("transport options accept HTTPS or explicit loopback HTTP only, with no credentials, query or path in the URL",async f=>{
+            await Task.CompletedTask;
+            void Rejected(Func<SyncHttpOptions> make){try{make();throw new Exception("expected rejection");}catch(SaveException e){Check(e.Code=="INVALID_SYNC_HTTP_OPTIONS","code");}}
+            Check(SyncHttpOptions.LoopbackDevelopment(3000).BaseUri.ToString()=="http://127.0.0.1:3000/","loopback development");
+            Check(new SyncHttpOptions(new Uri("https://api.example.invalid/")).BaseUri.Scheme=="https","https accepted");
+            Rejected(()=>new SyncHttpOptions(new Uri("http://127.0.0.1:3000/")));                                   // http needs the explicit flag
+            Rejected(()=>new SyncHttpOptions(new Uri("http://example.com/"),allowLoopbackHttp:true));               // never plain http beyond loopback
+            Rejected(()=>new SyncHttpOptions(new Uri("https://user:pass@example.com/")));
+            Rejected(()=>new SyncHttpOptions(new Uri("https://example.com/?x=1")));
+            Rejected(()=>new SyncHttpOptions(new Uri("https://example.com/prefix/")));
+            Rejected(()=>new SyncHttpOptions(new Uri("https://example.com/"),TimeSpan.FromMilliseconds(5)));
+            Rejected(()=>new SyncHttpOptions(new Uri("https://example.com/"),maxBatchOperations:101));
+            using var transport=new SyncHttpTransport(SyncHttpOptions.LoopbackDevelopment(3000));
+            foreach(string bad in new[]{"api/v2/x","/other","/api/v2/x?y=1","/api/v2/x\\y"}){
+                try{await transport.SendAsync(HttpMethod.Get,bad,null,null,CancellationToken.None);throw new Exception("expected rejection");}
+                catch(SaveException e){Check(e.Code=="INVALID_SYNC_HTTP_PATH","path code");}
+            }
+        });
+
+        // ---- stage 3: lifecycle policy used by the Godot host (GameSyncHost) ----
+        SyncWorkerLifecycle Life(F f,string url)=>new(new SyncHttpOptions(new Uri(url+"/"),TimeSpan.FromSeconds(2),allowLoopbackHttp:true),()=>f.Db,
+            null,TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock);
+        async Task<bool> Until(Func<bool> done,int ms=20000){for(int i=0;i<ms/100&&!done();i++)await Task.Delay(100);return done();}
+
+        await Case("synchronization is disabled by default; only the exact local-test flag enables it and it always means http://127.0.0.1:3000",async f=>{
+            Check(SyncLocalMode.FromArguments(Array.Empty<string>()) is null,"default disabled");
+            Check(SyncLocalMode.FromArguments(new[]{"--other"}) is null,"unrelated arguments");
+            var on=SyncLocalMode.FromArguments(new[]{SyncLocalMode.Flag});
+            Check(on is not null && on.BaseUri.ToString()=="http://127.0.0.1:3000/","local test destination");
+            foreach(var bad in new[]{"--two-sides-sync-url=https://evil.example","--two-sides-sync-local-test=http://x","--two-sides-sync","--two-sides-sync-port=80","--two-sides-sync-local-test2"})
+                Check(SyncLocalMode.FromArguments(new[]{SyncLocalMode.Flag,bad}) is null && SyncLocalMode.FromArguments(new[]{bad}) is null,"rejects "+bad);
+            Check(SyncLocalMode.FromArguments(new[]{SyncLocalMode.Flag,SyncLocalMode.Flag}) is null,"duplicate flag is ambiguous");
+            await using var disabled=new SyncWorkerLifecycle(null,()=>f.Db);
+            Check(await disabled.TickAsync(true)=="SYNC_DISABLED" && disabled.WorkersCreated==0 && disabled.State==SyncLifecycleState.Disabled,"disabled never starts");
+            f.CaptureAll();
+            Check(f.Number("SELECT count(*) FROM sync_outbox WHERE state<>'pending';")==0,"outbox untouched while disabled");
+        });
+
+        await Case("the worker starts once, only with a valid local session and binding; repeated ticks and scene changes never create a second one",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();
+            await using var life=Life(f,server.Url);
+            Check(await life.TickAsync(false)=="SYNC_WAITING_SESSION" && life.WorkersCreated==0,"no session, no worker");
+            await using var nostorage=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(server.Port),()=>null);
+            Check(await nostorage.TickAsync(true)=="SYNC_WAITING_STORAGE","no storage, no worker");
+            var first=await life.TickAsync(true);
+            Check(first=="SYNC_STARTED" && life.State==SyncLifecycleState.Running && life.WorkersCreated==1,first);
+            var ticks=await Task.WhenAll(Enumerable.Range(0,20).Select(_=>Task.Run(()=>life.TickAsync(true))));
+            Check(ticks.All(t=>t=="SYNC_RUNNING") && life.WorkersCreated==1,"still exactly one worker");
+            Check(await Until(()=>All(f,ids,OutboxDeliveryState.Confirmed)),"the single worker delivered everything");
+        });
+
+        await Case("a database without a registered sync installation waits instead of inventing one",async f=>{
+            using var empty=new SyntheticSandbox(SyntheticSandbox.AuthorizedProjectRoot);var db=empty.CreateDatabase();SchemaManager.Initialize(db);
+            await using var life=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(3000),()=>db);
+            Check(await life.TickAsync(true)=="SYNC_WAITING_BINDING" && life.WorkersCreated==0,"no profile/installation");
+            await Task.CompletedTask;
+        });
+
+        await Case("stopping is ordered: the worker ends, the HttpClient is released, pending work stays, and a later session starts a fresh single worker",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();
+            await using var life=Life(f,server.Url);
+            await life.TickAsync(true);Check(await Until(()=>All(f,ids,OutboxDeliveryState.Confirmed)),"delivered");
+            server.Kill();f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));var extra=f.Capture(new(SyncFactKind.GameReport,f.Game,f.Revision()));
+            var clock=Stopwatch.StartNew();var stop=await life.StopAsync(TimeSpan.FromSeconds(5));
+            Check(stop=="SYNC_STOPPED" && clock.Elapsed<TimeSpan.FromSeconds(5) && life.State==SyncLifecycleState.Stopped && life.WorkersStopped==1,stop);
+            Check(life.WorkerDiagnostic is null,"worker released");
+            Check(await life.StopAsync(TimeSpan.FromSeconds(1))=="SYNC_STOPPED" && life.WorkersStopped==1,"stopping twice is harmless");
+            var after=f.Op(extra).State;Check(after!=OutboxDeliveryState.Confirmed,"unconfirmed work is kept: "+after);
+            Check(await life.TickAsync(false)=="SYNC_WAITING_SESSION" && life.WorkersCreated==1,"logout keeps it stopped");
+            using var again=new OfflineServer();again.Start();
+            await using var next=Life(f,again.Url);f.Clock=f.Clock.AddHours(2);
+            Check(await next.TickAsync(true)=="SYNC_STARTED","new session starts");
+            for(int i=0;i<200 && f.Op(extra).State!=OutboxDeliveryState.Confirmed;i++){f.Clock=f.Clock.AddMinutes(10);await Task.Delay(100);}
+            Check(f.Op(extra).State==OutboxDeliveryState.Confirmed,"the pending operation is delivered later with its original id: "+f.Op(extra).State+" "+f.Op(extra).LastErrorCode+" "+next.Code);
+        });
+
+        await Case("the game works with Express off; starting Express later reconnects and delivers the same operation ids",async f=>{
+            var ids=f.CaptureAll();string snapshot=f.GameSnapshot();
+            using var probe=new OfflineServer();probe.Start();int port=probe.Port;probe.Kill();
+            await using var life=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(port),()=>f.Db,null,TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock);
+            Check(await life.TickAsync(true)=="SYNC_STARTED","starting does not need the server");
+            Check(await Until(()=>f.Op(ids[0]).State==OutboxDeliveryState.RetryableFailure),"offline: retryable, not lost");
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));
+            Check(f.GameSnapshot()!=snapshot,"local save still works with the server down");
+            using var server=new OfflineServer();server.Start(port);
+            for(int i=0;i<200 && !All(f,ids,OutboxDeliveryState.Confirmed);i++){f.Clock=f.Clock.AddMinutes(10);await Task.Delay(100);}
+            Check(All(f,ids,OutboxDeliveryState.Confirmed),"reconnected and delivered");
+            Check(f.Number("SELECT count(*) FROM sync_outbox;")>=ids.Count,"nothing removed");
+        });
+
+        await Case("the caller is never blocked: ticks, requests and stop return promptly while the server is silent",async f=>{
+            f.CaptureAll();using var hang=new HangingServer();
+            await using var life=new SyncWorkerLifecycle(new SyncHttpOptions(new Uri($"http://127.0.0.1:{hang.Port}/"),TimeSpan.FromSeconds(30),allowLoopbackHttp:true),()=>f.Db,null,null,null,()=>f.Clock);
+            var clock=Stopwatch.StartNew();
+            Check(await life.TickAsync(true)=="SYNC_STARTED","started");
+            for(int i=0;i<50;i++){life.Request();_=life.TickAsync(true);}
+            Check(clock.ElapsedMilliseconds<1500,"start + 50 requests returned in "+clock.ElapsedMilliseconds+" ms");
+            await Task.Delay(500);
+            clock.Restart();var stop=await life.StopAsync(TimeSpan.FromSeconds(5));
+            Check(clock.Elapsed<TimeSpan.FromSeconds(7) && (stop=="SYNC_STOPPED"||stop=="SYNC_STOP_TIMEOUT"),stop+" in "+clock.ElapsedMilliseconds+" ms");
+            Check(life.State==SyncLifecycleState.Stopped,"stopped");
+        });
+
+        await Case("closing the game during an in-flight batch leaves a consistent Outbox and the next run finishes the job",async f=>{
+            var ids=f.CaptureAll();string hashes=string.Join("|",ids.Select(id=>f.Op(id).PayloadHash));
+            using(var hang=new HangingServer())
+            {
+                await using var life=new SyncWorkerLifecycle(new SyncHttpOptions(new Uri($"http://127.0.0.1:{hang.Port}/"),TimeSpan.FromSeconds(30),allowLoopbackHttp:true),()=>f.Db,null,null,null,()=>f.Clock);
+                await life.TickAsync(true);await Task.Delay(500);
+                await life.DisposeAsync();
+                Check(life.State==SyncLifecycleState.Disposed,"disposed");
+            }
+            Check(ids.All(id=>f.Op(id).State!=OutboxDeliveryState.Confirmed),"nothing confirmed without a receipt");
+            Check(string.Join("|",ids.Select(id=>f.Op(id).PayloadHash))==hashes && f.Number("SELECT count(*) FROM sync_outbox;")==ids.Count,"operations intact");
+            f.Clock=f.Clock.AddHours(2);
+            using var server=new OfflineServer();server.Start();
+            await using var next=Life(f,server.Url);await next.TickAsync(true);
+            for(int i=0;i<200 && !All(f,ids,OutboxDeliveryState.Confirmed);i++){f.Clock=f.Clock.AddMinutes(10);await Task.Delay(100);}
+            Check(All(f,ids,OutboxDeliveryState.Confirmed),"completed by the next run");
+        });
+
+        // ---- stage 4: disposable storage for the engine run, protection of real saves, Logout -> Login -> Resume ----
+        await Case("test storage arguments: only the exact flags together select the sandbox; anything else fails closed and never names a path",async f=>{
+            await Task.CompletedTask;
+            string[] on={SyncLocalMode.Flag,SyncTestStorageMode.Flag};
+            Check(SyncTestStorageMode.FromArguments(Array.Empty<string>())==SyncTestStorageRequest.None,"none by default");
+            Check(SyncTestStorageMode.FromArguments(new[]{SyncLocalMode.Flag})==SyncTestStorageRequest.None,"sync alone does not select the sandbox");
+            Check(SyncTestStorageMode.FromArguments(on)==SyncTestStorageRequest.Sandbox,"exact flags");
+            Check(SyncTestStorageMode.FromArguments(new[]{SyncTestStorageMode.Flag})==SyncTestStorageRequest.Invalid,"storage flag without the local-test mode");
+            foreach(string bad in new[]{"--two-sides-test-storage=C:\\x","--two-sides-test-storage=runtime","--two-sides-test-storage=sandbox2","--two-sides-test-storage","--two-sides-test-storage=..\\runtime-game"})
+                Check(SyncTestStorageMode.FromArguments(new[]{SyncLocalMode.Flag,bad})==SyncTestStorageRequest.Invalid,"invalid "+bad);
+            Check(SyncTestStorageMode.FromArguments(new[]{SyncLocalMode.Flag,SyncTestStorageMode.Flag,SyncTestStorageMode.Flag})==SyncTestStorageRequest.Invalid,"duplicates");
+            Check(GameTestStorage.FromArguments(Array.Empty<string>()) is null,"normal game: no test storage");
+            try{GameTestStorage.FromArguments(new[]{SyncLocalMode.Flag,"--two-sides-test-storage=C:\\Users"});throw new Exception("expected failure");}
+            catch(InvalidOperationException){}
+        });
+
+        await Case("the engine test storage is a fresh sandbox database that can never be the runtime save, a protected copy, or anything the player owns",async f=>{
+            string runtimeDir=CopyGameDatabase.RuntimeDirectory;string runtimeFile=CopyGameDatabase.RuntimePath;
+            string Fingerprint()
+            {
+                if(!Directory.Exists(runtimeDir))return "absent";
+                var rows=new List<string>();
+                foreach(var file in Directory.GetFiles(runtimeDir).OrderBy(x=>x,StringComparer.OrdinalIgnoreCase))
+                {
+                    var info=new FileInfo(file);string hash="locked";
+                    try{using var s=new FileStream(file,FileMode.Open,FileAccess.Read,FileShare.ReadWrite);hash=Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(s));}catch(IOException){}
+                    rows.Add(Path.GetFileName(file)+"|"+info.Length+"|"+info.LastWriteTimeUtc.Ticks+"|"+hash);
+                }
+                return string.Join("\n",rows);
+            }
+            string protectedRoot=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"TwoSides","ReconstructionTests");
+            string Tree(string p)=>Directory.Exists(p)?string.Join("\n",Directory.GetFiles(p,"*",SearchOption.AllDirectories).OrderBy(x=>x).Select(x=>x+"|"+new FileInfo(x).LastWriteTimeUtc.Ticks)):"absent";
+            string before=Fingerprint(),protectedBefore=Tree(protectedRoot);string path;
+            using(var storage=GameTestStorage.Create())
+            {
+                path=storage.Database.Path;string databases=Path.Combine(SyntheticSandbox.AuthorizedProjectRoot,".work","databases")+Path.DirectorySeparatorChar;
+                Check(path.StartsWith(databases,StringComparison.OrdinalIgnoreCase) && !path.StartsWith(runtimeDir,StringComparison.OrdinalIgnoreCase) && !string.Equals(path,runtimeFile,StringComparison.OrdinalIgnoreCase),"inside the disposable folder only");
+                Check((File.GetAttributes(path)&FileAttributes.ReparsePoint)==0 && (File.GetAttributes(Path.GetDirectoryName(path)!)&FileAttributes.ReparsePoint)==0,"no links");
+                await using var adapter=storage.CreateAdapter();
+                // Every path other than the single sandbox token is refused before any file is touched.
+                foreach(string forbidden in new[]{GamePersistenceAdapter.RuntimeStoragePath,GamePersistenceAdapter.StoragePath,CopyGameDatabase.AuthorizedPath,DurableTestDatabase.AuthorizedPath,path,Path.Combine(runtimeDir,"..","runtime-game","save.sqlite3"),"",
+                    Path.Combine(protectedRoot,"x","save.sqlite3"),@"C:\Users\luis2\AppData\Roaming\Godot\app_userdata\Two Sides\save.sqlite3"})
+                    Check(!(await adapter.OpenAsync(forbidden)).Success,"refused "+forbidden);
+                var opened=await adapter.OpenAsync(GameTestStorage.OpenPath);
+                Check(opened.Success && opened.Data is not null && opened.Data.DisplayName=="Synthetic Godot Validation","opens the synthetic profile");
+                Check(adapter.SyncStorage is not null,"sync handle available while open");
+                await adapter.DrainOutboxAsync(TimeSpan.FromSeconds(1));
+                Check(adapter.SyncStorage is null,"nothing can resume once closing starts");
+            }
+            Check(!File.Exists(path) && !Directory.Exists(Path.GetDirectoryName(path)!),"the sandbox is deleted on dispose");
+            Check(Fingerprint()==before,"the runtime save directory is byte-for-byte unchanged");
+            Check(Tree(protectedRoot)==protectedBefore,"protected reconstruction copies are unchanged");
+        });
+
+        await Case("Logout -> Login -> Resume: stops on logout, resumes only with a session, one worker, same credentials for the same player and a new JWT",async f=>{
+            var ids=f.CaptureAll();using var server=new OfflineServer();server.Start();
+            var taps=new List<TapHandler>();var gate=new SyncSessionGate();
+            await using var life=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(server.Port),()=>f.Db,null,TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock,
+                ()=>{var t=new TapHandler{InnerHandler=new SocketsHttpHandler{AllowAutoRedirect=false,UseProxy=false,UseCookies=false}};lock(taps)taps.Add(t);return t;});
+            async Task<string> Tick()=>await life.TickAsync(gate.Evaluate(true,true));
+            Check(await Tick()=="SYNC_STARTED","session 1 starts");
+            Check(await Until(()=>All(f,ids,OutboxDeliveryState.Confirmed)),"session 1 delivered");
+            // Logout
+            gate.End();Check(await Tick()=="SYNC_WAITING_SESSION" && life.State==SyncLifecycleState.Stopped && life.WorkersStopped==1,"logout stops it");
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));var later=f.Capture(new(SyncFactKind.GameReport,f.Game,f.Revision()));
+            for(int i=0;i<5;i++){Check(await Tick()=="SYNC_WAITING_SESSION","stays stopped while logged out");await Task.Delay(50);}
+            Check(life.WorkersCreated==1 && f.Op(later).State==OutboxDeliveryState.Pending,"no resume and no sending without a session; local work still captured");
+            // Login
+            gate.Begin();Check(await Tick()=="SYNC_STARTED" && life.WorkersCreated==2,"login resumes with exactly one new worker");
+            var again=await Task.WhenAll(Enumerable.Range(0,10).Select(_=>Task.Run(Tick)));Check(again.All(c=>c=="SYNC_RUNNING") && life.WorkersCreated==2,"no duplicates");
+            Check(await Until(()=>f.Op(later).State==OutboxDeliveryState.Confirmed),"pending work delivered after login: "+f.Op(later).State+" "+f.Op(later).LastErrorCode+" "+life.Code+" "+life.WorkerDiagnostic?.Code);
+            lock(taps)
+            {
+                Check(taps.Count==2,"a fresh HttpClient handler per session");
+                Check(taps.Sum(t=>t.Registrations)==1 && taps.Sum(t=>t.Logins)>=2,"registered once; the second session logged in with the kept in-memory credential");
+                Check(taps[0].BatchTokens.Count>0 && taps[1].BatchTokens.Count>0 && taps[0].BatchTokens.Intersect(taps[1].BatchTokens).Count()==0,"a new JWT per session, never reused");
+            }
+            // Closing: nothing resumes
+            gate.Close();Check(!gate.Begin() && await Tick()=="SYNC_WAITING_SESSION" && life.WorkersStopped==2,"closing wins over login");
+            Check(!gate.Evaluate(false,true) && !new SyncSessionGate().Evaluate(true,false),"no profile or no open database: no session");
+        });
+
+        await Case("two players on one install never share a JWT or credential: switching player restarts with that player's own binding",async f=>{
+            using var other=new F();var a=f.CaptureAll();var b=other.CaptureAll();
+            using var server=new OfflineServer();server.Start();
+            ISaveDatabase current=f.Db;var taps=new List<TapHandler>();var gate=new SyncSessionGate();
+            await using var life=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(server.Port),()=>current,null,TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock,
+                ()=>{var t=new TapHandler{InnerHandler=new SocketsHttpHandler{AllowAutoRedirect=false,UseProxy=false,UseCookies=false}};lock(taps)taps.Add(t);return t;});
+            other.Clock=f.Clock;
+            Check(await life.TickAsync(gate.Evaluate(true,true))=="SYNC_STARTED" && await Until(()=>All(f,a,OutboxDeliveryState.Confirmed)),"player A delivered");
+            gate.End();await life.TickAsync(gate.Evaluate(true,true));current=other.Db;gate.Begin();
+            Check(await life.TickAsync(gate.Evaluate(true,true))=="SYNC_STARTED","player B starts after A logged out");
+            Check(await Until(()=>All(other,b,OutboxDeliveryState.Confirmed)),"player B delivered with B's own credentials (the server rejects foreign tokens)");
+            lock(taps){Check(taps.Count==2 && taps.Sum(t=>t.Registrations)==2 && taps[0].BatchTokens.Intersect(taps[1].BatchTokens).Count()==0,"two registrations, two different JWTs");}
+        });
+
+        // ---- stage 5: DPAPI (CurrentUser) credential store, synthetic accounts, disposable SQLite and a disposable credential folder only ----
+        SyncBinding BindingOf(string player,string installation)=>new(player,installation,1);
+        byte[] Utf16(string s)=>Encoding.Unicode.GetBytes(s);
+        bool Contains(byte[] haystack,byte[] needle)=>haystack.AsSpan().IndexOf(needle)>=0;
+        bool ContainsText(byte[] haystack,string text)=>Contains(haystack,Encoding.UTF8.GetBytes(text))||Contains(haystack,Utf16(text));
+
+        await Case("DPAPI store: values are protected on disk, survive a simulated restart, and are bound to their own player and installation",async f=>{
+            await Task.CompletedTask;
+            using var dir=new TempDir();var a=BindingOf(Id(),Id());var b=BindingOf(Id(),Id());
+            string secretA="credential-A-"+Id(),secretB="credential-B-"+Id();string accountA=Id(),regA=Id();
+            var store=new DpapiSyncSecretStore(dir.Path);
+            Check(store.ReadCredential(a) is null && !store.IsUnavailable(a),"empty at first");
+            store.WriteCredential(a,secretA);store.WriteRegistrationId(a,regA);store.WriteAccount(a,accountA);store.WriteCredential(b,secretB);
+            var files=Directory.GetFiles(dir.Path);Check(files.Length==2 && files.All(x=>x.EndsWith(".cred")),"one protected file per binding, no temp leftovers");
+            foreach(var file in files)
+            {
+                var bytes=File.ReadAllBytes(file);
+                foreach(string plain in new[]{secretA,secretB,accountA,regA,a.LocalPlayerId,a.InstallationId,b.LocalPlayerId,b.InstallationId,"credential","technical","installation"})
+                    Check(!ContainsText(bytes,plain),"plaintext not on disk: "+plain.Substring(0,Math.Min(8,plain.Length)));
+            }
+            var restarted=new DpapiSyncSecretStore(dir.Path);                                         // a new process would build exactly this
+            Check(restarted.ReadCredential(a)==secretA && restarted.ReadAccount(a)==accountA && restarted.ReadRegistrationId(a)==regA,"A recovered after restart");
+            Check(restarted.ReadCredential(b)==secretB && restarted.ReadAccount(b) is null,"B has its own, separate values");
+            Check(restarted.ReadCredential(BindingOf(a.LocalPlayerId,Id())) is null && restarted.ReadCredential(new(a.LocalPlayerId,a.InstallationId,2)) is null,"another installation or generation of the same player sees nothing");
+            store.WriteCredential(a,secretA);Check(Directory.GetFiles(dir.Path).Length==2,"rewriting the same credential changes nothing");
+        });
+
+        await Case("DPAPI store fails closed: corrupt, truncated, swapped or foreign blobs are unavailable, never overwritten and never mixed between players",async f=>{
+            await Task.CompletedTask;
+            using var dir=new TempDir();var a=BindingOf(Id(),Id());var b=BindingOf(Id(),Id());
+            var store=new DpapiSyncSecretStore(dir.Path);store.WriteCredential(a,"secret-A-"+Id());store.WriteAccount(a,Id());store.WriteCredential(b,"secret-B-"+Id());
+            string FileFor(SyncBinding x)=>Path.Combine(dir.Path,Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(x.LocalPlayerId+"|"+x.InstallationId+"|"+x.BindingGeneration)))[..32].ToLowerInvariant()+".cred");
+            string pa=FileFor(a),pb=FileFor(b);byte[] original=File.ReadAllBytes(pa);
+            // 1. flipped byte
+            var tampered=(byte[])original.Clone();tampered[tampered.Length/2]^=0x5A;File.WriteAllBytes(pa,tampered);
+            var s1=new DpapiSyncSecretStore(dir.Path);Check(s1.ReadCredential(a) is null && s1.IsUnavailable(a),"tampered blob refused");
+            Check(File.ReadAllBytes(pa).SequenceEqual(tampered),"an unusable blob is left alone, not replaced");
+            bool refused=false;try{s1.WriteCredential(a,"replacement");}catch(SaveException e){refused=e.Code=="CREDENTIAL_UNAVAILABLE";}Check(refused,"writing over an unusable credential is refused");
+            Check(s1.ReadCredential(b) is not null && !s1.IsUnavailable(b),"the other player is unaffected");
+            // 2. truncated / empty / oversized
+            foreach(var bad in new[]{Array.Empty<byte>(),original.Take(10).ToArray(),new byte[20000]}){File.WriteAllBytes(pa,bad);Check(new DpapiSyncSecretStore(dir.Path).IsUnavailable(a),"bad size/content refused");}
+            // 3. A's blob placed under B's file name (copy/paste between players)
+            File.WriteAllBytes(pa,original);File.Copy(pa,pb,true);
+            var s3=new DpapiSyncSecretStore(dir.Path);Check(s3.IsUnavailable(b) && s3.ReadCredential(b) is null,"another player's blob is refused (entropy and embedded binding)");
+            Check(s3.ReadCredential(a) is not null,"A still reads its own");
+            // 4. explicit Forget is the only way out
+            s3.Forget(b);Check(!s3.IsUnavailable(b) && !File.Exists(pb),"forget clears the unusable state and removes the file");
+            s3.WriteCredential(b,"fresh-B");Check(new DpapiSyncSecretStore(dir.Path).ReadCredential(b)=="fresh-B","a new credential can be stored afterwards");
+        });
+
+        await Case("a corrupt stored credential never registers a second account: sync pauses, operations stay retryable, local saving continues",async f=>{
+            var ids=f.CaptureAll();string snapshot=f.GameSnapshot();using var dir=new TempDir();using var server=new OfflineServer();server.Start();
+            var store=new DpapiSyncSecretStore(dir.Path);store.WriteCredential(f.Binding,"will-be-corrupted");
+            var file=Directory.GetFiles(dir.Path).Single();File.WriteAllBytes(file,Enumerable.Repeat((byte)7,64).ToArray());byte[] frozen=File.ReadAllBytes(file);
+            var tap=new TapHandler{InnerHandler=new SocketsHttpHandler{AllowAutoRedirect=false,UseProxy=false,UseCookies=false}};
+            using var transport=new SyncHttpTransport(new SyncHttpOptions(new Uri(server.Url+"/"),TimeSpan.FromSeconds(5),allowLoopbackHttp:true),tap);
+            var session=new SyncSessionManager(transport,f.Binding,new DpapiSyncSecretStore(dir.Path));
+            var dispatcher=new SyncOutboxDispatcher(f.Queue,session,f.Binding);
+            var pass=await dispatcher.RunPassAsync(CancellationToken.None);
+            Check(pass.Transport==SyncHttpFailure.CredentialUnavailable && pass.Confirmed==0 && pass.Code=="SYNC_CREDENTIALUNAVAILABLE",pass.DiagnosticSummary);
+            Check(tap.Registrations==0 && tap.Logins==0 && tap.Batches==0,"no request reached the server (no new account, no login, no batch)");
+            Check(File.ReadAllBytes(file).SequenceEqual(frozen),"the unusable file was not touched");
+            foreach(var id in ids.Take(3))Check(f.Op(id).State==OutboxDeliveryState.RetryableFailure,"retryable "+f.Op(id).State);
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));
+            Check(f.GameSnapshot()!=snapshot,"the game keeps saving locally while the store is broken");
+        });
+
+        await Case("restart without re-registering: the same account is reused through the protected store, with a new JWT and the same operation ids",async f=>{
+            var ids=f.CaptureAll();using var dir=new TempDir();using var server=new OfflineServer();server.Start();
+            var taps=new List<TapHandler>();
+            Func<HttpMessageHandler?> handler=()=>{var t=new TapHandler{InnerHandler=new SocketsHttpHandler{AllowAutoRedirect=false,UseProxy=false,UseCookies=false}};lock(taps)taps.Add(t);return t;};
+            SyncWorkerLifecycle Run()=>new(SyncHttpOptions.LoopbackDevelopment(server.Port),()=>f.Db,()=>new DpapiSyncSecretStore(dir.Path),TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock,handler);
+            string credentialBefore;
+            await using(var first=Run())
+            {
+                Check(await first.TickAsync(true)=="SYNC_STARTED" && await Until(()=>All(f,ids,OutboxDeliveryState.Confirmed)),"first run delivered");
+                credentialBefore=new DpapiSyncSecretStore(dir.Path).ReadCredential(f.Binding)!;
+                Check(new DpapiSyncSecretStore(dir.Path).ReadAccount(f.Binding) is not null && Directory.GetFiles(dir.Path).Length==1,"account and credential stored");
+            }                                                                                           // "game closed": everything in memory is gone
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));var later=f.Capture(new(SyncFactKind.GameReport,f.Game,f.Revision()));
+            await using(var second=Run())
+            {
+                Check(await second.TickAsync(true)=="SYNC_STARTED" && await Until(()=>f.Op(later).State==OutboxDeliveryState.Confirmed),"second run delivered with the recovered identity: "+f.Op(later).State+" "+f.Op(later).LastErrorCode);
+            }
+            lock(taps)
+            {
+                Check(taps.Sum(t=>t.Registrations)==1,"exactly one registration across both runs");
+                Check(taps.Sum(t=>t.Logins)>=2,"the second run logged in");
+                Check(taps.First().BatchTokens.Intersect(taps.Last().BatchTokens).Count()==0,"a different JWT after restart");
+            }
+            Check(new DpapiSyncSecretStore(dir.Path).ReadCredential(f.Binding)==credentialBefore,"the credential did not change");
+            Check(ids.All(id=>f.Op(id).State==OutboxDeliveryState.Confirmed && f.Op(id).OperationId==id),"earlier operations were not re-sent or altered");
+        });
+
+        await Case("an expired token is renewed with the stored credential (login, never a new registration)",async f=>{
+            using var dir=new TempDir();using var server=new OfflineServer();server.Start();
+            var tap=new TapHandler{InnerHandler=new SocketsHttpHandler{AllowAutoRedirect=false,UseProxy=false,UseCookies=false}};
+            using var transport=new SyncHttpTransport(new SyncHttpOptions(new Uri(server.Url+"/"),TimeSpan.FromSeconds(5),allowLoopbackHttp:true),tap);
+            var now=DateTimeOffset.UtcNow;var store=new DpapiSyncSecretStore(dir.Path);
+            var session=new SyncSessionManager(transport,f.Binding,store,()=>now);
+            Check((await session.EnsureAsync(CancellationToken.None)).Ok && session.HasSession && tap.Registrations==1 && tap.Logins==1,"first session");
+            now=now.AddMinutes(20);Check(!session.HasSession,"the 15 minute JWT is considered expired");
+            Check((await session.EnsureAsync(CancellationToken.None)).Ok && session.HasSession && tap.Registrations==1 && tap.Logins==2,"renewed by login with the protected credential");
+            // a brand new manager (restarted game) with an expired/absent token also just logs in
+            var restarted=new SyncSessionManager(transport,f.Binding,new DpapiSyncSecretStore(dir.Path),()=>now);
+            Check((await restarted.EnsureAsync(CancellationToken.None)).Ok && tap.Registrations==1 && tap.Logins==3,"restart: login only");
+            Check((await restarted.ProbeAsync(CancellationToken.None)).Ok,"the renewed JWT is accepted");
+        });
+
+        await Case("server disconnected and back (even with empty state): operations survive, the stored credential is reused, sync recovers for the same player",async f=>{
+            var ids=f.CaptureAll();using var dir=new TempDir();
+            using var probe=new OfflineServer();probe.Start();int port=probe.Port;
+            await using var life=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(port),()=>f.Db,()=>new DpapiSyncSecretStore(dir.Path),TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock);
+            Check(await life.TickAsync(true)=="SYNC_STARTED" && await Until(()=>All(f,ids,OutboxDeliveryState.Confirmed)),"delivered while up");
+            string credential=new DpapiSyncSecretStore(dir.Path).ReadCredential(f.Binding)!;probe.Kill();
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,f.Revision(),"jungle","human"));var offline=f.Capture(new(SyncFactKind.GameReport,f.Game,f.Revision()));
+            Check(await Until(()=>f.Op(offline).State==OutboxDeliveryState.RetryableFailure),"offline: retryable, not lost");
+            using var back=new OfflineServer();back.Start(port);                                         // a restarted offline server knows no accounts
+            for(int i=0;i<200 && f.Op(offline).State!=OutboxDeliveryState.Confirmed;i++){f.Clock=f.Clock.AddMinutes(10);await Task.Delay(100);}
+            Check(f.Op(offline).State==OutboxDeliveryState.Confirmed && All(f,ids,OutboxDeliveryState.Confirmed),"recovered after reconnect: "+f.Op(offline).State+" "+f.Op(offline).LastErrorCode+" "+life.WorkerDiagnostic?.Code);
+            Check(new DpapiSyncSecretStore(dir.Path).ReadCredential(f.Binding)==credential && Directory.GetFiles(dir.Path).Length==1,"same credential, still one file");
+        });
+
+        await Case("logout keeps the protected identity; explicit sign-out of the device forgets it; another player never sees it",async f=>{
+            using var other=new F();var a=f.CaptureAll();var b=other.CaptureAll();other.Clock=f.Clock;
+            using var dir=new TempDir();using var server=new OfflineServer();server.Start();
+            ISaveDatabase current=f.Db;var gate=new SyncSessionGate();
+            await using var life=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(server.Port),()=>current,()=>new DpapiSyncSecretStore(dir.Path),TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock);
+            Check(await life.TickAsync(gate.Evaluate(true,true))=="SYNC_STARTED" && await Until(()=>All(f,a,OutboxDeliveryState.Confirmed)),"A delivered");
+            gate.End();await life.TickAsync(gate.Evaluate(true,true));
+            Check(Directory.GetFiles(dir.Path).Length==1 && new DpapiSyncSecretStore(dir.Path).ReadCredential(f.Binding) is not null,"logout keeps the credential (the account must stay reachable)");
+            current=other.Db;gate.Begin();
+            Check(await life.TickAsync(gate.Evaluate(true,true))=="SYNC_STARTED" && await Until(()=>All(other,b,OutboxDeliveryState.Confirmed)),"B delivered with B's own credential");
+            var shared=new DpapiSyncSecretStore(dir.Path);
+            Check(Directory.GetFiles(dir.Path).Length==2 && shared.ReadCredential(f.Binding)!=shared.ReadCredential(other.Binding),"two files, two different credentials");
+            // explicit sign-out of the device for B only
+            Check(await life.ForgetCredentialAsync()=="SYNC_CREDENTIAL_FORGOTTEN" && life.State==SyncLifecycleState.Stopped,"forget stops the worker first");
+            var after=new DpapiSyncSecretStore(dir.Path);
+            Check(after.ReadCredential(other.Binding) is null && after.ReadCredential(f.Binding) is not null && Directory.GetFiles(dir.Path).Length==1,"only B's credential was removed");
+            Check(b.All(id=>other.Op(id).State==OutboxDeliveryState.Confirmed) && other.Number("SELECT count(*) FROM sync_outbox;")>=b.Count,"outbox untouched by forgetting");
+        });
+
+        await Case("no secret reaches logs, diagnostics, SQLite or the credential folder in clear text, and the Outbox content is unchanged",async f=>{
+            var ids=f.CaptureAll();var hashes=ids.ToDictionary(id=>id,id=>f.Op(id).PayloadHash);var envelopes=ids.ToDictionary(id=>id,id=>f.Op(id).CanonicalEnvelope);
+            using var dir=new TempDir();using var server=new OfflineServer();server.Start();
+            await using var life=new SyncWorkerLifecycle(SyncHttpOptions.LoopbackDevelopment(server.Port),()=>f.Db,()=>new DpapiSyncSecretStore(dir.Path),TimeSpan.FromMilliseconds(150),TimeSpan.FromMilliseconds(150),()=>f.Clock);
+            var codes=new List<string>{await life.TickAsync(true)};Check(await Until(()=>All(f,ids,OutboxDeliveryState.Confirmed)),"delivered");
+            codes.Add(life.Code);codes.Add(life.WorkerDiagnostic?.Code??"");codes.Add(SyncOutboxCounts.Read(f.Db));
+            string credential=new DpapiSyncSecretStore(dir.Path).ReadCredential(f.Binding)!,account=new DpapiSyncSecretStore(dir.Path).ReadAccount(f.Binding)!;
+            foreach(string text in codes){Check(!text.Contains(credential)&&!text.Contains(account),"diagnostic text is clean: "+text);}
+            Check(!ContainsText(File.ReadAllBytes(f.Db.Path),credential),"SQLite does not contain the credential");
+            Check(Directory.GetFiles(dir.Path).All(p=>!ContainsText(File.ReadAllBytes(p),credential)),"credential folder is not clear text");
+            Check(ids.All(id=>f.Op(id).PayloadHash==hashes[id] && f.Op(id).CanonicalEnvelope==envelopes[id]),"operation content byte-identical");
+        });
+
+        Console.WriteLine(_count+" sync HTTP checks passed; real Express offline-test composition on 127.0.0.1, synthetic SQLite only, no Atlas.");
+        return 0;
+    }
+}

@@ -1,0 +1,15 @@
+# OpenSSL configuration of the throw-away LOCAL TEST CA (B23). Scope: it can only vouch for the name "localhost" (and 127.0.0.1), lives 30 days, can sign no further CA.
+# Usage:  openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -config ca.cnf
+[req]
+distinguished_name = dn
+prompt = no
+x509_extensions = v3_ca
+
+[dn]
+CN = Two Sides LOCAL TEST CA (remove after use)
+
+[v3_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign
+subjectKeyIdentifier = hash
+nameConstraints = critical,permitted;DNS:localhost,permitted;IP:127.0.0.1/255.255.255.255

@@ -1,0 +1,145 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+using Microsoft.Win32.SafeHandles;
+using TwoSides.LocalPersistence;
+
+namespace TwoSides.TelemetryInspection;
+
+public sealed class InspectionRefused : Exception
+{
+    public string Code {get;}
+    public InspectionRefused(string code):base(code){Code=code;}
+}
+public sealed record SessionTime(int Ordinal,long EffectiveMs);
+public sealed record InspectionReport(string Result,bool SourceUnchanged,bool TemporaryCopyDeleted,int SchemaVersion,
+    int[] SaveMigrations,int GameplayVersion,int StatisticsVersion,string StatisticsChecksum,long Events,
+    Dictionary<string,long> EventTypes,long EffectiveMs,Dictionary<string,long> BiomeTimeMs,SessionTime[] SessionTimes,
+    Dictionary<string,long> Sessions,long GamesStarted,long GamesCompleted,Dictionary<string,long> Endings,
+    Dictionary<string,long> Decisions,Dictionary<string,long> BiomeCompletions,Dictionary<string,long> Outbox,
+    long DuplicateEventIds,long DuplicateSourceKeys,long DuplicateDecisionFacts,long InvalidIntervals,
+    long UnprojectedIntents,long UnprojectedGameplay,Dictionary<string,long> Coverage,string Integrity);
+
+// No SQLite connection to the source. Hold ancestors against rename, every source file against writes/deletion,
+// validate production ownership, and copy a stable closed store. SQLite sees only the disposable snapshot.
+public static class Inspector
+{
+    private sealed record Ownership(int Format,string Copy,string Purpose,string FileIdentity,bool Ready);
+    private static readonly string[] Allowed={"save.sqlite3","ownership.json","store.lease","save.sqlite3-journal","save.sqlite3-wal","save.sqlite3-shm"};
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Types={"installation_registered","game_started","game_completed","biome_entered","biome_completed","environmental_decision","playtime_interval","session_started","session_ended"};
+    private static void Need(bool condition,string code){if(!condition)throw new InspectionRefused(code);}
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Info {public uint Attributes;public System.Runtime.InteropServices.ComTypes.FILETIME C,A,W;public uint Volume,SizeHigh,SizeLow,Links,IndexHigh,IndexLow;}
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    private static extern SafeFileHandle CreateFileW(string name,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",SetLastError=true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,StringBuilder path,uint count,uint flags);
+    private static SafeFileHandle Lock(string path,bool directory)
+    {
+        // FILE_READ_ATTRIBUTES for ancestors; GENERIC_READ and only FILE_SHARE_READ for files.
+        var h=CreateFileW(path,directory?0x80u:0x80000000u,directory?3u:1u,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
+        if(h.IsInvalid){h.Dispose();throw new InspectionRefused("STORE_NOT_CLOSED_OR_ACCESS_DENIED");}
+        try{
+            Need(GetFileInformationByHandle(h,out var i),"FILE_INFORMATION_FAILED");
+            Need((i.Attributes&0x400)==0&&((i.Attributes&0x10)!=0)==directory&&(directory||i.Links==1),"LINK_OR_UNSAFE_OBJECT");
+            var b=new StringBuilder(32768);uint n=GetFinalPathNameByHandleW(h,b,(uint)b.Capacity,0);
+            Need(n>0&&n<b.Capacity,"UNSAFE_PATH");string resolved=b.ToString();if(resolved.StartsWith(@"\\?\",StringComparison.Ordinal))resolved=resolved[4..];
+            Need(string.Equals(resolved.TrimEnd('\\'),Path.GetFullPath(path).TrimEnd('\\'),StringComparison.OrdinalIgnoreCase),"UNSAFE_PATH");return h;
+        }catch{h.Dispose();throw;}
+    }
+    private static string Identity(SafeFileHandle handle){Need(GetFileInformationByHandle(handle,out var i),"FILE_INFORMATION_FAILED");return $"{i.Volume:x8}:{i.IndexHigh:x8}{i.IndexLow:x8}";}
+    private static string Hash(Stream stream){stream.Position=0;string value=Convert.ToHexString(SHA256.HashData(stream));stream.Position=0;return value;}
+    private sealed class SnapshotDatabase : ISaveDatabase
+    {
+        public string Path {get;}
+        public SnapshotDatabase(string path){Path=path;}
+        public SqliteConnection Open(){var c=new SqliteConnection(new SqliteConnectionStringBuilder{DataSource=Path,Mode=SqliteOpenMode.ReadOnly,Pooling=false}.ToString());c.Open();using var q=c.CreateCommand();q.CommandText="PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;";q.ExecuteNonQuery();return c;}
+    }
+    public static InspectionReport Inspect(string path,string expectedProductionPath)
+    {
+        Need(OperatingSystem.IsWindows(),"WINDOWS_REQUIRED");
+        Need(Path.IsPathFullyQualified(path)&&!path.StartsWith(@"\\",StringComparison.Ordinal)&&
+            string.Equals(path,Path.GetFullPath(path),StringComparison.OrdinalIgnoreCase)&&
+            string.Equals(path,expectedProductionPath,StringComparison.OrdinalIgnoreCase),"OUT_OF_SCOPE_PATH");
+        string dir=Path.GetDirectoryName(path)!;
+        Need(Path.GetFileName(path)=="save.sqlite3"&&Path.GetFileName(dir)=="PlayerData"&&Path.GetFileName(Path.GetDirectoryName(dir))=="TwoSides", "OUT_OF_SCOPE_PATH");
+        Need(!path.Split(Path.DirectorySeparatorChar).Any(p=>p.StartsWith("OneDrive",StringComparison.OrdinalIgnoreCase))&&new DriveInfo(Path.GetPathRoot(path)!).DriveType==DriveType.Fixed,"UNSAFE_PATH");
+        var locks=new List<SafeFileHandle>();var sources=new Dictionary<string,FileStream>(StringComparer.Ordinal);
+        string? temp=null;InspectionReport? result=null;
+        try{
+            string current=Path.GetPathRoot(dir)!;locks.Add(Lock(current,true));
+            foreach(string segment in dir[current.Length..].Split(Path.DirectorySeparatorChar)){current=Path.Combine(current,segment);locks.Add(Lock(current,true));}
+            var names=Directory.GetFileSystemEntries(dir).Select(Path.GetFileName).ToArray();
+            Need(names.All(n=>n is not null&&Allowed.Contains(n))&&new[]{"save.sqlite3","ownership.json","store.lease"}.All(names.Contains),"UNKNOWN_STORE_FILE");
+            foreach(string name in Allowed.Where(names.Contains)){
+                var handle=Lock(Path.Combine(dir,name),false);
+                try{sources.Add(name,new FileStream(handle,FileAccess.Read));}catch{handle.Dispose();throw;}
+            }
+            Need(sources["ownership.json"].Length<=1024,"OWNERSHIP_INVALID");
+            Ownership? ownership;
+            try{ownership=JsonSerializer.Deserialize<Ownership>(sources["ownership.json"]);}catch(JsonException){throw new InspectionRefused("OWNERSHIP_INVALID");}
+            Need(ownership is {Format:1,Copy:"two-sides-player-save-v1",Purpose:"player-production-save",Ready:true}&&ownership.FileIdentity==Identity(sources["save.sqlite3"].SafeFileHandle),"OWNERSHIP_INVALID");
+            // A nonempty rollback journal may require recovery. Do not recover or checkpoint the source.
+            Need(!sources.TryGetValue("save.sqlite3-journal",out var journal)||journal.Length==0,"JOURNAL_REQUIRES_SEPARATE_REVIEW");
+            var before=sources.ToDictionary(x=>x.Key,x=>(Hash:Hash(x.Value),Length:x.Value.Length));
+            temp=Path.Combine(Path.GetTempPath(),"TwoSidesB78Inspect-"+Guid.NewGuid().ToString("N"));
+            Need(!Directory.Exists(temp),"TEMP_ALREADY_EXISTS");Directory.CreateDirectory(temp);
+            foreach(var pair in sources.Where(x=>x.Key.StartsWith("save.sqlite3",StringComparison.Ordinal))){pair.Value.Position=0;using var target=new FileStream(Path.Combine(temp,pair.Key),FileMode.CreateNew,FileAccess.Write,FileShare.None);pair.Value.CopyTo(target);target.Flush(true);}
+            result=Read(Path.Combine(temp,"save.sqlite3"));
+            Need(sources.All(x=>x.Value.Length==before[x.Key].Length&&Hash(x.Value)==before[x.Key].Hash),"SOURCE_CHANGED");
+        }
+        finally{
+            foreach(var source in sources.Values)source.Dispose();for(int i=locks.Count-1;i>=0;i--)locks[i].Dispose();
+            if(temp is not null&&Directory.Exists(temp)){
+                // Delete only this generated flat snapshot, never recurse over an input path.
+                foreach(string file in Directory.GetFiles(temp))File.Delete(file);Directory.Delete(temp);
+            }
+        }
+        return result! with{SourceUnchanged=true,TemporaryCopyDeleted=true};
+    }
+    private static long Number(SqliteConnection c,string sql){using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+    private static Dictionary<string,long> Groups(SqliteConnection c,string sql,Func<string,bool> allowed)
+    {
+        var result=new Dictionary<string,long>(StringComparer.Ordinal);using var q=c.CreateCommand();q.CommandText=sql;using var r=q.ExecuteReader();
+        while(r.Read()){string key=r.GetString(0);Need(allowed(key),"UNEXPECTED_STATISTICAL_VALUE");result.Add(key,r.GetInt64(1));}return result;
+    }
+    private static InspectionReport Read(string path)
+    {
+        var db=new SnapshotDatabase(path);SchemaManager.Verify(db);GameplayEventSchema.Verify(db);
+        using var c=db.Open();
+        Need(Number(c,"PRAGMA application_id;")==0x54535044,"NOT_PRODUCTION_DATABASE");
+        using(var q=c.CreateCommand()){q.CommandText="PRAGMA integrity_check;";using var r=q.ExecuteReader();Need(r.Read()&&r.GetString(0)=="ok"&&!r.Read(),"SQLITE_INTEGRITY_FAILED");}
+        Need(Number(c,"SELECT count(*) FROM statistics_schema_migrations;")==1,"STATISTICS_MIGRATION_INVALID");
+        using(var q=c.CreateCommand()){q.CommandText="SELECT checksum FROM statistics_schema_migrations WHERE version=1 AND migration_key='statistics-only-v1';";Need((string?)q.ExecuteScalar()==StatisticsTelemetry.Checksum,"STATISTICS_MIGRATION_INVALID");}
+        Need(Number(c,"SELECT count(*) FROM statistics_installation WHERE singleton=1;")==1,"STATISTICS_INSTALLATION_INVALID");
+        string installation;using(var q=c.CreateCommand()){q.CommandText="SELECT installation_id FROM statistics_installation WHERE singleton=1;";installation=(string)q.ExecuteScalar()!;}
+        // Validate each immutable payload without printing any identifiers or Data payloads.
+        using(var q=c.CreateCommand()){q.CommandText="SELECT event_id,session_id,event_type,occurred_at_utc,game_token,biome_id,duration_ms,data FROM statistics_events;";using var r=q.ExecuteReader();while(r.Read()){
+            _=StatisticsTelemetry.Canonical(new(r.GetString(0),1,installation,r.GetString(1),r.GetString(2),r.GetString(3),r.IsDBNull(4)?null:r.GetString(4),r.IsDBNull(5)?null:r.GetString(5),r.IsDBNull(6)?null:r.GetInt64(6),r.GetString(7)));
+        }}
+        var types=Groups(c,"SELECT event_type,count(*) FROM statistics_events GROUP BY event_type;",Types.Contains);
+        var biomes=Groups(c,"SELECT biome_id,sum(duration_ms) FROM statistics_events WHERE event_type='playtime_interval' GROUP BY biome_id;",Biomes.Contains);
+        var sessions=Groups(c,"SELECT status,count(*) FROM gameplay_sessions GROUP BY status;",x=>x is "open" or "closed" or "interrupted");
+        var endings=Groups(c,"SELECT json_extract(data,'$.ending'),count(*) FROM statistics_events WHERE event_type='game_completed' GROUP BY json_extract(data,'$.ending');",x=>x is "good" or "medium" or "bad");
+        var decisions=Groups(c,"SELECT biome_id||':'||json_extract(data,'$.option')||':'||json_extract(data,'$.state'),count(*) FROM statistics_events WHERE event_type='environmental_decision' GROUP BY 1;",x=>Biomes.Any(b=>x==b+":reject:healthy"||x==b+":approve:degraded"));
+        var completed=Groups(c,"SELECT biome_id||':'||json_extract(data,'$.result'),count(*) FROM statistics_events WHERE event_type='biome_completed' GROUP BY 1;",x=>Biomes.Any(b=>x==b+":good"||x==b+":bad"));
+        var outbox=Groups(c,"SELECT state,count(*) FROM statistics_outbox GROUP BY state;",x=>x is "pending" or "in_flight" or "confirmed" or "retryable_failure" or "permanent_failure");
+        var coverage=Groups(c,"SELECT code,count(*) FROM statistics_coverage GROUP BY code;",x=>x is "CAPTURE_GAP" or "SUSPENSION_EXCLUDED" or "PREEXISTING_PROGRESS_NO_BACKFILL");
+        var times=new List<SessionTime>();using(var q=c.CreateCommand()){q.CommandText="SELECT coalesce(sum(CASE WHEN event_type='playtime_interval' THEN duration_ms ELSE 0 END),0) FROM statistics_events GROUP BY session_id ORDER BY min(sequence);";using var r=q.ExecuteReader();while(r.Read())times.Add(new(times.Count+1,r.GetInt64(0)));}
+        long ids=Number(c,"SELECT count(*) FROM (SELECT event_id FROM statistics_events GROUP BY event_id HAVING count(*)>1);"),sources=Number(c,"SELECT count(*) FROM (SELECT source_key FROM statistics_events GROUP BY source_key HAVING count(*)>1);"),facts=Number(c,"SELECT count(*) FROM (SELECT game_token,biome_id,json_extract(data,'$.decisionKey') FROM statistics_events WHERE event_type='environmental_decision' GROUP BY 1,2,3 HAVING count(*)>1);");
+        long invalid=Number(c,"SELECT count(*) FROM statistics_events WHERE event_type='playtime_interval' AND (duration_ms IS NULL OR duration_ms<=0 OR duration_ms>60000 OR json_extract(data,'$.active')!=1 OR json_extract(data,'$.excluded')!=0 OR json_extract(data,'$.endMs')-json_extract(data,'$.startMs')!=duration_ms);");
+        Need(ids==0&&sources==0&&facts==0&&invalid==0,"STATISTICAL_INTEGRITY_FAILED");
+        long count=Number(c,"SELECT count(*) FROM statistics_events;"),effective=Number(c,"SELECT coalesce(sum(duration_ms),0) FROM statistics_events WHERE event_type='playtime_interval';");
+        Need(count==Number(c,"SELECT count(*) FROM statistics_outbox;"),"OUTBOX_INCOMPLETE");
+        return new("PASS",false,false,2,new[]{1,2},1,1,StatisticsTelemetry.Checksum,count,types,effective,biomes,times.ToArray(),sessions,types.GetValueOrDefault("game_started"),types.GetValueOrDefault("game_completed"),endings,decisions,completed,outbox,ids,sources,facts,invalid,Number(c,"SELECT count(*) FROM statistics_intents WHERE projected=0;"),Number(c,"SELECT (SELECT count(*) FROM gameplay_events WHERE rowid>(SELECT last_rowid FROM statistics_cursors WHERE source='event'))+(SELECT count(*) FROM gameplay_intervals WHERE rowid>(SELECT last_rowid FROM statistics_cursors WHERE source='interval'));"),coverage,"ok");
+    }
+}

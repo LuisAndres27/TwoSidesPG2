@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "generatedAtUtc": "2026-10-29T22:00:11.870Z",
+  "releaseId": "c2-ba006dea951a180aabf7561b028ee1cb",
+  "releaseDirectory": "C:\\Users\\luis2\\AppData\\Local\\TwoSides\\C2Runtime\\c2-ba006dea951a180aabf7561b028ee1cb",
+  "mode": "c2-blocked",
+  "remoteEnabled": false,
+  "manifestSha256": "A24EDEE0CED4D6548AEEDCF5F72B8C2E689D31ABDEFA97B054A90538F5FD57A8",
+  "payloadSha256": "35502ABC9C42F00E474259267E7A08594AFD643627806B4C36E3022030A0CBC7",
+  "verifierRelativePath": "package/scripts/c2-activatable-verify-reference.ps1",
+  "verifierSha256": "EFA7AD7C88168EF25A0BCCE23C82262D9BB7D2DC82B3F0DC1B32A071272EE0E7",
+  "parentReleaseId": "c2-22fa685aef680f59de7e52427a42d647",
+  "parentManifestSha256": "0A8C7D973CE35BFD31D697C5E87B9432D7AC591D1BFBE93E3DCD882F83AA7579",
+  "independentReference": false
+}

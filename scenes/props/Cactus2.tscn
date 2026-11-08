@@ -1,0 +1,81 @@
+[gd_scene format=3 uid="uid://c4g6yu2rgmehs"]
+
+[ext_resource type="Script" uid="uid://ccqe0omeaa3t0" path="res://scripts/FuenteRecurso.cs" id="1_jku8n"]
+[ext_resource type="PackedScene" uid="uid://bb52018wsndbt" path="res://scenes/props/item_tuna.tscn" id="2_04g0a"]
+[ext_resource type="Texture2D" uid="uid://hbdph81y47h8" path="res://assets/sprites/fondos/desierto/CACTUS ALTO.png" id="3_7fmve"]
+[ext_resource type="Texture2D" uid="uid://h76gt8b12xeu" path="res://assets/sprites/fondos/desierto/CACTUS ALTO MAL ESTADO.png" id="4_rrf8m"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_g24ht"]
+atlas = ExtResource("3_7fmve")
+region = Rect2(0, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_igbs0"]
+atlas = ExtResource("3_7fmve")
+region = Rect2(32, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_x8cpr"]
+atlas = ExtResource("3_7fmve")
+region = Rect2(64, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_klqb0"]
+atlas = ExtResource("4_rrf8m")
+region = Rect2(0, 0, 32, 64)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_3y76c"]
+atlas = ExtResource("4_rrf8m")
+region = Rect2(32, 0, 32, 64)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_g5x2f"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_g24ht")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_igbs0")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_x8cpr")
+}],
+"loop": true,
+"name": &"palmera",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_klqb0")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_3y76c")
+}],
+"loop": true,
+"name": &"palmera_bad",
+"speed": 5.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_7rqrc"]
+size = Vector2(32, 63)
+
+[node name="Cactus" type="Area2D" unique_id=113170801]
+script = ExtResource("1_jku8n")
+EscenaRecurso = ExtResource("2_04g0a")
+AnimacionBase = "palmera"
+
+[node name="PuntoDrop" type="Marker2D" parent="." unique_id=342570844]
+position = Vector2(0, -30)
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=1174918]
+position = Vector2(0, -8)
+sprite_frames = SubResource("SpriteFrames_g5x2f")
+animation = &"palmera"
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=1297744957]
+position = Vector2(0, -7.5)
+shape = SubResource("RectangleShape2D_7rqrc")
+
+[node name="Indicador" type="Label" parent="." unique_id=1347437028]
+offset_left = -11.0
+offset_top = -14.0
+offset_right = 9.0
+offset_bottom = 9.0
+text = "[E]"

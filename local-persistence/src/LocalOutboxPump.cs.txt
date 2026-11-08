@@ -1,0 +1,62 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+public sealed record LocalOutboxPage(string Code,bool IntegrityFailure,SyncReconciliationPage? Page=null);
+public sealed record LocalOutboxDiagnostic(string Code,bool IntegrityFailure,long Passes,long Inserted,bool Running);
+
+// No migration here: absence remains inactive. Caller serializes this pump with its domain worker.
+public sealed class LocalOutboxPump
+{
+    private readonly ISaveDatabase _database;
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly Action? _beforeCommit;
+    public LocalOutboxPump(ISaveDatabase database,Func<DateTimeOffset>? clock=null,Action? beforeCommit=null)
+    {_database=database;_clock=clock??(()=>DateTimeOffset.UtcNow);_beforeCommit=beforeCommit;}
+    public LocalOutboxPage Step(SyncReconciliationCursor? cursor,int limit=25)
+    {
+        try
+        {
+            using var c=_database.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);
+            SaveValidation.Require(r.Number("PRAGMA user_version;")==2,"UNSUPPORTED_SCHEMA");
+            if(cursor is null)
+            {
+                using var integrity=r.Command("PRAGMA quick_check;");
+                SaveValidation.Require((string?)integrity.ExecuteScalar()=="ok","CORRUPT_STORAGE");
+                SaveValidation.Require(r.Number("SELECT count(*) FROM pragma_foreign_key_check;")==0,"CORRUPT_STORAGE");
+            }
+            if(r.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'sync_*';")==0)
+            {tx.Commit();return new("OUTBOX_NOT_ACTIVATED",false);}
+            SyncOutboxSchema.Verify(r);
+            if(r.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'gameplay_*';")>0)GameplayEventSchema.Verify(r);
+            var profile=r.Profile();
+            if(profile is null){tx.Commit();return new("OUTBOX_WAITING_PROFILE",false);}
+            // Never select arbitrarily among installations or create another on restart.
+            var bindings=new List<SyncBinding>();
+            using(var q=r.Command("SELECT installation_id,binding_generation FROM sync_installations WHERE local_player_id=$p;",("$p",profile.LocalPlayerId)))
+            using(var data=q.ExecuteReader())while(data.Read())bindings.Add(new(profile.LocalPlayerId,data.GetString(0),data.GetInt64(1)));
+            SaveValidation.Require(bindings.Count<=1,"AMBIGUOUS_SYNC_BINDING");
+            var binding=bindings.SingleOrDefault()??new(profile.LocalPlayerId,Guid.NewGuid().ToString("D"),1);
+            var page=SyntheticOutboxReconciler.PrepareSyntheticPage(r,binding,_clock(),limit,cursor,"historical_import");
+            _beforeCommit?.Invoke();tx.Commit();
+            page=page with{Committed=true};
+            return new(page.Diagnostics.Count==0?"OUTBOX_LOCAL_READY":"OUTBOX_REQUIRES_REVIEW",false,page);
+        }
+        catch(Exception error) when(error is SaveException or SqliteException or IOException or UnauthorizedAccessException or JsonException or ArgumentException or FormatException or OverflowException)
+        {
+            string code=error is SqliteException sql?StorageErrors.Map(sql).Code:(error as SaveException)?.Code??"IO_ERROR";
+            bool integrity=code is "CORRUPT_STORAGE" or "UNSUPPORTED_SCHEMA" or "FOREIGN_KEYS_DISABLED";
+            string safe=code is "CORRUPT_STORAGE" or "UNSUPPORTED_SCHEMA" or "FOREIGN_KEYS_DISABLED" or "UNSUPPORTED_SYNC_SCHEMA" or
+                "UNSUPPORTED_EVENT_SCHEMA" or "AMBIGUOUS_SYNC_BINDING" or "OUTBOX_FULL" or "STORAGE_BUSY" or "ACCESS_DENIED" or "DISK_FULL" or
+                "INVALID_RECONCILIATION_CURSOR" or "SOURCE_CONTENT_CONFLICT" ? code : "OUTBOX_STORAGE_FAILURE";
+            return new(safe,integrity);
+        }
+    }
+}
+

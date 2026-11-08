@@ -1,0 +1,122 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace TwoSides.LocalPersistence;
+
+public sealed record LocalOutboxDrain(string Code,bool Completed,bool IntegrityFailure,long Inserted);
+
+// Owns no Godot objects, sockets or DB capability. Adapter delegate serializes each page with domain writes.
+public sealed class LocalOutboxScheduler:IAsyncDisposable
+{
+    private readonly Func<SyncReconciliationCursor?,CancellationToken,Task<LocalOutboxPage>> _step;
+    private readonly SemaphoreSlim _signal=new(0,1);
+    private readonly CancellationTokenSource _stop=new();
+    private readonly TimeSpan _coalesce,_retry,_yield;
+    private readonly Task _worker;
+    private int _requested,_closing;
+    private readonly object _closeLock=new();
+    private Task<LocalOutboxDrain>? _drain;
+    private Task<LocalOutboxDrain>? _drainWork;
+    private LocalOutboxDiagnostic _diagnostic=new("OUTBOX_IDLE",false,0,0,false);
+    public LocalOutboxDiagnostic Diagnostic=>Volatile.Read(ref _diagnostic);
+    public LocalOutboxScheduler(Func<SyncReconciliationCursor?,CancellationToken,Task<LocalOutboxPage>> step,
+        TimeSpan? coalesce=null,TimeSpan? retry=null,TimeSpan? pageYield=null)
+    {
+        _step=step;_coalesce=coalesce??TimeSpan.FromSeconds(2);_retry=retry??TimeSpan.FromSeconds(30);_yield=pageYield??TimeSpan.FromMilliseconds(25);
+        SaveValidation.Require(_coalesce>=TimeSpan.Zero && _retry>TimeSpan.Zero && _yield>=TimeSpan.Zero,"INVALID_OUTBOX_SCHEDULER");
+        _worker=Task.Run(Run);
+    }
+    public void Request()
+    {
+        if(Volatile.Read(ref _closing)!=0)return;
+        if(Interlocked.Exchange(ref _requested,1)==0){try{_signal.Release();}catch(SemaphoreFullException){}}
+    }
+    private async Task Run()
+    {
+        var token=_stop.Token;
+        try
+        {
+            while(!token.IsCancellationRequested)
+            {
+                await _signal.WaitAsync(_retry,token).ConfigureAwait(false);
+                Interlocked.Exchange(ref _requested,0);
+                await Task.Delay(_coalesce,token).ConfigureAwait(false);
+                var before=Diagnostic;
+                Volatile.Write(ref _diagnostic,before with{Running=true});
+                SyncReconciliationCursor? cursor=null;long inserted=0;string code="OUTBOX_LOCAL_READY";bool integrity=false;
+                do
+                {
+                    token.ThrowIfCancellationRequested();
+                    var result=await _step(cursor,token).ConfigureAwait(false);
+                    code=result.Code;integrity=result.IntegrityFailure;
+                    if(result.Page is not {Committed:true} page){cursor=null;break;}
+                    inserted+=page.Inserted;cursor=page.Next;
+                    await Task.Delay(_yield,token).ConfigureAwait(false);
+                }while(cursor is not null);
+                var d=Diagnostic;
+                Volatile.Write(ref _diagnostic,new(code,integrity,d.Passes+1,d.Inserted+inserted,false));
+            }
+        }
+        catch(OperationCanceledException) when(token.IsCancellationRequested){}
+        catch {var d=Diagnostic;Volatile.Write(ref _diagnostic,d with{Code="OUTBOX_WORKER_FAILED",Running=false});}
+        finally {var d=Diagnostic;Volatile.Write(ref _diagnostic,d with{Running=false});}
+    }
+    public async ValueTask DisposeAsync()
+    {
+        if(Interlocked.Exchange(ref _closing,1)==0)_stop.Cancel();
+        await _worker.ConfigureAwait(false);
+        Task<LocalOutboxDrain>? work;lock(_closeLock)work=_drainWork;
+        if(work is not null)await work.ConfigureAwait(false);
+        // No callbacks or timer survives completion. Cancellation can wait for current bounded DB page.
+    }
+
+    // Terminal barrier: caller must first stop/commit source writes. A fresh pass follows any active page.
+    public Task<LocalOutboxDrain> DrainAsync(TimeSpan budget)
+    {
+        SaveValidation.Require(budget>TimeSpan.Zero && budget<=TimeSpan.FromSeconds(30),"INVALID_OUTBOX_DRAIN");
+        lock(_closeLock)
+        {
+            if(_drain is not null)return _drain;
+            if(Interlocked.Exchange(ref _closing,1)!=0)return Task.FromResult(new LocalOutboxDrain("OUTBOX_CLOSED",false,false,0));
+            _stop.Cancel();
+            return _drain=BoundedDrain(budget);
+        }
+    }
+    private async Task<LocalOutboxDrain> BoundedDrain(TimeSpan budget)
+    {
+        using var deadline=new CancellationTokenSource(budget);
+        var token=deadline.Token;
+        _drainWork=Task.Run(async()=>
+        {
+            long inserted=0;
+            try
+            {
+                await _worker.ConfigureAwait(false);
+                SyncReconciliationCursor? cursor=null;
+                do
+                {
+                    token.ThrowIfCancellationRequested();
+                    var result=await _step(cursor,token).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                    if(result.Page is not {Committed:true} page)
+                        return new LocalOutboxDrain(result.Code,false,result.IntegrityFailure,inserted);
+                    inserted+=page.Inserted;cursor=page.Next;
+                    if(cursor is null)return new LocalOutboxDrain(page.Completed && page.Consistent?"OUTBOX_DRAINED":"OUTBOX_REQUIRES_REVIEW",page.Completed && page.Consistent,result.IntegrityFailure,inserted);
+                    await Task.Yield();
+                }while(true);
+            }
+            catch(OperationCanceledException) when(token.IsCancellationRequested){return new LocalOutboxDrain("OUTBOX_CLOSE_DEFERRED",false,false,inserted);}
+            catch{return new LocalOutboxDrain("OUTBOX_DRAIN_FAILED",false,false,inserted);}
+        });
+        var expired=Task.Delay(budget);
+        var finished=await Task.WhenAny(_drainWork,expired).ConfigureAwait(false);
+        LocalOutboxDrain answer;
+        if(finished==_drainWork && !token.IsCancellationRequested)answer=await _drainWork.ConfigureAwait(false);
+        else {deadline.Cancel();answer=new("OUTBOX_CLOSE_DEFERRED",false,Diagnostic.IntegrityFailure,0);}
+        var d=Diagnostic;
+        Volatile.Write(ref _diagnostic,d with{Code=answer.Code,IntegrityFailure=answer.IntegrityFailure});
+        return answer;
+    }
+}
+

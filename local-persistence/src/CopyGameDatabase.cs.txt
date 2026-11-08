@@ -1,0 +1,32 @@
+using System;
+using Microsoft.Data.Sqlite;
+
+// Internal test seam for the named, disposable production-storage check project only. The Godot game assembly has a different name.
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("TwoSides.Production.Checks")]
+
+namespace TwoSides.LocalPersistence;
+
+// Only the authorized test copy's game store; never an arbitrary or production path.
+public sealed class CopyGameDatabase : ISaveDatabase, IDisposable
+{
+    public static string AuthorizedDirectory => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "TwoSides", "ReconstructionTests", "copy-" + DurableTestDatabase.CopyId, "game-progress");
+    public static string AuthorizedPath => System.IO.Path.Combine(AuthorizedDirectory, "save.sqlite3");
+    public static string RuntimeDirectory => System.IO.Path.Combine(SyntheticSandbox.AuthorizedProjectRoot, ".work", "runtime-game");
+    public static string RuntimePath => System.IO.Path.Combine(RuntimeDirectory, "save.sqlite3");
+    // Per-user PRODUCTION store: %LOCALAPPDATA%\TwoSides\PlayerData\save.sqlite3. Independent of the copy, runtime (developer historical) and sandbox stores.
+    public static string ProductionDirectory => OwnedCopyDatabase.ProductionDirectoryUnder(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+    public static string ProductionPath => System.IO.Path.Combine(ProductionDirectory, "save.sqlite3");
+    public static CopyGameDatabase OpenProductionOrCreate(string absolutePath) => new(OwnedCopyDatabase.OpenProduction(absolutePath, null));
+    internal static CopyGameDatabase OpenProductionUnder(string localRoot, string absolutePath) => new(OwnedCopyDatabase.OpenProduction(absolutePath, localRoot));
+    // Separate, explicitly authorized runtime store. Never opens either protected AppData store.
+    public static CopyGameDatabase OpenRuntimeOrCreate(string absolutePath) => new(OwnedCopyDatabase.OpenOrCreate(absolutePath, true, true));
+    private readonly OwnedCopyDatabase _store;
+    internal bool IsProductionStore => _store.IsProductionStore;
+    private CopyGameDatabase(OwnedCopyDatabase store) { _store = store; }
+    public string Path => _store.Path;
+    public static CopyGameDatabase OpenOrCreate(string absolutePath) => new(OwnedCopyDatabase.OpenOrCreate(absolutePath, true));
+    public SqliteConnection Open() => _store.Open();
+    public void Dispose() => _store.Dispose();
+}

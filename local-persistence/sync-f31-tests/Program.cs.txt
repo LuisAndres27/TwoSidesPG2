@@ -1,0 +1,11 @@
+using System;
+using System.Threading.Tasks;
+
+internal static class Program
+{
+    public static async Task<int> Main(string[] args)
+    {
+        try{return await SyncF31Checks.Run();}
+        catch(Exception error){Console.Error.WriteLine("FAIL "+error.GetType().Name+": "+error.Message);return 1;}
+    }
+}

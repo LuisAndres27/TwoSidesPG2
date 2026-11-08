@@ -1,0 +1,112 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+
+namespace TwoSides.Integration.SyncHttp;
+
+public sealed class StatisticsCredential
+{
+    public string InstallationId {get;} public string Token {get;} public string Audience {get;} public long ExpiresAtMs {get;}
+    public StatisticsCredential(string installationId,string token,string audience,long expiresAtMs)
+    {SaveValidation.Id(installationId);if(token.Length!=43||token.Any(c=>!char.IsAsciiLetterOrDigit(c)&&c!='-'&&c!='_'))throw new ArgumentException("Invalid statistics credential");InstallationId=installationId;Token=token;Audience=audience;ExpiresAtMs=expiresAtMs;}
+    public override string ToString()=>"StatisticsCredential [redacted]";
+}
+public interface IStatisticsCredentials {Task<StatisticsCredential?> GetAsync(CancellationToken cancel);}
+public sealed class StatisticsTransport : IAsyncDisposable
+{
+    public const string Contract="statistics-only-v1";
+    private readonly IStatisticsDeliveryStore _store;private readonly IStatisticsCredentials _credentials;private readonly HttpClient _http;
+    private readonly Uri _endpoint;private readonly string _audience;private readonly Func<long> _now;private readonly Func<double> _random;
+    private readonly SemaphoreSlim _gate=new(1,1);private readonly CancellationTokenSource _stop=new();
+    private bool _paused,_closed;private int _failures;
+    public string Diagnostic {get;private set;}="STATISTICS_TRANSPORT_READY";
+    public StatisticsTransport(IStatisticsDeliveryStore store,IStatisticsCredentials credentials,Uri baseUri,bool syntheticLoopback=false,HttpMessageHandler? testHandler=null,Func<long>? now=null,Func<double>? random=null)
+    {
+        if(!baseUri.IsAbsoluteUri||baseUri.UserInfo!=""||baseUri.Query!=""||baseUri.Fragment!=""||baseUri.AbsolutePath!="/"||
+            (baseUri.Scheme!="https"&&!(syntheticLoopback&&baseUri.Scheme=="http"&&baseUri.Host=="127.0.0.1")))throw new ArgumentException("Statistics destination rejected");
+        if(testHandler is not null&&!syntheticLoopback)throw new ArgumentException("Test handler requires synthetic capability");
+        _store=store;_credentials=credentials;_endpoint=new(baseUri,"api/v1/statistics/events");_audience=baseUri.GetLeftPart(UriPartial.Authority);
+        // System certificate/name validation stays enabled. Never follow redirects with a bearer credential.
+        _http=new HttpClient(testHandler??new HttpClientHandler{AllowAutoRedirect=false}){Timeout=Timeout.InfiniteTimeSpan};
+        _now=now??(()=>DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());_random=random??Random.Shared.NextDouble;
+    }
+    private long Delay(HttpResponseMessage? response=null)
+    {
+        double jitter=Math.Clamp(_random(),0,1);long delay=(long)(Math.Min(3600000,30000*Math.Pow(2,Math.Min(_failures++,7)))*(0.8+0.4*jitter));
+        var after=response?.Headers.RetryAfter;long server=after?.Delta is TimeSpan span?(long)span.TotalMilliseconds:after?.Date is DateTimeOffset date?date.ToUnixTimeMilliseconds()-_now():0;
+        return Math.Clamp(Math.Max(delay,server),1000,86400000);
+    }
+    private async Task Defer(IReadOnlyList<StatisticalDelivery> batch,long delay,string code)
+    {long now=_now();foreach(var d in batch)await _store.DeferStatisticsAsync(d,now,checked(now+delay),code,CancellationToken.None).ConfigureAwait(false);}
+    public async Task ResumeAuthenticationAsync(CancellationToken cancel=default)
+    {await _gate.WaitAsync(cancel).ConfigureAwait(false);try{await _store.ResumeStatisticsAsync(_now(),cancel).ConfigureAwait(false);_paused=false;_failures=0;}finally{_gate.Release();}}
+    public async Task<string> TickAsync(CancellationToken cancel=default)
+    {
+        if(_closed)return "STATISTICS_TRANSPORT_CLOSED";
+        if(!await _gate.WaitAsync(0,cancel).ConfigureAwait(false))return "STATISTICS_TRANSPORT_BUSY";
+        IReadOnlyList<StatisticalDelivery> batch=Array.Empty<StatisticalDelivery>();bool resolved=false;
+        try{
+            if(_closed||_paused)return Diagnostic=_closed?"STATISTICS_TRANSPORT_CLOSED":"STATISTICS_AUTH_REQUIRED";
+            using var timeout=CancellationTokenSource.CreateLinkedTokenSource(cancel,_stop.Token);timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            var credential=await _credentials.GetAsync(timeout.Token).ConfigureAwait(false);
+            if(credential is null||credential.ExpiresAtMs<=_now()||credential.Audience!=_audience){_paused=true;return Diagnostic="STATISTICS_AUTH_REQUIRED";}
+            batch=await _store.ReserveStatisticsAsync(_now(),timeout.Token).ConfigureAwait(false);
+            if(batch.Count==0)return Diagnostic="STATISTICS_IDLE";
+            if(batch.Count>5||batch.Any(d=>d.Event.InstallationId!=credential.InstallationId)){
+                _paused=true;await Defer(batch,86400000,"auth_required").ConfigureAwait(false);resolved=true;return Diagnostic="STATISTICS_AUTH_OR_CONFIGURATION_REQUIRED";
+            }
+            var items=batch.Select(d=>{
+                string text=StatisticsTelemetry.Canonical(d.Event),hash=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
+                if(hash!=d.PayloadHash||Encoding.UTF8.GetByteCount(text)>4096)throw new InvalidOperationException("Statistics payload mismatch");
+                return new {EventJson=text,PayloadHash=hash};
+            }).ToArray();
+            string body=JsonSerializer.Serialize(new{Contract,Events=items});if(Encoding.UTF8.GetByteCount(body)>32768)throw new InvalidOperationException("Statistics batch too large");
+            using var request=new HttpRequestMessage(HttpMethod.Post,_endpoint){Content=new StringContent(body,Encoding.UTF8,"application/json")};
+            request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",credential.Token);
+            using var response=await _http.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,timeout.Token).ConfigureAwait(false);
+            if(response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden or HttpStatusCode.BadRequest or HttpStatusCode.NotFound){
+                _paused=true;await Defer(batch,86400000,"auth_required").ConfigureAwait(false);resolved=true;return Diagnostic="STATISTICS_AUTH_OR_CONFIGURATION_REQUIRED";
+            }
+            if(response.StatusCode!=HttpStatusCode.OK){await Defer(batch,Delay(response),response.StatusCode==HttpStatusCode.TooManyRequests?"rate_limited":"http_transient").ConfigureAwait(false);resolved=true;return Diagnostic="STATISTICS_RETRY_PENDING";}
+            if(response.Content.Headers.ContentType?.MediaType!="application/json"||response.Content.Headers.ContentLength>16384)throw new InvalidOperationException("Statistics receipt media or size");
+            await using var stream=await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);using var buffer=new MemoryStream();var bytes=new byte[2048];int read;
+            while((read=await stream.ReadAsync(bytes,timeout.Token).ConfigureAwait(false))>0){if(buffer.Length+read>16384)throw new InvalidOperationException("Statistics receipt too large");buffer.Write(bytes,0,read);}
+            using var json=JsonDocument.Parse(buffer.ToArray());var root=json.RootElement;
+            RequireFields(root,"Contract","Receipts");if(root.GetProperty("Contract").GetString()!=Contract)throw new InvalidOperationException("Statistics receipt contract");
+            var receipts=root.GetProperty("Receipts");if(receipts.ValueKind!=JsonValueKind.Array||receipts.GetArrayLength()>5)throw new InvalidOperationException("Statistics receipt shape");
+            var map=new Dictionary<string,(string Status,string Code)>();
+            foreach(var r in receipts.EnumerateArray()){
+                RequireFields(r,"EventId","PayloadHash","Status","Code");string id=r.GetProperty("EventId").GetString()!,hash=r.GetProperty("PayloadHash").GetString()!,status=r.GetProperty("Status").GetString()!,code=r.GetProperty("Code").GetString()!;
+                var source=batch.SingleOrDefault(d=>d.Event.EventId==id);if(source is null||source.PayloadHash!=hash||map.ContainsKey(id))throw new InvalidOperationException("Statistics receipt binding");
+                bool valid=status switch{"accepted" or "duplicate"=>code=="ok","rejected"=>new[]{"invalid_event","hash_mismatch","unsupported_version","invalid_time","event_expired","event_conflict","fact_conflict"}.Contains(code),"retryable"=>code is "storage_unavailable" or "quota_exceeded",_=>false};
+                if(!valid)throw new InvalidOperationException("Statistics receipt status");map.Add(id,(status,code));
+            }
+            long now=_now(),retry=checked(now+Delay(response));
+            foreach(var d in batch){
+                if(map.TryGetValue(d.Event.EventId,out var r)&&r.Status is "accepted" or "duplicate")await _store.ConfirmStatisticsAsync(d,CancellationToken.None).ConfigureAwait(false);
+                else if(map.TryGetValue(d.Event.EventId,out r)&&r.Status=="rejected")await _store.RejectStatisticsAsync(d,now,r.Code,CancellationToken.None).ConfigureAwait(false);
+                else await _store.DeferStatisticsAsync(d,now,retry,"unconfirmed_receipt",CancellationToken.None).ConfigureAwait(false);
+            }
+            resolved=true;if(batch.All(d=>map.TryGetValue(d.Event.EventId,out var receipt)&&receipt.Status!="retryable"))_failures=0;
+            return Diagnostic="STATISTICS_RECEIPTS_APPLIED";
+        }catch(Exception){
+            // Fixed codes only. A local receipt commit may have partially succeeded: leases/IDs make reopening safe.
+            if(batch.Count>0&&!resolved){try{await Defer(batch,Delay(),"http_transient").ConfigureAwait(false);}catch{/* already confirmed or storage unavailable; durable lease expires */}}
+            return Diagnostic=cancel.IsCancellationRequested||_stop.IsCancellationRequested?"STATISTICS_CANCELLED":"STATISTICS_RETRY_PENDING";
+        }finally{_gate.Release();}
+    }
+    private static void RequireFields(JsonElement element,params string[] fields)
+    {if(element.ValueKind!=JsonValueKind.Object||element.EnumerateObject().Count()!=fields.Length||fields.Any(f=>!element.TryGetProperty(f,out _)))throw new InvalidOperationException("Statistics receipt fields");}
+    public async ValueTask DisposeAsync()
+    {_closed=true;_stop.Cancel();if(await _gate.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false)){try{_http.Dispose();}finally{_gate.Release();}}else _http.Dispose();}
+}

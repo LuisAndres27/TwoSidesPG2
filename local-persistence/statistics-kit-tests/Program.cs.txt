@@ -1,0 +1,121 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+
+// B87 checks of the statistics kit: activation gate, kit files, credential provider and the REAL chain
+// (disposable SQLite -> StatisticsTransport -> real Express startKitExpress over a disposable synthetic store). Loopback only, no Atlas, no PlayerData.
+internal static class Program
+{
+ static int checks;static string Id()=>Guid.NewGuid().ToString("D");
+ static void Check(bool ok,string label){if(!ok)throw new Exception(label);checks++;Console.WriteLine("PASS "+label);}
+ static string TempDir(string prefix){string d=Path.Combine(Path.GetTempPath(),prefix+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(d);return d;}
+ static void Remove(string d){foreach(var f in Directory.GetFiles(d))File.Delete(f);Directory.Delete(d);}
+ static long Now=>DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+ static string Token(char c='A')=>new string(c,43);
+
+ static void Gate()
+ {
+  string[] On(string user,string dir)=>new[]{"--stats-demo","--stats-expected-user="+user,"--stats-kit-dir="+dir};
+  string code;
+  Check(StatisticsKitGate.Evaluate(Array.Empty<string>(),"TwoSidesDemo",out code) is null&&code=="STATS_KIT_OFF","no arguments: transport stays OFF");
+  Check(StatisticsKitGate.Evaluate(new[]{"--stats-expected-user=TwoSidesDemo","--stats-kit-dir=C:\\kit"},"TwoSidesDemo",out code) is null&&code=="STATS_KIT_OFF","expected user and folder WITHOUT the flag: OFF");
+  Check(StatisticsKitGate.Evaluate(new[]{"--stats-demo"},"TwoSidesDemo",out code) is null&&code=="STATS_KIT_ARGUMENTS","flag without user/folder: rejected");
+  Check(StatisticsKitGate.Evaluate(On("TwoSidesDemo","C:\\kit"),"OtherAccount",out code) is null&&code=="STATS_KIT_USER_MISMATCH","wrong Windows account: rejected");
+  foreach(string forbidden in new[]{"luis2","TwoSidesTest","TwoSidesStatsTest","LUIS2"})
+   Check(StatisticsKitGate.Evaluate(On(forbidden,"C:\\kit"),forbidden,out code) is null&&code=="STATS_KIT_USER_FORBIDDEN","accounts with real player data never activate: "+forbidden.ToLowerInvariant());
+  Check(StatisticsKitGate.Evaluate(On("TwoSidesDemo","relative\\kit"),"TwoSidesDemo",out code) is null&&code=="STATS_KIT_DIRECTORY","relative folder: rejected");
+  var ok=StatisticsKitGate.Evaluate(On("TwoSidesDemo","C:\\TwoSidesStatsKit\\hand-over"),"twosidesdemo",out code);
+  Check(ok is not null&&code=="STATS_KIT_ENABLED"&&ok.KitDirectory=="C:\\TwoSidesStatsKit\\hand-over","expected account + flag + absolute folder: enabled (account compared case-insensitively)");
+ }
+
+ static void Files()
+ {
+  string d=TempDir("twosides-b87-kit-");
+  try{
+   string id=Id();long now=Now;
+   Check(StatisticsKitFiles.TryRead(d,now,id) is null,"no kit.json: null");
+   StatisticsKitFiles.WriteInstallation(d,id);StatisticsKitFiles.WriteInstallation(d,id);
+   using(var doc=JsonDocument.Parse(File.ReadAllText(Path.Combine(d,"installation.json"))))Check(doc.RootElement.GetProperty("schema").GetInt32()==1&&doc.RootElement.GetProperty("installationId").GetString()==id&&doc.RootElement.EnumerateObject().Count()==2,"installation.json holds only schema and id");
+   Check(Directory.GetFiles(d,"*.tmp").Length==0,"no temporary files left");
+   void Kit(string audience,string token,long exp,string inst)=>File.WriteAllText(Path.Combine(d,"kit.json"),JsonSerializer.Serialize(new{schema=1,audience,token,expiresAtMs=exp,installationId=inst}));
+   Kit("http://127.0.0.1:4187",Token(),now+60000,id);Check(StatisticsKitFiles.TryRead(d,now,id) is {Audience:"http://127.0.0.1:4187"},"valid kit is read");
+   Kit("http://127.0.0.1:4187",Token(),now-1,id);Check(StatisticsKitFiles.TryRead(d,now,id) is null,"expired kit: null");
+   Kit("http://127.0.0.1:4187",Token(),now+60000,Id());Check(StatisticsKitFiles.TryRead(d,now,id) is null,"kit for another installation: null");
+   foreach(string audience in new[]{"https://127.0.0.1:4187","http://localhost:4187","http://127.0.0.1.evil.test:4187","http://10.0.0.5:4187","http://127.0.0.1:4187/x","http://127.0.0.1"}){Kit(audience,Token(),now+60000,id);Check(StatisticsKitFiles.TryRead(d,now,id) is null,"audience refused: "+audience);}
+   Kit("http://127.0.0.1:4187","short",now+60000,id);Check(StatisticsKitFiles.TryRead(d,now,id) is null,"bad token shape: null");
+   File.WriteAllText(Path.Combine(d,"kit.json"),"{not json");Check(StatisticsKitFiles.TryRead(d,now,id) is null,"corrupt kit: null");
+   File.WriteAllText(Path.Combine(d,"kit.json"),new string('x',2000));Check(StatisticsKitFiles.TryRead(d,now,id) is null,"oversized kit: null");
+   Kit("http://127.0.0.1:4187",Token(),now+60000,id);
+   var credentials=new KitStatisticsCredentials(d,id,()=>now);var c=credentials.GetAsync(CancellationToken.None).GetAwaiter().GetResult();
+   Check(c is not null&&c.InstallationId==id&&c.Audience=="http://127.0.0.1:4187"&&c.ToString()=="StatisticsCredential [redacted]","credential provider returns the redacted credential");
+   File.Delete(Path.Combine(d,"kit.json"));Check(credentials.GetAsync(CancellationToken.None).GetAwaiter().GetResult() is null,"provider returns null again when the kit disappears");
+  }finally{Remove(d);}
+ }
+
+ sealed class Fixture:IAsyncDisposable {
+  public readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);public readonly SyntheticDatabase Db;public GamePersistenceAdapter Adapter;public readonly string Owner=Id(),Game=Id();
+  public Fixture(){Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Adapter=GamePersistenceAdapter.CreateSyntheticStatisticsAdapter(Db);}
+  public long N(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+  public async Task Start(){
+   if(!(await Adapter.OpenAsync("owned-outbox-fixture")).Success)throw new Exception("fixture open");
+   await Adapter.CreateLocalProfileAsync(new(Id(),Owner,"PRIVATE-SYNTHETIC-B87"));await Adapter.CreateNewGameAsync(new(Id(),Owner,Game));
+   long Rev()=>(Adapter.LoadGameAsync(Owner,Game).GetAwaiter().GetResult().Data!).Game.Revision;
+   await Adapter.EnterBiomeAsync(new(Id(),Owner,Game,Rev(),"ocean","human"));
+   await Adapter.RecordDecisionAsync(new(Id(),Id(),Owner,Game,Rev(),"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}"));
+   await Adapter.CompleteBiomeAsync(new(Id(),Owner,Game,Rev(),"ocean","good"));
+  }
+  public async ValueTask DisposeAsync(){await Adapter.DisposeAsync();Sandbox.Dispose();}
+ }
+ sealed class Server:IAsyncDisposable {
+  readonly Process process;public readonly int Port;
+  public Server(string storeDirectory,string kitDirectory){
+   var start=new ProcessStartInfo("node"){RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,UseShellExecute=false,CreateNoWindow=true};
+   start.ArgumentList.Add("--import");start.ArgumentList.Add(new Uri(Path.GetFullPath("backend/tests/jwt/env-guard.js")).AbsoluteUri);start.ArgumentList.Add(Path.GetFullPath("backend/tests/b87/kit-e2e-server.js"));start.ArgumentList.Add(storeDirectory);start.ArgumentList.Add(kitDirectory);
+   process=Process.Start(start)!;
+   string? line=process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult();
+   if(line is null)throw new Exception("Express kit server bootstrap failed");using var json=JsonDocument.Parse(line);Port=json.RootElement.GetProperty("port").GetInt32();
+  }
+  public async Task<long> Total(){await process.StandardInput.WriteLineAsync("summary");using var json=JsonDocument.Parse((await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)))!);return json.RootElement.TryGetProperty("all|events",out var value)?value.GetInt64():0;}
+  public async ValueTask DisposeAsync(){if(!process.HasExited){await process.StandardInput.WriteLineAsync("close");await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(8));}Check(process.ExitCode==0,"Express kit server closed normally");process.Dispose();}
+ }
+ static async Task<StatisticsKit?> WaitForKit(string dir,string id){for(int i=0;i<100;i++){var kit=StatisticsKitFiles.TryRead(dir,Now,id);if(kit is not null)return kit;await Task.Delay(100);}return null;}
+
+ static async Task EndToEnd()
+ {
+  await using var f=new Fixture();await f.Start();
+  string installation;using(var c=f.Db.Open()){using var q=c.CreateCommand();q.CommandText="SELECT installation_id FROM statistics_installation;";installation=(string)q.ExecuteScalar()!;}
+  var outbox=f.Adapter.StatisticalOutbox;Check(outbox is not null&&outbox.GetInstallationId()==installation,"accessor GetInstallationId returns the stored installation id");
+  string store=TempDir("twosides-b79-"),kit=TempDir("twosides-b87-hand-over-");
+  try{
+   await using(var server=new Server(store,kit))
+   {
+    // No kit yet: the transport pauses by itself and sends nothing.
+    await using(var early=new StatisticsTransport(f.Adapter,new KitStatisticsCredentials(kit,installation),new Uri("http://127.0.0.1:"+server.Port+"/"),syntheticLoopback:true))
+    {
+     string tick=await early.TickAsync();Check(tick=="STATISTICS_AUTH_REQUIRED"&&await server.Total()==0,"before the hand-over: no credential, nothing sent");
+    }
+    Check(!File.Exists(Path.Combine(kit,"kit.json")),"the server issues no token before the game announces itself");
+    StatisticsKitFiles.WriteInstallation(kit,installation);
+    var published=await WaitForKit(kit,installation);Check(published is not null&&published.Audience=="http://127.0.0.1:"+server.Port,"the real server publishes a loopback kit for exactly this installation");
+    Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state<>'confirmed';")==5,"five pending statistical events before delivery");
+    await using var transport=new StatisticsTransport(f.Adapter,new KitStatisticsCredentials(kit,installation),new Uri(published!.Audience+"/"),syntheticLoopback:true);
+    string result=await transport.TickAsync();
+    Check(result=="STATISTICS_RECEIPTS_APPLIED","real hand-over: receipts applied ("+result+")");
+    Check(f.N("SELECT count(*) FROM statistics_outbox WHERE state='confirmed';")==5&&await server.Total()==5,"all five events confirmed locally and counted once by Express");
+    Check((await f.Adapter.LoadGameAsync(f.Owner,f.Game)).Data!.Biomes.Single(b=>b.BiomeId=="ocean").Status=="completed","game progress untouched by delivery");
+    // The kit is removed when the server closes.
+   }
+   Check(!File.Exists(Path.Combine(kit,"kit.json")),"kit.json is deleted when the server stops");
+  }finally{Remove(kit);foreach(var file in Directory.GetFiles(store,"*",SearchOption.AllDirectories))File.Delete(file);foreach(var sub in Directory.GetDirectories(store,"*",SearchOption.AllDirectories).OrderByDescending(x=>x.Length))Directory.Delete(sub);Directory.Delete(store);}
+ }
+
+ public static async Task<int> Main(){try{Gate();Files();await EndToEnd();Console.WriteLine("B87 STATISTICS KIT CHECKS PASS "+checks);return 0;}catch(Exception e){Console.WriteLine("B87 KIT FAIL "+e.GetType().Name+" "+e.Message);return 1;}}
+}

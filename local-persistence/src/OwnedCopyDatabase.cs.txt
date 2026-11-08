@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+using Microsoft.Win32.SafeHandles;
+
+namespace TwoSides.LocalPersistence;
+
+// Windows-only fixed stores of this test copy; legacy AppData purposes and separate runtime capability.
+internal sealed class OwnedCopyDatabase : ISaveDatabase, IDisposable
+{
+    public const string CopyId = "06dc7ade-b3cd-425b-8d79-90dde8ef1ac6";
+    // Production (per-user player store) is a fourth, separate purpose: its own application id, store id, ownership purpose and directory.
+    internal const string ProductionStoreId = "two-sides-player-save-v1";
+    internal const string ProductionFolder = "PlayerData";
+    private int ApplicationId => _production ? 0x54535044 : _runtime ? 0x54535254 : _game ? 0x54534743 : 0x54535054;
+    private readonly bool _production;
+    internal bool IsProductionStore => _production;
+    private readonly string? _localRootOverride; // Test seam (internal): only an explicitly named disposable root, never reachable from the game.
+    private string StoreId => _production ? ProductionStoreId : CopyId;
+    internal static string ProductionDirectoryUnder(string localRoot) => System.IO.Path.Combine(localRoot, "TwoSides", ProductionFolder);
+    private string LocalRoot => _runtime ? SyntheticSandbox.AuthorizedProjectRoot
+        : _production ? (_localRootOverride ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData))
+        : Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    private readonly bool _game;
+    private readonly bool _runtime;
+    private string Purpose => _production ? "player-production-save" : _runtime ? "copy-runtime-game" : _game ? "copy-game-progress" : "synthetic-infrastructure-only";
+    private string AuthorizedDirectory => _production ? ProductionDirectoryUnder(LocalRoot) : _runtime ? CopyGameDatabase.RuntimeDirectory : System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "TwoSides", "ReconstructionTests", "copy-" + CopyId, _game ? "game-progress" : "persistence");
+    private string AuthorizedPath => System.IO.Path.Combine(AuthorizedDirectory, "save.sqlite3");
+    public string Path { get; }
+    private readonly List<SafeFileHandle> _directories = new();
+    private FileStream? _lease;
+    private SafeFileHandle? _file;
+    private bool _disposed;
+    private sealed record Ownership(int Format, string Copy, string Purpose, string FileIdentity, bool Ready);
+
+    private OwnedCopyDatabase(bool game, bool runtime, bool production = false, string? localRootOverride = null)
+    { _game = game; _runtime = runtime; _production = production; _localRootOverride = localRootOverride; Path = AuthorizedPath; }
+
+    // Per-user production store under %LOCALAPPDATA%\TwoSides\PlayerData. Fail-closed (UNSAFE_PATH) for relative, UNC, non-fixed-drive, OneDrive or
+    // reparse-point locations. It never opens, copies or migrates any historical store: those paths belong to other purposes and are rejected by
+    // the exact-path comparison below.
+    internal static OwnedCopyDatabase OpenProduction(string absolutePath, string? localRootOverride)
+    {
+        SaveValidation.Require(OperatingSystem.IsWindows(), "UNSUPPORTED_PLATFORM");
+        var store = new OwnedCopyDatabase(true, false, true, localRootOverride);
+        string local = store.LocalRoot;
+        SaveValidation.Require(!string.IsNullOrWhiteSpace(local) && !local.StartsWith(@"\\", StringComparison.Ordinal)
+            && System.IO.Path.IsPathFullyQualified(local)
+            && string.Equals(System.IO.Path.GetFullPath(local).TrimEnd('\\'), local.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase), "UNSAFE_PATH");
+        SaveValidation.Require(System.IO.Path.IsPathFullyQualified(absolutePath)
+            && string.Equals(absolutePath, store.AuthorizedPath, StringComparison.OrdinalIgnoreCase), "UNSAFE_PATH");
+        try { store.Initialize(); return store; }
+        catch (SaveException) { store.Dispose(); throw; }
+        catch (SqliteException error) { store.Dispose(); throw StorageErrors.Map(error); }
+        catch (UnauthorizedAccessException) { store.Dispose(); throw new SaveException("ACCESS_DENIED"); }
+        catch (IOException) { store.Dispose(); throw new SaveException("IO_ERROR"); }
+        catch { store.Dispose(); throw; }
+    }
+
+    internal static OwnedCopyDatabase OpenOrCreate(string absolutePath, bool game, bool runtime = false)
+    {
+        SaveValidation.Require(OperatingSystem.IsWindows(), "UNSUPPORTED_PLATFORM");
+        var store = new OwnedCopyDatabase(game, runtime);
+        SaveValidation.Require(System.IO.Path.IsPathFullyQualified(absolutePath)
+            && string.Equals(absolutePath, store.AuthorizedPath, StringComparison.OrdinalIgnoreCase), "UNSAFE_PATH");
+        try { store.Initialize(); return store; }
+        catch (SaveException) { store.Dispose(); throw; }
+        catch (SqliteException error) { store.Dispose(); throw StorageErrors.Map(error); }
+        catch (UnauthorizedAccessException) { store.Dispose(); throw new SaveException("ACCESS_DENIED"); }
+        catch (IOException) { store.Dispose(); throw new SaveException("IO_ERROR"); }
+        catch { store.Dispose(); throw; }
+    }
+
+    // Locks every ancestor against rename/deletion while a validated capability is alive.
+    // OPEN_REPARSE_POINT plus final-path equality prevents following a substituted junction.
+    private void LockDirectories()
+    {
+        string local = LocalRoot;
+        SaveValidation.Require(System.IO.Path.IsPathFullyQualified(local)
+            && new DriveInfo(System.IO.Path.GetPathRoot(local)!).DriveType == DriveType.Fixed,
+            "UNSAFE_PATH");
+        SaveValidation.Require(_runtime || !local.Split(System.IO.Path.DirectorySeparatorChar)
+            .Any(part => part.StartsWith("OneDrive", StringComparison.OrdinalIgnoreCase)), "UNSAFE_PATH");
+        // Runtime capability anchors at the exact approved project root. OneDrive ancestors can carry cloud reparse metadata; the root and every descendant still require normal handles and final-path equality.
+        string current = _runtime ? SyntheticSandbox.AuthorizedProjectRoot : System.IO.Path.GetPathRoot(AuthorizedDirectory)!;
+        _directories.Add(WindowsGuard.Lock(current, true));
+        foreach (string part in AuthorizedDirectory.Substring(current.Length).TrimStart(System.IO.Path.DirectorySeparatorChar).Split(System.IO.Path.DirectorySeparatorChar))
+        {
+            current = System.IO.Path.Combine(current, part);
+            if (!WindowsGuard.Exists(current))
+            {
+                // Only the fixed suffix under the approved anchor may be created.
+                SaveValidation.Require(current.StartsWith(local + System.IO.Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase), "UNSAFE_PATH");
+                Directory.CreateDirectory(current);
+            }
+            _directories.Add(WindowsGuard.Lock(current, true));
+        }
+    }
+
+    private void Initialize()
+    {
+        LockDirectories();
+        string manifest = System.IO.Path.Combine(AuthorizedDirectory, "ownership.json");
+        string lease = System.IO.Path.Combine(AuthorizedDirectory, "store.lease");
+        bool hasManifest = WindowsGuard.Exists(manifest);
+        if (!hasManifest)
+            SaveValidation.Require(Directory.GetFileSystemEntries(AuthorizedDirectory).Length == 0, "UNKNOWN_DATABASE");
+        else
+            foreach (string entry in Directory.GetFileSystemEntries(AuthorizedDirectory))
+                SaveValidation.Require(entry == manifest || entry == lease || entry == Path ||
+                    entry == Path + "-journal" || entry == Path + "-wal" || entry == Path + "-shm", "UNKNOWN_DATABASE");
+        // Lock pre-existing files before FileStream can follow anything.
+        using var manifestGuard = hasManifest ? WindowsGuard.Lock(manifest, false) : null;
+        using var leaseGuard = WindowsGuard.Exists(lease) ? WindowsGuard.Lock(lease, false) : null;
+        _lease = new FileStream(lease, hasManifest ? FileMode.Open : FileMode.CreateNew,
+            FileAccess.ReadWrite, FileShare.ReadWrite); // byte-range lock serializes processes
+        if (OperatingSystem.IsWindows()) _lease.Lock(0, 1);
+        else throw new SaveException("UNSUPPORTED_PLATFORM");
+        if (!hasManifest)
+        {
+            using (var created = new FileStream(Path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite))
+                created.Flush(true);
+            _file = WindowsGuard.Lock(Path, false);
+            WriteOwnership(manifest, new Ownership(1, StoreId, Purpose, WindowsGuard.Identity(_file), false), true);
+            using (var c = OpenConnection())
+            {
+                using var command = c.CreateCommand(); command.CommandText = "PRAGMA application_id=" + ApplicationId + ";";
+                command.ExecuteNonQuery();
+            }
+            SchemaManager.Initialize(this);
+            SchemaManager.Verify(this);
+            // No automatic recovery after interrupted creation: Ready=false fails closed.
+            WriteOwnership(manifest, new Ownership(1, StoreId, Purpose, WindowsGuard.Identity(_file), true), false);
+        }
+        else
+        {
+            SaveValidation.Require(WindowsGuard.Exists(Path), "UNKNOWN_DATABASE");
+            _file = WindowsGuard.Lock(Path, false);
+            SaveValidation.Require(new FileInfo(manifest).Length <= 1024, "UNKNOWN_DATABASE");
+            Ownership? owner;
+            try { owner = JsonSerializer.Deserialize<Ownership>(File.ReadAllText(manifest)); }
+            catch (JsonException) { throw new SaveException("UNKNOWN_DATABASE"); }
+            SaveValidation.Require(owner is not null && owner.Format == 1 && owner.Copy == StoreId
+                && owner.Purpose == Purpose && owner.Ready
+                && owner.FileIdentity == WindowsGuard.Identity(_file), "UNKNOWN_DATABASE");
+            using (var c = OpenConnection())
+            {
+                using var command = c.CreateCommand(); command.CommandText = "PRAGMA application_id;";
+                SaveValidation.Require(Convert.ToInt32(command.ExecuteScalar()) == ApplicationId, "UNKNOWN_DATABASE");
+            }
+            SchemaManager.Initialize(this);
+            SchemaManager.Verify(this);
+        }
+    }
+
+    private static void WriteOwnership(string path, Ownership value, bool create)
+    {
+        using var guard = create ? null : WindowsGuard.Lock(path, false);
+        using var stream = new FileStream(path, create ? FileMode.CreateNew : FileMode.Open,
+            FileAccess.Write, FileShare.ReadWrite);
+        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(value);
+        stream.Write(bytes); stream.SetLength(bytes.Length); stream.Flush(true);
+    }
+
+    private SqliteConnection OpenConnection()
+    {
+        SaveValidation.Require(!_disposed && _file is not null, "STORAGE_CLOSED");
+        using var check = WindowsGuard.Lock(Path, false);
+        SaveValidation.Require(WindowsGuard.Identity(check) == WindowsGuard.Identity(_file!), "UNKNOWN_DATABASE");
+        foreach (string suffix in new[] { "-journal", "-wal", "-shm" })
+        {
+            string sidecar = Path + suffix;
+            if (WindowsGuard.Exists(sidecar)) { using var guard = WindowsGuard.Lock(sidecar, false); }
+        }
+        var c = new SqliteConnection(new SqliteConnectionStringBuilder {
+            DataSource = Path, Mode = SqliteOpenMode.ReadWrite, Pooling = false,
+            ForeignKeys = true, Cache = SqliteCacheMode.Private, DefaultTimeout = 1 }.ToString());
+        try
+        {
+            c.Open(); using var command = c.CreateCommand();
+            command.CommandText = "PRAGMA foreign_keys;";
+            SaveValidation.Require(Convert.ToInt32(command.ExecuteScalar()) == 1, "FOREIGN_KEYS_DISABLED");
+            command.CommandText = "PRAGMA synchronous=FULL; PRAGMA busy_timeout=1000;";
+            command.ExecuteNonQuery(); return c;
+        }
+        catch { c.Dispose(); throw; }
+    }
+
+    public SqliteConnection Open()
+    {
+        try { return OpenConnection(); }
+        catch (SqliteException e) { throw StorageErrors.Map(e); }
+        catch (UnauthorizedAccessException) { throw new SaveException("ACCESS_DENIED"); }
+        catch (IOException) { throw new SaveException("IO_ERROR"); }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _file?.Dispose(); _lease?.Dispose();
+        for (int i = _directories.Count - 1; i >= 0; i--) _directories[i].Dispose();
+        _directories.Clear(); // Deliberately never delete a durable file, directory or manifest.
+    }
+}
+
+internal static class WindowsGuard
+{
+    internal static bool Exists(string path)
+    {
+        // Unlike File.Exists/Directory.Exists this also rejects dangling reparse entries.
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            SaveValidation.Require((attributes & FileAttributes.ReparsePoint) == 0, "UNSAFE_PATH");
+            return true;
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Information
+    {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Information information);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint count, uint flags);
+
+    internal static SafeFileHandle Lock(string path, bool directory)
+    {
+        // FILE_READ_ATTRIBUTES, share READ|WRITE but no DELETE; open reparse itself.
+        var handle = CreateFileW(path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error(); handle.Dispose();
+            throw new SaveException(error == 5 ? "ACCESS_DENIED" : error == 32 ? "STORAGE_BUSY" : "IO_ERROR");
+        }
+        try
+        {
+            SaveValidation.Require(GetFileInformationByHandle(handle, out var info), "IO_ERROR");
+            SaveValidation.Require((info.Attributes & 0x400) == 0 && ((info.Attributes & 0x10) != 0) == directory,
+                "UNSAFE_PATH");
+            SaveValidation.Require(directory || info.Links == 1, "UNSAFE_PATH");
+            var final = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandleW(handle, final, (uint)final.Capacity, 0);
+            SaveValidation.Require(length > 0 && length < final.Capacity, "UNSAFE_PATH");
+            string resolved = final.ToString();
+            if (resolved.StartsWith(@"\\?\", StringComparison.Ordinal)) resolved = resolved.Substring(4);
+            SaveValidation.Require(string.Equals(resolved.TrimEnd('\\'), System.IO.Path.GetFullPath(path).TrimEnd('\\'),
+                StringComparison.OrdinalIgnoreCase), "UNSAFE_PATH");
+            return handle;
+        }
+        catch { handle.Dispose(); throw; }
+    }
+    internal static string Identity(SafeFileHandle handle)
+    {
+        SaveValidation.Require(GetFileInformationByHandle(handle, out var info), "IO_ERROR");
+        return $"{info.Volume:x8}:{info.IndexHigh:x8}{info.IndexLow:x8}";
+    }
+}

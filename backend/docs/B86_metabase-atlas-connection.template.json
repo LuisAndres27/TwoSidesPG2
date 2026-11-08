@@ -1,0 +1,31 @@
+{
+  "_comment": "PLANTILLA. No es una configuracion activa y no contiene secretos. NO se ha creado ninguna conexion en Metabase. La conexion B85 local (database id 2) no se toca: esta seria una SEGUNDA conexion, creada manualmente por el propietario solo despues de autorizar la fase Atlas y de ejecutar 'publish' (copia de agregados).",
+  "name": "Two Sides Atlas analitico (solo lectura, demostracion sintetica)",
+  "engine": "mongo",
+  "details": {
+    "use-conn-uri": true,
+    "conn-uri": "mongodb+srv://<USUARIO_LECTOR>@<HOST_ATLAS>/twosides_statistics_analytics_demo?authSource=admin&tls=true&authMechanism=SCRAM-SHA-1",
+    "pass": "<LA CONTRASENA SE ESCRIBE UNICAMENTE EN EL CAMPO OCULTO DE METABASE>",
+    "ssl": true,
+    "_note": "<USUARIO_LECTOR> = twosides_statistics_reader_v1. La URI no lleva contrasena. Si el campo de Metabase exige usuario separado, usar el mismo usuario y dejar la contrasena solo en su campo."
+  },
+  "isolationModel": "B85: Metabase lee una base ANALITICA SEPARADA que solo contiene una copia publicada de los contadores agregados. Nunca ve la base de ingesta twosides_statistics_demo (recibos, marcas semanticas, actividad, cuotas, meta).",
+  "metabaseSettings": {
+    "is_full_sync": false,
+    "schedule": "manual",
+    "auto_run_queries": false,
+    "let_user_control_scheduling": false
+  },
+  "requiredRole": {
+    "role": "two_sides_statistics_reader_v1",
+    "actions": ["FIND sobre twosides_statistics_analytics_demo.stats_v1_counters", "LIST_COLLECTIONS sobre twosides_statistics_analytics_demo", "DB_STATS sobre twosides_statistics_analytics_demo"],
+    "verifiedLocally": "Probado en un servidor mongod con autenticacion y TLS (tests/b86): el lector solo ve y lee stats_v1_counters de la base analitica; no puede leer ni listar la base de ingesta; no puede escribir. La disponibilidad y el nombre exacto de cada accion en el proyecto Atlas del propietario NO se han verificado."
+  },
+  "publisher": {
+    "identity": "twosides_statistics_publisher_v1",
+    "does": "Copia _id y values de stats_v1_counters (ingesta) a stats_v1_counters (analitica) en UNA transaccion (borrar + insertar). Accion: Run-Atlas-Session.ps1 -Identity publisher -Action publish",
+    "note": "La copia es una instantanea: hay que volver a publicar para actualizar el dashboard."
+  },
+  "questionsToReuse": "tools/b85/questions.mjs (15 consultas nativas sobre stats_v1_counters). Se re-apuntan a la nueva base de datos de Metabase; no se modifican las definiciones ni el dashboard 2 de B85.",
+  "labeling": "El dashboard resultante debe titularse DEMOSTRACION SINTETICA mientras use datos de twosides_statistics_demo. No presentarlo como estadisticas reales de jugadores."
+}

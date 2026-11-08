@@ -1,0 +1,674 @@
+# sync-test-staged.ps1.template — STAGED controller of the real F1+F2 sync test (B39/B40). NOT run by the repository. Windows PowerShell 5.1.
+# Copy it OUTSIDE the project (e.g. %LOCALAPPDATA%\TwoSidesSyntheticRun\sync-test-staged.ps1). It performs EXACTLY ONE stage per invocation and never advances by itself:
+#   .\sync-test-staged.ps1 -Stage A -RunDir <run folder made by build.mjs> -ConfirmPhrase AUTORIZO-ETAPA-A-<first 8 chars of runId> -ExpectedTreeDigest <v4> -ExpectedKeyFingerprint <fp>
+# Stages:  A local integrity/environment (no network)      B Atlas read-only baseline (owner types the password in the launcher's hidden prompt)
+#          C register + session + ONE batch of ONE operation   D read-only verification, then identical re-send   E receipts/query, final read-only deltas
+#          F OUT OF SCOPE of this campaign (refuses)           G safe shutdown/cleanup report; runnable at any time, even after an interruption.
+# Protections: stage phrase tied to the runId · fixed order (A<B<C<D<E) · an unfinished/failed stage needs -Resume and the SAME bytes · HTTP only to the allow-list below (no DELETE/PUT/PATCH,
+# no other path) · base URL pinned to https://localhost:8443 · only main_v2_* collections are expected and the historical ones must not change · no automatic cleanup of any data · nothing secret is
+# printed or written in clear: the synthetic account credential (and the JWT) live only in a DPAPI(CurrentUser) blob inside RunDir, wiped by stage G. The Atlas password is never handled here:
+# it is typed by the owner into the hidden prompt of the EXISTING launchers (run-main-inspection.ps1 / run-verify-synthetic.ps1), which this script only invokes.
+# Exit codes: 0 ok · 2 invalid parameters · 9 stage F refused · 10 not authorized · 11 prerequisite missing · 12 -Resume required · 13 locked · 20 outcome UNKNOWN (do not create anything new)
+#             21 failed · 30 inconsistent receipt/verification · 31 discrepancy against the baseline · 40 stage G found something still active.
+param(
+    [Parameter(Mandatory = $true)][string]$Stage,
+    [string]$RunDir,
+    [string]$ConfirmPhrase,
+    [switch]$Resume,
+    [string]$BackendDir = 'C:\Users\luis2\OneDrive\Desktop\PRUEBA\TWO SIDES PRUEBA\Two-Sides PRUEBA\backend',
+    [string]$BaseUrl = 'https://localhost:8443',
+    [string]$ExpectedTreeDigest, [string]$ExpectedKeyFingerprint,
+    [string]$ManifestPath = (Join-Path $env:LOCALAPPDATA 'TwoSidesMainIntegrity\backend-integrity-manifest.json'),
+    [string]$SigningKeyFile = (Join-Path $env:LOCALAPPDATA 'TwoSidesMainSecrets\keys\main-jwt.pem'),
+    [string]$KeyId = 'main-2026-11',
+    [string]$ExpectedBaselineFile,
+    [string]$AuthorizationDir = (Join-Path $env:LOCALAPPDATA 'TwoSidesInspection'),
+    [string[]]$ProcessNames = @('node', 'caddy', 'Godot*'),
+    [int[]]$CheckPorts = @(3000, 8443),
+    [string[]]$BackupDirs = @((Join-Path $env:LOCALAPPDATA 'TwoSidesBackendBackups\pre-F1-20261102'), (Join-Path $env:LOCALAPPDATA 'TwoSidesBackendBackups\pre-F2-20261102')),
+    [string]$CaThumbprint = 'F2BF0E8DC06AC9C4F12F27ECD6841438A5D412A7',
+    [int]$CaddyPid, [switch]$StopCaddy, [int]$ExpressPid, [switch]$ForceStopExpress,
+    [switch]$IncludeNotFoundProbe,
+    [int]$RequestTimeoutSec = 20,
+    [int]$BaselineMaxAgeMinutes = 60,
+    # ---- test-only (rejected unless -TestMode; TestMode forbids the real URL and real launchers) ----
+    [switch]$TestMode, [string]$InspectionLauncher, [string]$VerifyLauncher, [string]$VerifierScript, [string]$TestFaultAfterStep, [string]$TestForbiddenProbe
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Add-Type -AssemblyName System.Security
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+
+# ------------------------------------------------------------------------------------------------ constants
+$RealBase = 'https://localhost:8443'
+$RealBackend = 'C:\Users\luis2\OneDrive\Desktop\PRUEBA\TWO SIDES PRUEBA\Two-Sides PRUEBA\backend'
+$NodeExe = 'C:\Program Files\nodejs\node.exe'
+$UuidV4 = '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+$PriorTestIds = @('5e05a972-98ef-447a-9579-ba4d0e20a4b8', '44ccac91-ed97-4694-bddf-5a7b70ca1504', '64ad5b53-9df4-4040-b2d0-056eebde3467', '9905e32c-8029-444e-ab69-b198629f41bd', 'c85edd99-fe3f-43cf-9966-ca3443e83c91')
+$MainCollections = @('operations', 'facts', 'fences', 'identities', 'ownerGuards', 'identitySessions', 'revocations')
+$DefaultBaseline = @{ main_v2 = @{ operations = 1; facts = 1; fences = 2; identities = 1; ownerGuards = 1; identitySessions = 1; revocations = 0 }
+    historical = @{ users = 2; decisions = 7; gameevents = 13; gameprogresses = 2; statisticevents = 14; statisticsummaries = 2; syncidentities = 1 } }
+# The ONLY HTTP calls this script can make.
+$Allowed = @('GET /api/health', 'POST /api/v2/technical/registrations', 'POST /api/v2/technical/sessions', 'POST /api/v2/sync/batches', 'POST /api/v2/sync/receipts/query')
+$Secrets = New-Object System.Collections.ArrayList
+$State = $null; $StatePath = $null; $LockPath = $null; $SecretsPath = $null; $Run = $null
+
+# ------------------------------------------------------------------------------------------------ output (redacting)
+function Redact([string]$text) {
+    foreach ($s in $Secrets) { if ($s -and $s.Length -ge 8) { $text = $text.Replace($s, '***') } }
+    return ([regex]::Replace($text, 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*', '***'))
+}
+function Say([string]$text) { [Console]::Out.WriteLine((Redact $text)) }
+function Finish([int]$code, [string]$status, [hashtable]$extra = @{}) {
+    $summary = [ordered]@{ stagedSync = $Stage; status = $status; exitCode = $code }
+    foreach ($k in $extra.Keys) { $summary[$k] = $extra[$k] }
+    Say (ConvertTo-Json $summary -Compress -Depth 8)
+    if ($script:LockPath -and (Test-Path -LiteralPath $script:LockPath)) { Remove-Item -LiteralPath $script:LockPath -Force -ErrorAction SilentlyContinue }
+    exit $code
+}
+function Stop-Param([string]$why) { Say ('REFUSED: ' + $why); Finish 2 'invalid-parameters' @{ reason = $why } }
+
+# ------------------------------------------------------------------------------------------------ parameter validation
+if ($Stage -cnotmatch '^[A-G]$') { Stop-Param 'Stage must be one of A B C D E F G.' }
+if ($TestMode) {
+    if (-not ($BaseUrl -match '^http://127\.0\.0\.1:\d{1,5}$')) { Stop-Param 'TestMode requires a loopback http://127.0.0.1:<port> base URL.' }
+    if ($BaseUrl -eq $RealBase) { Stop-Param 'TestMode can never use the real URL.' }
+    if (-not $InspectionLauncher -or -not $VerifyLauncher -or -not $VerifierScript) { Stop-Param 'TestMode requires fake launchers.' }
+    foreach ($l in @($InspectionLauncher, $VerifyLauncher)) { if ($l -match 'run-main-inspection(-captured)?\.ps1$|run-verify-synthetic\.ps1$') { Stop-Param 'TestMode refuses the real launchers.' } }
+} else {
+    if ($BaseUrl -ne $RealBase) { Stop-Param 'The base URL is pinned to https://localhost:8443.' }
+    if ([IO.Path]::GetFullPath($BackendDir) -ne [IO.Path]::GetFullPath($RealBackend)) { Stop-Param 'BackendDir is pinned.' }
+    if ($InspectionLauncher -or $VerifyLauncher -or $VerifierScript -or $TestFaultAfterStep -or $TestForbiddenProbe) { Stop-Param 'Test-only parameters are not allowed without -TestMode.' }
+    if (($ProcessNames -join ',') -ne 'node,caddy,Godot*' -or ($CheckPorts -join ',') -ne '3000,8443') { Stop-Param 'Service checks are pinned (node, caddy, Godot*; ports 3000, 8443).' }
+}
+if ($Stage -eq 'F') { Say 'Stage F (controlled loss of the response) is OUT OF SCOPE of this campaign: it needs a separate written authorization and build-second-op.mjs. Nothing was done.'; Finish 9 'out-of-scope' }
+if ($TestForbiddenProbe) {                                         # test hook: proves the allow-list refuses before any request is made
+    $probe = $TestForbiddenProbe
+    if ($Allowed -contains $probe.Replace(':', ' ')) { Stop-Param 'probe is allowed' }
+    Stop-Param ('HTTP call not in the allow-list: ' + $probe)
+}
+if (-not $RunDir -and $Stage -ne 'G') { Stop-Param 'RunDir is required.' }
+if ($RunDir) {
+    if ($RunDir -notmatch '^[A-Za-z]:\\[^"]+$') { Stop-Param 'RunDir must be an absolute path.' }
+    $RunDir = [IO.Path]::GetFullPath($RunDir)
+    if ($RunDir.StartsWith((Split-Path -Parent $RealBackend) + '\', [StringComparison]::OrdinalIgnoreCase) -or $RunDir -match '\\OneDrive[^\\]*\\') { Stop-Param 'RunDir must be outside the project and OneDrive.' }
+}
+
+# ------------------------------------------------------------------------------------------------ small helpers
+function Sha256Hex([byte[]]$bytes) { $h = [Security.Cryptography.SHA256]::Create().ComputeHash($bytes); return (($h | ForEach-Object { $_.ToString('x2') }) -join '') }
+function ReadBytes([string]$name) { return [IO.File]::ReadAllBytes((Join-Path $RunDir $name)) }
+function ReadJson([string]$name) { return (Get-Content -Raw -LiteralPath (Join-Path $RunDir $name) | ConvertFrom-Json) }
+function ToHash($o) {
+    if ($null -eq $o) { return $null }
+    if ($o -is [System.Management.Automation.PSCustomObject]) { $h = @{}; foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = ToHash $p.Value }; return $h }
+    if ($o -is [System.Array]) { return @($o | ForEach-Object { ToHash $_ }) }
+    return $o
+}
+function NowIso { return (Get-Date).ToUniversalTime().ToString('o') }
+function Run-Node([string[]]$arguments) {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $NodeExe; $info.WorkingDirectory = $BackendDir; $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.CreateNoWindow = $true
+    $info.Arguments = (($arguments | ForEach-Object { '"' + $_ + '"' }) -join ' ')
+    $p = [Diagnostics.Process]::Start($info); $out = $p.StandardOutput.ReadToEnd(); $err = $p.StandardError.ReadToEnd(); $p.WaitForExit()
+    return @{ Code = $p.ExitCode; Out = $out; Err = $err }
+}
+function Last-Json($lines) {
+    $all = @($lines | Where-Object { $_ } | ForEach-Object { $_.ToString().Trim() })
+    for ($i = $all.Count - 1; $i -ge 0; $i--) { if ($all[$i].StartsWith('{')) { try { return (ConvertFrom-Json $all[$i]) } catch { } } }
+    return $null
+}
+
+# ------------------------------------------------------------------------------------------------ run folder, state, lock, DPAPI
+$State = $null; $StatePath = $null; $LockPath = $null; $SecretsPath = $null; $Run = $null
+function Save-State {
+    $tmp = $StatePath + '.tmp-' + [guid]::NewGuid().ToString('N')
+    try {
+        [IO.File]::WriteAllText($tmp, (ConvertTo-Json $State -Depth 12), (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $StatePath -Force
+    } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }   # an interrupted write never leaves its temporary behind
+}
+function Assert-PrivateDir([string]$dir) {
+    $acl = Get-Acl -LiteralPath $dir
+    foreach ($rule in $acl.Access) {
+        $who = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -eq 'Allow' -and ($who -match '^(Everyone|BUILTIN\\Users|NT AUTHORITY\\Authenticated Users|Todos|BUILTIN\\Usuarios)$')) { throw ('RunDir is readable by ' + $who) }
+    }
+}
+# ---- ACL of the protected file itself (B41): protected from inheritance, one explicit rule for the current user. The check accepts only the current user, SYSTEM and Administrators.
+function Set-SecretsAcl([string]$path) {
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $info = New-Object IO.FileInfo $path
+    $acl = $info.GetAccessControl()
+    $acl.SetAccessRuleProtection($true, $false)                       # no inheritance, inherited rules are dropped
+    foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRule($rule) }
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($me, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)))
+    $info.SetAccessControl($acl)
+}
+function Test-SecretsAcl([string]$path) {
+    $problems = New-Object System.Collections.ArrayList
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $allowed = @($me, 'S-1-5-18', 'S-1-5-32-544')
+    try {
+        $acl = (New-Object IO.FileInfo $path).GetAccessControl()
+        if (-not $acl.AreAccessRulesProtected) { [void]$problems.Add('inheritance-enabled') }
+        $meCan = $false
+        foreach ($rule in $acl.Access) {
+            $sid = try { $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { 'unresolved' }
+            if ($rule.AccessControlType -eq 'Allow') {
+                if ($allowed -notcontains $sid) { [void]$problems.Add('foreign-allow') }
+                if ($sid -eq $me -and ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Read) -ne 0) { $meCan = $true }
+            }
+        }
+        if (-not $meCan) { [void]$problems.Add('current-user-without-access') }
+    } catch { [void]$problems.Add('acl-unreadable') }
+    return @($problems | Select-Object -Unique)
+}
+function Protect-Secrets([hashtable]$blob) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $blob -Compress))
+    $entropy = [Text.Encoding]::UTF8.GetBytes($State.runId)
+    $protected = [Security.Cryptography.ProtectedData]::Protect($bytes, $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $tmp = $SecretsPath + '.tmp'
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }                      # abandoned temporary of an interrupted write
+    try {
+        [IO.File]::WriteAllBytes($tmp, [byte[]]@()); Set-SecretsAcl $tmp                           # the ACL is applied while the file is still EMPTY
+        [IO.File]::WriteAllBytes($tmp, $protected)
+        Fault-After 'secrets-tmp'
+        Move-Item -LiteralPath $tmp -Destination $SecretsPath -Force
+    } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+    $bad = @(Test-SecretsAcl $SecretsPath)
+    if ($bad.Count) { Remove-Item -LiteralPath $SecretsPath -Force -ErrorAction SilentlyContinue; throw ('secrets-unavailable: the protected file could not be restricted (' + ($bad -join ', ') + ')') }
+    [Array]::Clear($bytes, 0, $bytes.Length)
+    Fault-After 'secrets-written'
+}
+function Unprotect-Secrets {
+    if (-not (Test-Path -LiteralPath $SecretsPath)) { return $null }
+    $bad = @(Test-SecretsAcl $SecretsPath)
+    if ($bad.Count) { throw ('secrets-unavailable: the protected file has an unexpected ACL (' + ($bad -join ', ') + ')') }      # fail closed: it is NOT decrypted
+    try {
+        $entropy = [Text.Encoding]::UTF8.GetBytes($State.runId)
+        $plain = [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($SecretsPath), $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $blob = ToHash (ConvertFrom-Json ([Text.Encoding]::UTF8.GetString($plain))); [Array]::Clear($plain, 0, $plain.Length)
+    } catch { throw 'secrets-unavailable: the protected file could not be decrypted or is not valid for this run' }          # no detail of the underlying error
+    foreach ($k in @('credential', 'token')) { if ($blob.ContainsKey($k) -and $blob[$k]) { [void]$Secrets.Add([string]$blob[$k]) } }
+    return $blob
+}
+function Secrets-Reason($ex, [string]$fallback) { if ($ex -and $ex.Exception.Message -like 'secrets-unavailable*') { return 'secrets-unavailable' } return $fallback }
+# Logical deletion only: the content is overwritten once and the file is removed. This is NOT a guarantee of irrecoverable physical erasure (SSD wear levelling, backups, shadow copies).
+function Wipe-Secrets {
+    if ($SecretsPath -and (Test-Path -LiteralPath $SecretsPath)) {
+        try {
+            $len = (Get-Item -LiteralPath $SecretsPath).Length; $junk = New-Object byte[] ([Math]::Max($len, 64)); [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($junk)
+            [IO.File]::WriteAllBytes($SecretsPath, $junk)
+        } catch { }                                                                                  # even if the overwrite fails, the removal is still attempted
+        try { Remove-Item -LiteralPath $SecretsPath -Force } catch { }
+        return (-not (Test-Path -LiteralPath $SecretsPath))
+    }
+    return $false
+}
+# Temporary files that THIS script creates inside the run folder, matched by exact name: secrets.dpapi.tmp and stage-state.json.tmp-<32 hex>. Nothing else is touched (no recursion, no links).
+function Remove-OwnTemporaries {
+    $removed = 0
+    if (-not $RunDir -or -not (Test-Path -LiteralPath $RunDir -PathType Container)) { return 0 }
+    foreach ($f in @(Get-ChildItem -LiteralPath $RunDir -File -Force -ErrorAction SilentlyContinue)) {
+        if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        if ($f.Name -ceq 'secrets.dpapi.tmp' -or $f.Name -cmatch '^stage-state\.json\.tmp-[0-9a-f]{32}$') {
+            try { Remove-Item -LiteralPath $f.FullName -Force; $removed++ } catch { }
+        }
+    }
+    return $removed
+}
+function Own-TemporariesLeft {
+    if (-not $RunDir -or -not (Test-Path -LiteralPath $RunDir -PathType Container)) { return 0 }
+    return @(Get-ChildItem -LiteralPath $RunDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq 'secrets.dpapi.tmp' -or $_.Name -cmatch '^stage-state\.json\.tmp-[0-9a-f]{32}$' }).Count
+}
+function Get-Lock {
+    if (Test-Path -LiteralPath $LockPath) {
+        $pidText = (Get-Content -Raw -LiteralPath $LockPath).Trim()
+        if ($pidText -match '^\d+$' -and (Get-Process -Id ([int]$pidText) -ErrorAction SilentlyContinue)) { Say 'REFUSED: another stage is running (lock held).'; Finish 13 'locked' }
+        Remove-Item -LiteralPath $LockPath -Force                      # stale lock of a dead process
+    }
+    [IO.File]::WriteAllText($LockPath, [string]$PID)
+}
+function Release-Lock { if ($LockPath -and (Test-Path -LiteralPath $LockPath)) { Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue } }
+
+# ------------------------------------------------------------------------------------------------ HTTP (allow-listed)
+function Call-Api([string]$method, [string]$path, [byte[]]$body, [string]$token) {
+    $key = $method + ' ' + $path
+    if ($Allowed -notcontains $key) { throw ('HTTP call not in the allow-list: ' + $key) }
+    $headers = @{}; if ($token) { $headers['Authorization'] = 'Bearer ' + $token }
+    $arguments = @{ Uri = $BaseUrl + $path; Method = $method; Headers = $headers; TimeoutSec = $RequestTimeoutSec; UseBasicParsing = $true }
+    if ($null -ne $body) { $arguments.Body = $body; $arguments.ContentType = 'application/json; charset=utf-8' }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try { $r = Invoke-WebRequest @arguments; $result = @{ Status = [int]$r.StatusCode; Content = [string]$r.Content } }
+    catch [System.Net.WebException] {
+        if ($_.Exception.Response) { $s = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); $result = @{ Status = [int]$_.Exception.Response.StatusCode; Content = $s.ReadToEnd() } }
+        else { $result = @{ Status = 0; Content = '' } }              # TLS / connection failure / client timeout
+    }
+    $result.Ms = [int]$clock.ElapsedMilliseconds
+    $result.Json = $null; if ($result.Content) { try { $result.Json = ConvertFrom-Json $result.Content } catch { } }
+    return $result
+}
+function Json-Bytes($o) { return , [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $o -Compress -Depth 8)) }   # unary comma: ONE Byte[] (B30)
+function New-Credential { $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); return ([Convert]::ToBase64String($b).TrimEnd('=').Replace('+', '-').Replace('/', '_')) }
+
+# ------------------------------------------------------------------------------------------------ run material checks (offline)
+function Test-RunMaterial {
+    $problems = New-Object System.Collections.ArrayList
+    foreach ($f in @('run-ids.json', 'batch.json', 'receipts-query.json')) { if (-not (Test-Path -LiteralPath (Join-Path $RunDir $f))) { [void]$problems.Add('missing ' + $f) } }
+    if ($problems.Count) { return $problems }
+    $ids = ReadJson 'run-ids.json'; $batch = ReadJson 'batch.json'; $query = ReadJson 'receipts-query.json'
+    foreach ($k in @('runId', 'registrationId', 'installationId', 'localPlayerId', 'sessionId', 'operationId', 'leaseId', 'batchId')) {
+        if (-not ($ids.PSObject.Properties.Name -contains $k) -or [string]$ids.$k -cnotmatch $UuidV4) { [void]$problems.Add('invalid id ' + $k) }
+    }
+    if ($problems.Count) { return $problems }
+    if (@($batch.operations).Count -ne 1) { [void]$problems.Add('batch must contain exactly one operation') } else {
+        $op = $batch.operations[0]
+        if ($op.operationId -ne $ids.operationId) { [void]$problems.Add('operationId mismatch') }
+        if ($op.attempt -ne 1) { [void]$problems.Add('attempt must be 1') }
+        if ((Sha256Hex ([Text.Encoding]::UTF8.GetBytes([string]$op.canonicalEnvelope))) -ne $op.payloadHash) { [void]$problems.Add('payloadHash is not the SHA-256 of the canonical envelope') }
+        $env = ConvertFrom-Json ([string]$op.canonicalEnvelope)
+        if ($env.type -ne 'session.report' -or $env.installationId -ne $ids.installationId -or $env.localPlayerId -ne $ids.localPlayerId -or $env.bindingGeneration -ne 1) { [void]$problems.Add('envelope does not match run-ids') }
+        if (@($op.dependencies).Count -ne 0) { [void]$problems.Add('dependencies must be empty') }
+        if (@($query.attempts).Count -ne 1 -or $query.attempts[0].operationId -ne $op.operationId -or $query.attempts[0].payloadHash -ne $op.payloadHash) { [void]$problems.Add('receipts-query does not match the operation') }
+    }
+    $mine = @($ids.runId, $ids.registrationId, $ids.installationId, $ids.localPlayerId, $ids.sessionId, $ids.operationId, $ids.leaseId, $ids.batchId)
+    if (($mine | Sort-Object -Unique).Count -ne $mine.Count) { [void]$problems.Add('ids are not all different') }
+    foreach ($x in $mine) { if ($PriorTestIds -contains $x) { [void]$problems.Add('an id belongs to the previous real test') } }
+    $parent = Split-Path -Parent $RunDir
+    foreach ($other in @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $RunDir })) {
+        $file = Join-Path $other.FullName 'run-ids.json'
+        if (Test-Path -LiteralPath $file) { try { $o = Get-Content -Raw -LiteralPath $file | ConvertFrom-Json
+            foreach ($p in $o.PSObject.Properties) { if ($p.Value -is [string] -and $p.Value -cmatch $UuidV4 -and $mine -contains $p.Value) { [void]$problems.Add('an id is reused from ' + $other.Name) } } } catch { } }
+    }
+    return $problems
+}
+
+# ------------------------------------------------------------------------------------------------ state load / stage gate
+function Load-Or-Init-State {
+    $ids = ReadJson 'run-ids.json'
+    $script:StatePath = Join-Path $RunDir 'stage-state.json'; $script:LockPath = Join-Path $RunDir 'stage.lock'; $script:SecretsPath = Join-Path $RunDir 'secrets.dpapi'
+    if (Test-Path -LiteralPath $StatePath) {
+        try { $script:State = ToHash (Get-Content -Raw -LiteralPath $StatePath | ConvertFrom-Json) } catch { Say 'REFUSED: stage-state.json is unreadable.'; Finish 21 'failed' @{ reason = 'state-unreadable' } }
+        if ($State.runId -ne $ids.runId -or $State.mode -ne $(if ($TestMode) { 'test' } else { 'real' })) { Say 'REFUSED: the state belongs to another run or mode.'; Finish 11 'prerequisite' @{ reason = 'state-mismatch' } }
+    } else {
+        $script:State = @{ schemaVersion = 1; runId = [string]$ids.runId; mode = $(if ($TestMode) { 'test' } else { 'real' }); createdAt = NowIso; stages = @{}; steps = @{}; logins = 0; account = $null
+            batchSha256 = (Sha256Hex (ReadBytes 'batch.json')); querySha256 = (Sha256Hex (ReadBytes 'receipts-query.json')); baseline = $null; reference = $null; log = @() }
+    }
+    if ($State.batchSha256 -ne (Sha256Hex (ReadBytes 'batch.json')) -or $State.querySha256 -ne (Sha256Hex (ReadBytes 'receipts-query.json'))) {
+        Say 'REFUSED: batch.json or receipts-query.json changed since the run started. The original bytes must be preserved.'; Finish 30 'inconsistent' @{ reason = 'bytes-changed' } }
+}
+function Stage-Status([string]$s) { if ($State.stages.ContainsKey($s)) { return [string]$State.stages[$s].status } else { return $null } }
+function Set-Stage([string]$s, [string]$status, [string]$note = '') {
+    $prev = if ($State.stages.ContainsKey($s)) { $State.stages[$s] } else { @{ startedAt = (NowIso) } }
+    $prev.status = $status; $prev.updatedAt = NowIso; if ($note) { $prev.note = $note }
+    $State.stages[$s] = $prev; Save-State
+}
+function Gate([string]$s) {
+    $phrase = 'AUTORIZO-ETAPA-' + $s + '-' + $State.runId.Substring(0, 8)
+    if ($ConfirmPhrase -cne $phrase) { Say ('NOT AUTHORIZED: stage ' + $s + ' needs the explicit phrase ' + $phrase + ' (given after the owner authorizes this stage in the chat).'); Finish 10 'not-authorized' @{ required = $phrase } }
+    $prereq = @{ B = @('A'); C = @('B'); D = @('C'); E = @('D') }[$s]
+    if ($prereq) {
+        $ok = if ($s -eq 'D') { @('ok', 'unknown') -contains (Stage-Status 'C') } else { (Stage-Status $prereq[0]) -eq 'ok' }
+        if (-not $ok) { Say ('PREREQUISITE: stage ' + $prereq[0] + ' has not completed successfully (status: ' + (Stage-Status $prereq[0]) + ').'); Finish 11 'prerequisite' @{ needs = $prereq[0] } }
+    }
+    $own = Stage-Status $s
+    if ($own -eq 'ok') { Say ('REFUSED: stage ' + $s + ' already completed; it is never run twice.'); Finish 11 'prerequisite' @{ reason = 'already-ok' } }
+    if ($own -and -not $Resume) { Say ('RESUME REQUIRED: stage ' + $s + ' is ' + $own + '. Re-run with -Resume to continue with the SAME identifiers and bytes.'); Finish 12 'resume-required' @{ stageStatus = $own } }
+}
+function Fault-After([string]$step) { if ($TestMode -and $TestFaultAfterStep -eq $step) { Say ('TEST FAULT after ' + $step); [Environment]::Exit(99) } }
+
+# ------------------------------------------------------------------------------------------------ baselines and launchers
+function Get-ExpectedBaseline {
+    if ($ExpectedBaselineFile) { return ToHash (Get-Content -Raw -LiteralPath $ExpectedBaselineFile | ConvertFrom-Json) }
+    return $DefaultBaseline
+}
+function New-InspectionAuthorization {
+    if (-not (Test-Path -LiteralPath $AuthorizationDir)) { New-Item -ItemType Directory -Path $AuthorizationDir | Out-Null }
+    $before = @(Get-ChildItem -LiteralPath $AuthorizationDir -Filter 'main-inspection-authorization-*.json' | ForEach-Object { $_.FullName })
+    $r = Run-Node @((Join-Path $BackendDir 'scripts\new-main-inspection-authorization.js'), $AuthorizationDir, 'rotated-backend')
+    if ($r.Code -ne 0) { throw 'could not create an inspection authorization' }
+    $new = @(Get-ChildItem -LiteralPath $AuthorizationDir -Filter 'main-inspection-authorization-*.json' | Where-Object { $before -notcontains $_.FullName })
+    if ($new.Count -ne 1) { throw 'expected exactly one new inspection authorization' }
+    return $new[0].FullName
+}
+# B42: the repository launcher run-main-inspection.ps1 lets node inherit the console, so its JSON is NOT capturable. Real mode therefore uses CAPTURING copies kept next to this script,
+# pinned by SHA-256 (the copies are byte-identical to docs/main-sync-test/run-main-inspection-captured.ps1.template and run-verify-synthetic.ps1.template).
+$PinnedLaunchers = @{ 'run-main-inspection-captured.ps1' = 'D4860B70D438E0DAEF0FCD02D556F1D77F40A6A075ACBA71E2F734EE24F97577'; 'run-verify-synthetic.ps1' = '8A751B0B90E59758624C9E642F7FB7702E8BCDEDA0EFFBF97D7DDF32F9FCC9A5' }
+function Get-PinnedLauncher([string]$name) {
+    $path = Join-Path $env:LOCALAPPDATA ('TwoSidesSyntheticRun\' + $name)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Say ('REFUSED: the capturing launcher is missing: ' + $name); return $null }
+    if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { Say ('REFUSED: the launcher must not be a link: ' + $name); return $null }
+    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $PinnedLaunchers[$name]) { Say ('REFUSED: the launcher does not match its pinned SHA-256: ' + $name); return $null }
+    return $path
+}
+# The report printed by a launcher is accepted ONLY if it can be tied to THIS authorization and to the launcher's own local record (<executionId>.inspection.json / .verification.json).
+function Confirm-ToolReport($report, [string]$authPath, [string]$firstKey, [string]$markerSuffix, [string]$kind, [DateTimeOffset]$notBefore, [string]$executionId) {
+    function Reject([string]$why) { Say ('REJECTED launcher output: ' + $why); return $null }
+    if ($null -eq $report) { return (Reject 'no JSON report was captured') }
+    if ($null -eq $report.PSObject.Properties[$firstKey] -or [string]$report.$firstKey -cne 'finished') { return (Reject ('"' + $firstKey + '" is not "finished"')) }
+    if ($null -eq $report.PSObject.Properties['executionId'] -or [string]$report.executionId -cne $executionId) { return (Reject 'executionId differs from the authorization created for this run') }
+    if ($null -eq $report.PSObject.Properties['writes'] -or $report.writes -isnot [int] -or $report.writes -ne 0) { return (Reject 'writes is not 0') }
+    if ($null -eq $report.PSObject.Properties['closed'] -or $report.closed -ne $true) { return (Reject 'closed is not true') }
+    $marker = Join-Path (Split-Path -Parent $authPath) ($executionId + $markerSuffix)
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { return (Reject 'the launcher left no local record for this execution') }
+    $rec = $null; try { $rec = Get-Content -Raw -LiteralPath $marker | ConvertFrom-Json } catch { return (Reject 'the local record is unreadable') }
+    if ([string]$rec.kind -cne $kind -or [string]$rec.executionId -cne $executionId) { return (Reject 'the local record belongs to another execution or kind') }
+    $fin = [DateTimeOffset]::MinValue
+    if ($null -eq $rec.PSObject.Properties['finishedAt'] -or -not [DateTimeOffset]::TryParse([string]$rec.finishedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$fin)) { return (Reject 'the local record has no finishing time') }
+    if ($fin -lt $notBefore.AddMinutes(-1) -or $fin -gt [DateTimeOffset]::UtcNow.AddMinutes(1)) { return (Reject 'the local record is not from this run (stale or future timestamp)') }
+    if ($kind -eq 'main-schema-inspection') {
+        if ($null -eq $rec.PSObject.Properties['result'] -or $rec.result.completed -ne $true -or [string]$rec.result.verdict -cne [string]$report.verdict) { return (Reject 'the local record does not confirm the reported verdict') }
+    } elseif ([string]$rec.verdict -cne [string]$report.verdict) { return (Reject 'the local record does not confirm the reported verdict') }
+    return $report
+}
+function Invoke-ToolLauncher([string]$launcher, [hashtable]$extra, [string]$firstKey, [string]$markerSuffix, [string]$kind, [string]$what) {
+    $auth = New-InspectionAuthorization
+    $a = $null; try { $a = Get-Content -Raw -LiteralPath $auth | ConvertFrom-Json } catch { Say 'REFUSED: the new authorization is unreadable.'; return $null }
+    $id = [string]$a.executionId
+    if ($id -cnotmatch '^[0-9a-f]{32}$' -or (Split-Path -Leaf $auth) -cne ('main-inspection-authorization-' + $id + '.json')) { Say 'REFUSED: the new authorization has an unexpected identity.'; return $null }
+    $notBefore = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$a.notBefore, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$notBefore)) { Say 'REFUSED: the authorization has no valid start time.'; return $null }
+    if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $auth) ($id + $markerSuffix))) { Say 'REFUSED: a record for this execution already exists (authorization reuse).'; return $null }
+    Say ('Starting the read-only ' + $what + ' launcher: the OWNER types the Atlas password into its hidden prompt.')
+    $global:LASTEXITCODE = 0
+    $lines = & $launcher -Enable -Authorization $auth @extra 2>&1 | ForEach-Object { $_.ToString() }
+    if ($LASTEXITCODE -ne 0) { Say ('The ' + $what + ' launcher ended with exit code ' + $LASTEXITCODE + '.'); return $null }
+    if (@($lines | Where-Object { $_ -and $_.ToString().Trim() }).Count -eq 0) { Say ('The ' + $what + ' launcher printed nothing capturable.'); return $null }
+    return (Confirm-ToolReport (Last-Json $lines) $auth $firstKey $markerSuffix $kind $notBefore $id)
+}
+function Invoke-Inspection {
+    $launcher = if ($TestMode) { $InspectionLauncher } else { Get-PinnedLauncher 'run-main-inspection-captured.ps1' }
+    if (-not $launcher) { return $null }
+    return (Invoke-ToolLauncher $launcher @{} 'mainSchemaInspection' '.inspection.json' 'main-schema-inspection' 'inspection')
+}
+function Read-Counts($report) {
+    $counts = @{ main_v2 = @{}; historical = @{}; extra = @() }
+    $required = $report.PSObject.Properties['requiredCollections']
+    if ($null -eq $required) { return $null }
+    foreach ($k in $MainCollections) {
+        $prop = $required.Value.PSObject.Properties[$k]
+        if ($null -eq $prop -or -not $prop.Value.present -or $prop.Value.name -ne ('main_v2_' + $k)) { return $null }
+        $counts.main_v2[$k] = [int]$prop.Value.estimatedCount
+    }
+    $others = $report.PSObject.Properties['otherCollections']
+    if ($null -ne $others) { foreach ($o in @($others.Value)) { $counts.historical[[string]$o.name] = [int]$o.estimatedCount } }
+    return $counts
+}
+function Compare-Counts($expected, $actual) {
+    $diff = New-Object System.Collections.ArrayList
+    foreach ($k in $expected.main_v2.Keys) { if ($actual.main_v2[$k] -ne $expected.main_v2[$k]) { [void]$diff.Add('main_v2_' + $k + ' expected ' + $expected.main_v2[$k] + ' got ' + $actual.main_v2[$k]) } }
+    foreach ($k in $expected.historical.Keys) { if (-not $actual.historical.ContainsKey($k) -or $actual.historical[$k] -ne $expected.historical[$k]) { [void]$diff.Add($k + ' expected ' + $expected.historical[$k] + ' got ' + $(if ($actual.historical.ContainsKey($k)) { $actual.historical[$k] } else { 'absent' })) } }
+    foreach ($k in $actual.historical.Keys) { if (-not $expected.historical.ContainsKey($k)) { [void]$diff.Add($k + ' is not part of the expected baseline') } }
+    return $diff
+}
+function Invoke-Verification([string]$account) {
+    $launcher = if ($TestMode) { $VerifyLauncher } else { Get-PinnedLauncher 'run-verify-synthetic.ps1' }
+    if (-not $launcher) { return $null }
+    $verifier = if ($TestMode) { $VerifierScript } else { Join-Path $env:LOCALAPPDATA 'TwoSidesSyntheticRun\verify.mjs' }
+    return (Invoke-ToolLauncher $launcher @{ RunDir = $RunDir; Account = $account; Verifier = $verifier } 'syntheticRunVerification' '.verification.json' 'synthetic-run-verification' 'verification')
+}
+
+# ------------------------------------------------------------------------------------------------ receipt checks
+function Test-Receipt($receipt, [string]$what) {
+    $bad = New-Object System.Collections.ArrayList
+    $batch = ReadJson 'batch.json'; $ids = ReadJson 'run-ids.json'; $op = $batch.operations[0]
+    if ($null -eq $receipt) { return @('no receipt') }
+    if ($receipt.operationId -ne $op.operationId) { [void]$bad.Add('operationId') }
+    if ($receipt.payloadHash -ne $op.payloadHash) { [void]$bad.Add('payloadHash') }
+    if ($receipt.installationId -ne $ids.installationId) { [void]$bad.Add('installationId') }
+    if ($receipt.localPlayerId -ne $ids.localPlayerId) { [void]$bad.Add('localPlayerId') }
+    if ($receipt.bindingGeneration -ne 1) { [void]$bad.Add('bindingGeneration') }
+    if ($State.account -and $receipt.technicalAccountId -ne $State.account) { [void]$bad.Add('technicalAccountId') }
+    if ([string]$receipt.receiptId -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { [void]$bad.Add('receiptId') }
+    if ([string]$receipt.committedAtUtc -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$') { [void]$bad.Add('committedAtUtc') }
+    if (@('committed', 'duplicate', 'superseded') -notcontains [string]$receipt.acceptedAs) { [void]$bad.Add('acceptedAs') }
+    return $bad
+}
+function Receipt-Summary($r) { return @{ receiptId = [string]$r.receiptId; committedAtUtc = [string]$r.committedAtUtc; payloadHash = [string]$r.payloadHash; operationId = [string]$r.operationId; acceptedAs = [string]$r.acceptedAs } }
+function Same-Receipt($r) {
+    $ref = $State.reference
+    return ($null -ne $ref -and [string]$r.receiptId -eq $ref.receiptId -and [string]$r.committedAtUtc -eq $ref.committedAtUtc -and [string]$r.payloadHash -eq $ref.payloadHash -and [string]$r.operationId -eq $ref.operationId)
+}
+
+# ------------------------------------------------------------------------------------------------ session (token inside the DPAPI blob only)
+function Ensure-Session {
+    $blob = Unprotect-Secrets
+    if ($null -eq $blob -or -not $blob.credential -or -not $State.account) { throw 'no credential/account available for this run' }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($blob.token -and $blob.tokenExp -and ([long]$blob.tokenExp - 60) -gt $now) { return $blob.token }
+    $ids = ReadJson 'run-ids.json'
+    $r = Call-Api 'POST' '/api/v2/technical/sessions' (Json-Bytes @{ schemaVersion = 2; technicalAccountId = $State.account; credential = $blob.credential; installationId = $ids.installationId; localPlayerId = $ids.localPlayerId }) $null
+    if ($r.Status -ne 200 -or -not $r.Json -or -not $r.Json.accessToken) { throw ('session failed with HTTP ' + $r.Status) }
+    $blob.token = [string]$r.Json.accessToken; $blob.tokenExp = $now + [int]$r.Json.expiresIn; [void]$Secrets.Add($blob.token)
+    Protect-Secrets $blob; $State.logins = [int]$State.logins + 1; Save-State
+    return $blob.token
+}
+
+# ================================================================================================ STAGES
+function Stage-A {
+    $checks = [ordered]@{}
+    $p = @(Test-RunMaterial); $checks.runMaterial = ($p.Count -eq 0)
+    if ($p.Count) { Say ('run material problems: ' + ($p -join '; ')) }
+    if (-not $ExpectedTreeDigest -or $ExpectedTreeDigest -cnotmatch '^[0-9a-f]{64}$' -or -not $ExpectedKeyFingerprint -or $ExpectedKeyFingerprint -cnotmatch '^[0-9a-f]{64}$') {
+        Say 'incomplete configuration: -ExpectedTreeDigest and -ExpectedKeyFingerprint (64 hex each, noted OUTSIDE the machine) are required.'; $checks.configuration = $false
+    } else { $checks.configuration = $true }
+    $checks.manifestVerify = $false; $checks.preflight = $false
+    if (Test-Path -LiteralPath $ManifestPath) {
+        $v = Run-Node @((Join-Path $BackendDir 'scripts\backend-integrity.js'), 'verify', $ManifestPath)
+        $checks.manifestVerify = ($v.Code -eq 0 -and $v.Out -match '"ok":true')
+        if ($checks.configuration -and (Test-Path -LiteralPath $SigningKeyFile)) {
+            $pf = Run-Node @((Join-Path $BackendDir 'scripts\main-preflight.js'), '--manifest', $ManifestPath, '--anchor', $ExpectedTreeDigest, '--key-file', $SigningKeyFile, '--key-id', $KeyId, '--expected-key-id', $KeyId, '--key-fingerprint', $ExpectedKeyFingerprint)
+            $checks.preflight = ($pf.Code -eq 0 -and $pf.Out -match '"mainPreflight":"ok"')
+        }
+    } else { Say 'manifest not found.' }
+    $acl1 = & powershell -NoProfile -File (Join-Path $BackendDir 'scripts\check-main-secrets-acl.ps1') | Out-String
+    $acl2 = & powershell -NoProfile -File (Join-Path $BackendDir 'scripts\check-main-secrets-acl.ps1') -Directory (Split-Path -Parent $ManifestPath) | Out-String
+    $checks.acl = ($acl1 -match '"verdict":"conforming"' -and $acl2 -match '"verdict":"conforming"')
+    $scan = Run-Node @((Join-Path $BackendDir 'scripts\scan-secrets.js')); $checks.secretScan = ($scan.Code -eq 0 -and ($scan.Out + $scan.Err) -match '"secretScan":"clean"')
+    $procs = @(); foreach ($n in $ProcessNames) { $procs += @(Get-Process -Name $n -ErrorAction SilentlyContinue) }
+    $listening = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $CheckPorts -contains $_.LocalPort })
+    $checks.noServers = ($procs.Count -eq 0 -and $listening.Count -eq 0)
+    if (-not $checks.noServers) { Say ('servers/ports active: processes=' + $procs.Count + ' listeners=' + $listening.Count) }
+    $root = @(Get-ChildItem Cert:\CurrentUser\Root); $checks.caNotInstalled = (@($root | Where-Object { $_.Thumbprint -eq $CaThumbprint }).Count -eq 0)
+    $backupsOk = $true
+    foreach ($b in $BackupDirs) {
+        if (-not (Test-Path -LiteralPath (Join-Path $b 'SHA256SUMS.txt'))) { $backupsOk = $false; continue }
+        foreach ($line in Get-Content -LiteralPath (Join-Path $b 'SHA256SUMS.txt')) {
+            if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') { $f = Join-Path $b $matches[2]; if (-not (Test-Path -LiteralPath $f) -or (Get-FileHash -LiteralPath $f).Hash -ne $matches[1].ToUpper()) { $backupsOk = $false } }
+        }
+    }
+    $checks.backups = $backupsOk
+    $compass = @(Get-NetTCPConnection -State Established -RemotePort 27017 -ErrorAction SilentlyContinue).Count
+    $State.environment = @{ at = (NowIso); compassStyleAtlasConnections = $compass; rootCertificates = $root.Count; checks = $checks }
+    $failed = @($checks.Keys | Where-Object { -not $checks[$_] })
+    foreach ($k in $checks.Keys) { Say (('  {0,-16} {1}' -f $k, $(if ($checks[$k]) { 'ok' } else { 'FAILED' }))) }
+    if ($failed.Count) { Set-Stage 'A' 'failed' ('failed: ' + ($failed -join ',')); Finish 21 'failed' @{ failedChecks = $failed } }
+    Set-Stage 'A' 'ok'; Finish 0 'ok' @{ checks = $checks.Count; atlasConnectionsFromOtherTools = $compass; next = 'B (needs its own authorization)' }
+}
+
+function Stage-B {
+    Set-Stage 'B' 'started'
+    $report = Invoke-Inspection
+    if ($null -eq $report -or $report.mainSchemaInspection -ne 'finished' -or $report.verdict -ne 'ready' -or $report.writes -ne 0 -or -not $report.closed) {
+        Set-Stage 'B' 'failed' 'inspection did not finish as ready/read-only/closed'; Finish 21 'failed' @{ reason = 'inspection' } }
+    $counts = Read-Counts $report
+    if ($null -eq $counts) { Set-Stage 'B' 'failed' 'unexpected collection set'; Finish 21 'failed' @{ reason = 'collections' } }
+    $diff = @(Compare-Counts (Get-ExpectedBaseline) $counts)
+    $State.baseline = @{ at = (NowIso); counts = $counts }
+    if ($diff.Count) { Say ('DISCREPANCY against the expected baseline: ' + ($diff -join '; ')); Set-Stage 'B' 'discrepancy' ($diff -join '; '); Finish 31 'discrepancy' @{ differences = @($diff) } }
+    Set-Stage 'B' 'ok'; Finish 0 'ok' @{ baseline = $counts; next = 'C (needs its own authorization and the services running)' }
+}
+
+function Stage-C {
+    $age = if ($State.baseline) { ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$State.baseline.at)).TotalMinutes } else { [double]::PositiveInfinity }
+    if ($age -gt $BaselineMaxAgeMinutes) { Say ('REFUSED: the baseline is older than ' + $BaselineMaxAgeMinutes + ' minutes; repeat stage B.'); Finish 11 'prerequisite' @{ reason = 'stale-baseline' } }
+    $p = @(Test-RunMaterial); if ($p.Count) { Say ('run material problems: ' + ($p -join '; ')); Finish 21 'failed' @{ reason = 'run-material' } }
+    if (-not $TestMode -and @(Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Thumbprint -eq $CaThumbprint }).Count -eq 0) { Say 'REFUSED: the temporary CA is not installed (TLS would fail).'; Finish 21 'failed' @{ reason = 'ca-missing' } }
+    Set-Stage 'C' 'started'
+    $ids = ReadJson 'run-ids.json'
+    # fail closed BEFORE any request: if protected secrets already exist they must be readable (ACL ok, decryptable for this run). Nothing is sent and no identity is regenerated.
+    if (Test-Path -LiteralPath $SecretsPath) {
+        try { [void](Unprotect-Secrets) } catch {
+            Set-Stage 'C' 'failed' 'secrets-unavailable'; Say 'REFUSED: the protected secrets of this run cannot be used (ACL or decryption check failed). No request was sent.'
+            Finish 21 'failed' @{ reason = 'secrets-unavailable'; hint = 'No request was sent and no identity was regenerated. Do not delete secrets.dpapi to work around it: run stage G and ask the owner.' } }
+    }
+    $h = Call-Api 'GET' '/api/health' $null $null
+    Say ('0) health: ' + $h.Status + ' (' + $h.Ms + ' ms)')
+    if ($h.Status -ne 200) { Set-Stage 'C' 'failed' 'health'; Finish 21 'failed' @{ reason = 'health'; httpStatus = $h.Status } }
+    # registration (idempotent by registrationId; the credential is protected BEFORE it is sent, so a lost answer cannot lose the account)
+    if (-not $State.steps.ContainsKey('registration')) {
+        try {
+            $blob = Unprotect-Secrets
+            if ($null -eq $blob) { $blob = @{ credential = (New-Credential); token = $null; tokenExp = 0 }; Protect-Secrets $blob; [void]$Secrets.Add($blob.credential) }
+        } catch { Set-Stage 'C' 'failed' 'secrets-unavailable'; Say 'REFUSED: the protected secrets could not be prepared. No request was sent.'; Finish 21 'failed' @{ reason = 'secrets-unavailable' } }
+        $r = Call-Api 'POST' '/api/v2/technical/registrations' (Json-Bytes @{ schemaVersion = 2; registrationId = $ids.registrationId; credential = $blob.credential; installationId = $ids.installationId; localPlayerId = $ids.localPlayerId; bindingGeneration = 1 }) $null
+        Say ('1) registration: ' + $r.Status + ' (' + $r.Ms + ' ms)')
+        if (@(200, 201) -notcontains $r.Status -or -not $r.Json -or [string]$r.Json.technicalAccountId -cnotmatch $UuidV4) {
+            Set-Stage 'C' $(if ($r.Status -eq 0 -or $r.Status -ge 500) { 'unknown' } else { 'failed' }) ('registration HTTP ' + $r.Status)
+            Finish $(if ($r.Status -eq 0 -or $r.Status -ge 500) { 20 } else { 21 }) $(if ($r.Status -eq 0 -or $r.Status -ge 500) { 'unknown' } else { 'failed' }) @{ reason = 'registration'; httpStatus = $r.Status; hint = 'Resume with the same registrationId; never register another account.' } }
+        $State.account = [string]$r.Json.technicalAccountId; $State.steps['registration'] = @{ at = (NowIso); httpStatus = $r.Status; ms = $r.Ms }; Save-State
+        Fault-After 'registration'
+    }
+    try { $token = Ensure-Session } catch { $why = Secrets-Reason $_ 'session'; Set-Stage 'C' 'failed' $why; Finish 21 'failed' @{ reason = $why } }
+    Say ('2) session: ok (logins so far: ' + $State.logins + ')'); Fault-After 'session'
+    # the ONE write: the bytes of batch.json, exactly
+    $bytes = ReadBytes 'batch.json'
+    $wasSent = $State.steps.ContainsKey('batch')
+    $State.steps['batch'] = @{ sentAt = (NowIso); sha256 = (Sha256Hex $bytes); outcome = 'in-flight'; priorAttempt = $wasSent }; Save-State
+    $b = Call-Api 'POST' '/api/v2/sync/batches' $bytes $token
+    Say ('3) POST sync/batches: ' + $b.Status + ' (' + $b.Ms + ' ms)')
+    $State.steps['batch'].httpStatus = $b.Status; $State.steps['batch'].ms = $b.Ms
+    $res = $null; if ($b.Json -and $b.Json.results) { $res = @($b.Json.results)[0] }
+    $priorAttempt = ($State.steps.ContainsKey('batch') -and $State.steps['batch'].ContainsKey('priorAttempt') -and $State.steps['batch'].priorAttempt)
+    if ($b.Status -eq 200 -and $res -and $res.receipt -and ($res.status -eq 'committed' -or ($priorAttempt -and $res.status -eq 'duplicate'))) {
+        $bad = @(Test-Receipt $res.receipt 'first send')
+        if ($bad.Count) { $State.steps['batch'].outcome = 'inconsistent'; Set-Stage 'C' 'inconsistent' ('receipt fields: ' + ($bad -join ',')); Finish 30 'inconsistent' @{ badFields = @($bad) } }
+        $State.reference = Receipt-Summary $res.receipt; $State.steps['batch'].outcome = 'committed'; Set-Stage 'C' 'ok'
+        Finish 0 'ok' @{ receiptId = $State.reference.receiptId; operationId = $State.reference.operationId; ms = $b.Ms; next = 'D (needs its own authorization)' }
+    }
+    if ($b.Status -eq 0 -or $b.Status -ge 500 -or ($res -and $res.status -eq 'deferred') -or -not $b.Json) {
+        $State.steps['batch'].outcome = 'unknown'; Set-Stage 'C' 'unknown' ('HTTP ' + $b.Status + ': persistence of the operation is UNKNOWN')
+        Say 'OUTCOME UNKNOWN: do NOT create another operation. Stage D verifies by reading and re-sends the SAME bytes.'; Finish 20 'unknown' @{ httpStatus = $b.Status; operationId = [string]$ids.operationId } }
+    $State.steps['batch'].outcome = 'failed'; Set-Stage 'C' 'failed' ('HTTP ' + $b.Status + ' / ' + $(if ($res) { $res.status } else { 'no result' }))
+    Finish 21 'failed' @{ httpStatus = $b.Status; resultStatus = $(if ($res) { [string]$res.status } else { $null }) }
+}
+
+function Stage-D {
+    Set-Stage 'D' 'started'
+    $ids = ReadJson 'run-ids.json'
+    # 1) read-only verification BEFORE the re-send
+    $v = Invoke-Verification $State.account
+    if ($null -eq $v -or $v.syntheticRunVerification -ne 'finished' -or $v.writes -ne 0 -or -not $v.closed) { Set-Stage 'D' 'failed' 'verification did not finish read-only'; Finish 21 'failed' @{ reason = 'verification' } }
+    $persisted = ($v.counts.operations -eq 1 -and $v.counts.facts -eq 1)
+    if ((Stage-Status 'C') -eq 'ok' -and $v.verdict -ne 'consistent') { Set-Stage 'D' 'inconsistent' 'verification is not consistent after a confirmed first send'; Finish 30 'inconsistent' @{ verdict = [string]$v.verdict; failed = @($v.failed) } }
+    if ((Stage-Status 'C') -eq 'unknown' -and -not $persisted -and ($v.counts.operations -ne 0 -or $v.counts.facts -ne 0)) { Set-Stage 'D' 'inconsistent' 'partial persistence'; Finish 30 'inconsistent' @{ counts = $v.counts } }
+    if ((Stage-Status 'C') -eq 'unknown' -and $persisted -and $v.verdict -ne 'consistent') { Set-Stage 'D' 'inconsistent' 'persisted but inconsistent'; Finish 30 'inconsistent' @{ failed = @($v.failed) } }
+    $State.steps['verifyBeforeResend'] = @{ at = (NowIso); verdict = [string]$v.verdict; persisted = $persisted; counts = $v.counts }; Save-State
+    Say ('1) verification before re-send: ' + $v.verdict + ' persisted=' + $persisted)
+    # 2) identical re-send (same operationId, same bytes)
+    try { $token = Ensure-Session } catch { $why = Secrets-Reason $_ 'session'; Set-Stage 'D' 'failed' $why; Finish 21 'failed' @{ reason = $why } }
+    $bytes = ReadBytes 'batch.json'
+    $b = Call-Api 'POST' '/api/v2/sync/batches' $bytes $token
+    Say ('2) identical re-send: ' + $b.Status + ' (' + $b.Ms + ' ms)')
+    $res = $null; if ($b.Json -and $b.Json.results) { $res = @($b.Json.results)[0] }
+    if ($b.Status -eq 0 -or $b.Status -ge 500 -or ($res -and $res.status -eq 'deferred') -or -not $b.Json) {
+        Set-Stage 'D' 'unknown' ('re-send HTTP ' + $b.Status); Say 'OUTCOME UNKNOWN again: verify by reading, then re-run D with -Resume (same bytes). Nothing new is ever created.'; Finish 20 'unknown' @{ httpStatus = $b.Status } }
+    if ($b.Status -ne 200 -or -not $res -or -not $res.receipt) { Set-Stage 'D' 'failed' ('re-send HTTP ' + $b.Status); Finish 21 'failed' @{ httpStatus = $b.Status; resultStatus = $(if ($res) { [string]$res.status } else { $null }) } }
+    $bad = @(Test-Receipt $res.receipt 're-send')
+    if ($bad.Count) { Set-Stage 'D' 'inconsistent' ('receipt fields: ' + ($bad -join ',')); Finish 30 'inconsistent' @{ badFields = @($bad) } }
+    if ($State.reference) {
+        if ($res.status -ne 'duplicate' -or -not (Same-Receipt $res.receipt)) { Set-Stage 'D' 'inconsistent' 'the re-send did not return the SAME receipt as duplicate'; Finish 30 'inconsistent' @{ resultStatus = [string]$res.status; sameReceipt = (Same-Receipt $res.receipt) } }
+    } else {                                                                              # first send was UNKNOWN: this response defines the reference receipt
+        if (-not $persisted -and $res.status -ne 'committed') { Set-Stage 'D' 'inconsistent' 'expected committed on the first confirmed delivery'; Finish 30 'inconsistent' @{ resultStatus = [string]$res.status } }
+        if ($persisted -and $res.status -ne 'duplicate') { Set-Stage 'D' 'inconsistent' 'expected duplicate for an already persisted operation'; Finish 30 'inconsistent' @{ resultStatus = [string]$res.status } }
+        $State.reference = Receipt-Summary $res.receipt
+    }
+    $State.steps['resend'] = @{ at = (NowIso); httpStatus = $b.Status; status = [string]$res.status; ms = $b.Ms; sameReceiptId = $true }; Set-Stage 'D' 'ok'
+    Finish 0 'ok' @{ resultStatus = [string]$res.status; receiptId = $State.reference.receiptId; sameReceiptId = $true; next = 'E (needs its own authorization)' }
+}
+
+function Stage-E {
+    Set-Stage 'E' 'started'
+    try { $token = Ensure-Session } catch { $why = Secrets-Reason $_ 'session'; Set-Stage 'E' 'failed' $why; Finish 21 'failed' @{ reason = $why } }
+    $q = Call-Api 'POST' '/api/v2/sync/receipts/query' (ReadBytes 'receipts-query.json') $token
+    Say ('1) receipts/query: ' + $q.Status + ' (' + $q.Ms + ' ms)')
+    if ($q.Status -eq 0 -or $q.Status -ge 500 -or -not $q.Json) { Set-Stage 'E' 'unknown' ('query HTTP ' + $q.Status); Finish 20 'unknown' @{ httpStatus = $q.Status } }
+    $r = @($q.Json.results)[0]
+    if ($q.Status -ne 200 -or -not $r -or $r.status -ne 'found') { Set-Stage 'E' 'failed' ('query result ' + $(if ($r) { $r.status } else { 'none' })); Finish 21 'failed' @{ httpStatus = $q.Status } }
+    $bad = @(Test-Receipt $r.receipt 'query')
+    if ($bad.Count -or -not (Same-Receipt $r.receipt)) { Set-Stage 'E' 'inconsistent' 'the queried receipt differs from the first receipt'; Finish 30 'inconsistent' @{ badFields = @($bad); sameReceipt = (Same-Receipt $r.receipt) } }
+    if ($IncludeNotFoundProbe) {
+        $fake = [guid]::NewGuid().ToString('D'); $fake = $fake.Substring(0, 14) + '4' + $fake.Substring(15)     # a query only: it creates nothing
+        $n = Call-Api 'POST' '/api/v2/sync/receipts/query' (Json-Bytes @{ schemaVersion = 2; attempts = @(@{ operationId = $fake; payloadHash = ('0' * 64); leaseId = [guid]::NewGuid().ToString('D'); attempt = 1 }) }) $token
+        if ($n.Status -ne 200 -or @($n.Json.results)[0].status -ne 'not_found') { Set-Stage 'E' 'failed' 'not_found probe'; Finish 21 'failed' @{ reason = 'not-found-probe' } }
+        Say '   not_found probe: ok'
+    }
+    $State.steps['query'] = @{ at = (NowIso); status = 'found'; sameReceiptId = $true; ms = $q.Ms }; Save-State
+    # final read-only deltas (global counts) and per-account verification
+    $report = Invoke-Inspection
+    if ($null -eq $report -or $report.verdict -ne 'ready' -or $report.writes -ne 0) { Set-Stage 'E' 'failed' 'final inspection'; Finish 21 'failed' @{ reason = 'final-inspection' } }
+    $after = Read-Counts $report; if ($null -eq $after) { Set-Stage 'E' 'failed' 'final collections'; Finish 21 'failed' @{ reason = 'final-collections' } }
+    $b = $State.baseline.counts; $logins = [int]$State.logins
+    $expected = @{ main_v2 = @{ operations = $b.main_v2.operations + 1; facts = $b.main_v2.facts + 1; fences = $b.main_v2.fences + 1; identities = $b.main_v2.identities + 1; ownerGuards = $b.main_v2.ownerGuards + 1
+        identitySessions = $b.main_v2.identitySessions + $logins; revocations = $b.main_v2.revocations }; historical = $b.historical }
+    $diff = @(Compare-Counts $expected $after)
+    if ($diff.Count) { Say ('DISCREPANCY in the final deltas: ' + ($diff -join '; ')); Set-Stage 'E' 'discrepancy' ($diff -join '; '); Finish 31 'discrepancy' @{ differences = @($diff) } }
+    $v = Invoke-Verification $State.account
+    if ($null -eq $v -or $v.verdict -ne 'consistent' -or $v.writes -ne 0) { Set-Stage 'E' 'inconsistent' 'final verification'; Finish 30 'inconsistent' @{ verdict = $(if ($v) { [string]$v.verdict } else { $null }) } }
+    $State.steps['final'] = @{ at = (NowIso); deltasOk = $true; verdict = 'consistent'; after = $after }; Set-Stage 'E' 'ok'
+    Finish 0 'ok' @{ deltasOk = $true; logins = $logins; next = 'G (close services, owner removes the temporary CA)' }
+}
+
+function Stage-G {
+    $result = [ordered]@{}
+    if ($RunDir -and (Test-Path -LiteralPath $RunDir)) {
+        $script:StatePath = Join-Path $RunDir 'stage-state.json'; $script:SecretsPath = Join-Path $RunDir 'secrets.dpapi'; $script:LockPath = Join-Path $RunDir 'stage.lock'
+        try { if (Test-Path -LiteralPath $StatePath) { $script:State = ToHash (Get-Content -Raw -LiteralPath $StatePath | ConvertFrom-Json) } } catch { $script:State = $null }
+        $result.secretsWiped = (Wipe-Secrets)
+        if (Test-Path -LiteralPath $LockPath) { $pidText = (Get-Content -Raw -LiteralPath $LockPath).Trim(); if (-not ($pidText -match '^\d+$' -and (Get-Process -Id ([int]$pidText) -ErrorAction SilentlyContinue))) { Remove-Item -LiteralPath $LockPath -Force } }
+        $result.temporariesRemoved = (Remove-OwnTemporaries)
+        # the absence is VERIFIED, not assumed
+        $secretsLeft = (Test-Path -LiteralPath $SecretsPath); $tmpLeft = (Own-TemporariesLeft)
+        $result.secretsFilePresent = $secretsLeft; $result.temporariesLeft = $tmpLeft; $result.absenceVerified = (-not $secretsLeft -and $tmpLeft -eq 0)
+        $result.erasureNote = 'logical deletion (overwrite + remove); not a guarantee of irrecoverable physical erasure'
+        if (-not $result.absenceVerified) { Say 'ATTENTION: the protected secrets file or an own temporary file is still present; close whatever holds it and run stage G again.' }
+    } else { $result.secretsWiped = $false }
+    $phrase = if ($State -and $State.runId) { 'AUTORIZO-ETAPA-G-' + $State.runId.Substring(0, 8) } else { $null }
+    $destructive = ($StopCaddy -or $ForceStopExpress)
+    if ($destructive -and (-not $phrase -or $ConfirmPhrase -cne $phrase)) { Say ('NOT AUTHORIZED: stopping processes needs the phrase ' + $phrase); Finish 10 'not-authorized' @{ required = $phrase } }
+    if ($StopCaddy) {
+        $p = if ($CaddyPid) { Get-Process -Id $CaddyPid -ErrorAction SilentlyContinue } else { $null }
+        if ($p -and $p.ProcessName -eq 'caddy') { Stop-Process -Id $CaddyPid -Force; $result.caddyStopped = $true } else { $result.caddyStopped = $false; Say 'Caddy pid not found or not a caddy process: nothing stopped.' }
+    }
+    if ($ForceStopExpress) {
+        $p = if ($ExpressPid) { Get-Process -Id $ExpressPid -ErrorAction SilentlyContinue } else { $null }
+        if ($p -and $p.ProcessName -eq 'node') { Stop-Process -Id $ExpressPid -Force; $result.expressForceStopped = $true; Say 'Express was stopped by force (document it: not a Ctrl+C shutdown).' } else { $result.expressForceStopped = $false; Say 'Express pid not found or not a node process: nothing stopped.' }
+    } else { Say 'Express is never stopped by this script unless -ForceStopExpress is given; the clean way is Ctrl+C in its console.' }
+    Start-Sleep -Milliseconds 300
+    $procs = @(); foreach ($n in $ProcessNames) { $procs += @(Get-Process -Name $n -ErrorAction SilentlyContinue) }
+    $listening = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $CheckPorts -contains $_.LocalPort })
+    $cu = @(Get-ChildItem Cert:\CurrentUser\Root); $caCu = @($cu | Where-Object { $_.Thumbprint -eq $CaThumbprint -or $_.Subject -match 'Two Sides' }).Count
+    $caLm = @(Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Thumbprint -eq $CaThumbprint -or $_.Subject -match 'Two Sides' }).Count
+    $result.processesActive = $procs.Count; $result.listenersActive = $listening.Count; $result.rootCertificates = $cu.Count; $result.caInstalledCurrentUser = ($caCu -gt 0); $result.caInstalledLocalMachine = ($caLm -gt 0)
+    $attention = ($procs.Count -gt 0 -or $listening.Count -gt 0 -or $caCu -gt 0 -or $caLm -gt 0 -or ($result.Contains('absenceVerified') -and -not $result.absenceVerified))
+    if ($caCu -gt 0) { Say ('The temporary CA is STILL installed. The OWNER removes it: certutil -user -delstore Root ' + $CaThumbprint) }
+    if ($procs.Count -gt 0) { Say ('Still running: ' + (($procs | ForEach-Object { $_.ProcessName + ':' + $_.Id }) -join ', ')) }
+    if ($State) { $State.stages['G'] = @{ status = $(if ($attention) { 'attention' } else { 'ok' }); updatedAt = (NowIso) }; try { Save-State } catch { } }
+    if ($result.Contains('absenceVerified')) { [void](Remove-OwnTemporaries); if ((Own-TemporariesLeft) -ne 0 -or (Test-Path -LiteralPath $SecretsPath)) { $result.absenceVerified = $false; $attention = $true } }   # final re-check after the state was saved
+    if ($attention) { Finish 40 'attention' $result }
+    Finish 0 'ok' $result
+}
+
+# ================================================================================================ dispatch
+if ($Stage -eq 'G') { Stage-G }
+$m = Test-Path -LiteralPath $RunDir -PathType Container
+if (-not $m) { Stop-Param 'RunDir does not exist.' }
+try { Assert-PrivateDir $RunDir } catch { if (-not $TestMode) { Stop-Param $_.Exception.Message } }
+if (-not (Test-Path -LiteralPath (Join-Path $RunDir 'run-ids.json'))) { Stop-Param 'RunDir has no run-ids.json (build it with build.mjs).' }
+Load-Or-Init-State
+Gate $Stage
+Get-Lock
+try {
+    switch ($Stage) { 'A' { Stage-A } 'B' { Stage-B } 'C' { Stage-C } 'D' { Stage-D } 'E' { Stage-E } }
+} finally { Release-Lock }

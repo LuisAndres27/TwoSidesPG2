@@ -1,0 +1,130 @@
+// probe-atlas-latency.mjs.template — ONE-SHOT, READ-ONLY latency probe of MongoDB Atlas (B33). NOT run by the repository, NOT part of src/.
+// It measures, with performance.now():
+//   1. DNS SRV resolution of the cluster and, for each of the (at most 3) members, one TLS handshake WITHOUT credentials (strict validation: servername + rejectUnauthorized);
+//   2. connection + authentication (SRV, TLS, SCRAM, topology discovery) through the same strict connector as the inspection (src/main/inspection.js), measured as ONE block
+//      (the driver does not expose the split; (2) minus (1) approximates SCRAM + discovery);
+//   3. one `connectionStatus` command (the permission check every read-only tool performs) - timed separately;
+//   4. exactly 30 sequential `hello` commands (individual times, min / median / p95 / max, error count).
+// The ONLY database commands that can be sent are {hello:1} and {connectionStatus:1,showPrivileges:true}: `guardedCommand` rejects anything else. There is no collection access,
+// no find, no write, no transaction, no session, no index/collection creation, no HTTP, no historical-collection access. The output holds numbers and fixed words only.
+// Copy it OUTSIDE the project (e.g. %LOCALAPPDATA%\TwoSidesSyntheticRun\probe.mjs) and run it ONLY through run-probe-latency.ps1 (hidden password prompt), with a fresh
+// inspection-format authorization (a single use, <= 60 minutes) and the owner's explicit authorization. The password never appears in arguments, environment, files or output.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import tls from 'node:tls';
+import dns from 'node:dns/promises';
+import { performance } from 'node:perf_hooks';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+
+export const HELLO_COUNT = 30;
+const round = ms => Math.round(ms * 10) / 10;
+
+// Nearest-rank percentile on a sorted copy; median = mean of the two middle values for an even count.
+export function summarize(samples) {
+  const ok = samples.filter(Number.isFinite).sort((a, b) => a - b), n = ok.length;
+  if (!n) return { count: 0, min: null, median: null, p95: null, max: null, mean: null };
+  const median = n % 2 ? ok[(n - 1) / 2] : (ok[n / 2 - 1] + ok[n / 2]) / 2;
+  return { count: n, min: round(ok[0]), median: round(median), p95: round(ok[Math.min(n - 1, Math.ceil(0.95 * n) - 1)]), max: round(ok[n - 1]), mean: round(ok.reduce((a, b) => a + b, 0) / n) };
+}
+
+// The only door to the database: {hello:1} and {connectionStatus:1,showPrivileges:true}; counts what it sent.
+export function guardedCommand(db) {
+  const sent = { hello: 0, connectionStatus: 0 };
+  const run = async command => {
+    const keys = Object.keys(command ?? {});
+    if (keys.length === 1 && keys[0] === 'hello' && command.hello === 1) { sent.hello++; return db.command({ hello: 1 }); }
+    if (keys.length === 2 && command.connectionStatus === 1 && command.showPrivileges === true) { sent.connectionStatus++; return db.command({ connectionStatus: 1, showPrivileges: true }); }
+    throw new Error('command_not_allowed');
+  };
+  return { run, sent };
+}
+
+// `hello()` performs one round trip. Errors are counted by fixed code (never driver text) and do not stop the series: exactly `count` attempts are made.
+export async function measureHello(hello, { count = HELLO_COUNT, now = () => performance.now() } = {}) {
+  const samples = [], errors = [];
+  for (let i = 0; i < count; i++) {
+    const t0 = now();
+    try { await hello(); samples.push(round(now() - t0)); } catch (error) { errors.push({ index: i, code: typeof error?.code === 'string' && /^[A-Za-z_0-9]{1,40}$/.test(error.code) ? error.code : 'hello_failed' }); samples.push(null); }
+  }
+  return { attempts: count, samplesMs: samples, errors, errorCount: errors.length, ...summarize(samples) };
+}
+
+async function tlsHandshake(host, port, timeoutMs = 10000) {
+  const t0 = performance.now();
+  return new Promise(resolve => {
+    let tcpMs = null, done = false;
+    const finish = result => { if (done) return; done = true; try { socket.destroy(); } catch { /* closing */ } resolve({ host: hostLabel(host), ...result }); };
+    const socket = tls.connect({ host, port, servername: host, rejectUnauthorized: true, minVersion: 'TLSv1.2' });
+    socket.setTimeout(timeoutMs, () => finish({ ok: false, code: 'timeout' }));
+    socket.once('connect', () => { tcpMs = round(performance.now() - t0); });
+    socket.once('secureConnect', () => finish({ ok: true, tcpMs, tlsTotalMs: round(performance.now() - t0), protocol: socket.getProtocol() }));
+    socket.once('error', error => finish({ ok: false, code: typeof error?.code === 'string' && /^[A-Z_0-9]{1,40}$/.test(error.code) ? error.code : 'tls_failed' }));
+  });
+}
+const hostLabel = host => host.replace(/^[^.]+/, m => m.slice(0, 3) + '…');     // shard-00-01.xxx -> sha…-00-01.xxx (members are not secrets, but the output stays short)
+
+// ---- runner (only when executed directly through the PowerShell launcher) ---------------------------------------------------------------------------------
+const fail = code => { const e = new Error('probe unavailable'); e.code = code; throw e; };
+function parseArgs(argv) {
+  const names = { '--enable-latency-probe': false, '--authorization': true, '--backend': true }, v = new Map();
+  for (let i = 0; i < argv.length; i++) {
+    if (!Object.hasOwn(names, argv[i]) || v.has(argv[i])) fail('arguments_rejected');
+    if (names[argv[i]]) { const x = argv[++i]; if (typeof x !== 'string' || x.startsWith('--')) fail('arguments_rejected'); v.set(argv[i - 1], x); } else v.set(argv[i], true);
+  }
+  if (v.get('--enable-latency-probe') !== true) fail('not_enabled');
+  for (const k of ['--authorization', '--backend']) if (!v.has(k)) fail('arguments_rejected');
+  return Object.fromEntries([...v].map(([k, x]) => [k.slice(2), x]));
+}
+export async function main(argv, stdin, stdout) {
+  const a = parseArgs(argv);
+  if (!stdin || stdin.isTTY || !path.isAbsolute(a.backend) || !path.isAbsolute(a.authorization)) fail('arguments_rejected');
+  const src = rel => import(pathToFileURL(path.join(a.backend, 'src', rel)).href);
+  const { parseInspectionAuthorization } = await src('main/inspection-authorization.js');
+  const { inspectionConnector, assertInspectionConnection, verifyInspectionPermissions } = await src('main/inspection.js');
+  const { MAIN_AUTH_MECHANISM, MAIN_TARGET, MAIN_URI } = await src('main/policy.js');
+  const { receiveAtlasCredential, consumeAtlasCredential, destroyAtlasCredential } = await src('modules/sync/atlas-credentials.js');
+  const stat = fs.lstatSync(a.authorization); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) fail('authorization_invalid');
+  const authorization = parseInspectionAuthorization(fs.readFileSync(a.authorization, 'utf8'), Date.now());
+  const marker = path.join(path.dirname(a.authorization), authorization.executionId + '.latency.json');
+  let credential; try { credential = await receiveAtlasCredential(stdin); } catch { fail('credential_required'); }
+  let mongoose; try { mongoose = createRequire(path.join(a.backend, 'package.json'))('mongoose'); } catch { destroyAtlasCredential(credential); fail('dependencies_missing'); }
+  try { fs.writeFileSync(marker, JSON.stringify({ kind: 'atlas-latency-probe', executionId: authorization.executionId, startedAt: new Date().toISOString(), note: 'No secrets.' }), { flag: 'wx' }); }
+  catch { destroyAtlasCredential(credential); fail('authorization_consumed'); }
+  const started = new Date().toISOString(), result = { atlasLatencyProbe: 'finished', executionId: authorization.executionId, startedAtUtc: started, environment: { node: process.versions.node, platform: process.platform + ' ' + os.release(), arch: process.arch }, cluster: MAIN_TARGET.host, database: MAIN_TARGET.database };
+  let connection;
+  try {
+    // 1. network path without credentials
+    const t0 = performance.now(); let members = [];
+    try { members = (await dns.resolveSrv('_mongodb._tcp.' + MAIN_TARGET.host)).slice(0, 3); result.dnsSrvMs = round(performance.now() - t0); result.srvMembers = members.length; } catch { result.dnsSrvMs = null; result.srvMembers = 0; }
+    result.tlsHandshakes = []; for (const m of members) result.tlsHandshakes.push(await tlsHandshake(m.name, m.port));
+    // 2. connection + authentication, one block
+    const pass = consumeAtlasCredential(credential);
+    const c0 = performance.now();
+    connection = await inspectionConnector(mongoose, authorization.user)(MAIN_URI, { dbName: MAIN_TARGET.database, user: authorization.user, pass, authSource: 'admin', authMechanism: MAIN_AUTH_MECHANISM,
+      tls: true, tlsAllowInvalidCertificates: false, tlsAllowInvalidHostnames: false, directConnection: false, readPreference: 'primary', retryWrites: false,
+      maxPoolSize: 1, minPoolSize: 0, serverSelectionTimeoutMS: 10000, connectTimeoutMS: 10000, socketTimeoutMS: 15000, waitQueueTimeoutMS: 2000,
+      autoIndex: false, autoCreate: false, bufferCommands: false, monitorCommands: false, appName: 'TwoSides-LatencyProbe' });
+    result.connectAndAuthMs = round(performance.now() - c0);
+    assertInspectionConnection(connection, authorization.user);
+    const db = guardedCommand(connection.db);
+    // 3. permission check (separate)
+    const p0 = performance.now(); const status = await db.run({ connectionStatus: 1, showPrivileges: true }); result.connectionStatusMs = round(performance.now() - p0);
+    verifyInspectionPermissions(status, authorization);
+    // 4. exactly 30 hello
+    Object.assign(result, { hello: await measureHello(() => db.run({ hello: 1 })) });
+    result.commands = { ...db.sent }; result.writes = 0; result.operationsAllowed = ['connectionStatus', 'hello'];
+    await connection.close(); connection = null; result.closed = true;
+    result.finishedAtUtc = new Date().toISOString();
+    stdout.write(JSON.stringify(result) + '\n');
+    fs.writeFileSync(marker, JSON.stringify({ kind: 'atlas-latency-probe', executionId: authorization.executionId, finishedAt: result.finishedAtUtc, completed: true, note: 'No secrets.' }));
+  } catch (error) {
+    if (connection) try { await connection.close(); } catch { /* already failing */ }
+    throw error;
+  } finally { destroyAtlasCredential(credential); }
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try { await main(process.argv.slice(2), process.stdin, process.stdout); process.exit(0); }
+  catch (error) { process.stderr.write('Unable to complete the Atlas latency probe\nreason=' + (/^[a-z_]{3,48}$/.test(error?.code ?? '') ? error.code : 'unexpected') + '\n'); process.exit(1); }
+}

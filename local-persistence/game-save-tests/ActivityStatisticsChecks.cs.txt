@@ -1,0 +1,95 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class ActivityStatisticsChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static void Check(bool ok){if(!ok)throw new Exception("Activity statistics assertion failed");}
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly GameSaveService Save;
+        internal readonly string Owner=Id();
+        internal string Game="",Session="",Run="",Biome="ocean";
+        internal GameplayEventService Events=null!;
+        internal F(bool extension=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState());
+            Save.CreateLocalProfile(Id(),Owner,"Actividad sintética");NewGame();
+            if(extension){GameplayEventSchema.MigrateSynthetic(Db);Events=new(Db);}
+        }
+        internal void NewGame()
+        {
+            Game=Id();Save.CreateNewGame(new(Id(),Owner,Game));
+            for(int i=0;i<5;i++){var g=Save.LoadGame(Owner,Game).Game;Save.EnterBiome(new(Id(),Owner,Game,g.Revision,Biomes[i],"human"));g=Save.LoadGame(Owner,Game).Game;Save.RecordDecision(new(Id(),Id(),Owner,Game,g.Revision,Biomes[i],Keys[i],i%2==0?"reject":"approve",i%2==0?"healthy":"degraded",i%2==0?"{\"stateKind\":\"healthy\"}":"{\"stateKind\":\"degraded\"}"));}
+        }
+        internal void Start(){Session=Id();Events.RecordEvent(new(Id(),Owner,Session,GameplayEventKind.SESSION_STARTED,DateTimeOffset.UnixEpoch,0));}
+        internal void Animal(int index=0,long offset=0){Biome=Biomes[index];Run=Id();Events.RecordEvent(new(Run,Owner,Session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,DateTimeOffset.UnixEpoch.AddMilliseconds(offset),offset,Game,Biome,Run));}
+        internal GameplayEvent Event(GameplayEventKind kind,long offset)=>new(Id(),Owner,Session,kind,DateTimeOffset.UnixEpoch.AddMilliseconds(offset),offset,Game,Biome,Run);
+        internal void Interval(long start,long end,GameplayTimeState state=GameplayTimeState.ActiveAnimal)=>Events.RecordInterval(new(Id(),Owner,Session,start,end,state,Game,Biome,Run));
+        internal void Close(long offset)=>Events.RecordEvent(new(Id(),Owner,Session,GameplayEventKind.SESSION_ENDED,DateTimeOffset.UnixEpoch.AddMilliseconds(offset),offset,SessionEnd:GameplaySessionEnd.Normal));
+        internal StatisticsService Stats()=>new(new RuntimeMenuChecks.ReadOnlyFixture(Db.Path),RealGameCatalog.InitialState());
+        internal PlayerStatistics Player()=>Stats().GetPlayerStatistics(Owner);
+        internal ActivityStatistics Activity()=>Player().Activity!;
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work,bool extension=true)
+    {using var f=new F(extension);await work(f);_count++;Console.WriteLine("PASS "+name);}
+    public static async Task<int> Run()
+    {
+        await Case("base-only history remains NotAvailable not measured zero",f=>
+        {Check(f.Activity().Sessions.State==StatisticsAvailability.NotAvailable && f.Activity().EffectiveMs.Value is null && f.Player().AllDecisions.Total==5);return Task.CompletedTask;},false);
+        await Case("migrated history before capture has no coverage rather than zero deaths",f=>
+        {var a=f.Activity();Check(a.Sessions.State==StatisticsAvailability.NoData && a.Deaths.Value is null && a.EffectiveMs.Value is null && a.HistoricalCoverageUnknown);return Task.CompletedTask;});
+        await Case("closed session with complete intervals has complete recorded coverage",f=>
+        {f.Start();f.Animal();f.Interval(0,100);f.Close(100);var a=f.Activity();Check(a.Sessions.Value==1 && a.EffectiveMs.Value==100 && !a.Incomplete);return Task.CompletedTask;});
+        await Case("open session shows confirmed time and incomplete warning",f=>
+        {f.Start();f.Animal();f.Interval(0,100);var a=f.Activity();Check(a.EffectiveMs.Value==100 && a.Incomplete);Check(LocalStatisticsText.Render(new(StatisticsAvailability.Available,f.Player())).Contains("Cobertura incompleta"));return Task.CompletedTask;});
+        await Case("interrupted close never fills missing duration",f=>
+        {f.Start();f.Animal();f.Interval(0,100);f.Events.InterruptSession(f.Owner,f.Session,Id(),DateTimeOffset.UtcNow);Check(f.Activity().EffectiveMs.Value==100 && f.Activity().Incomplete);return Task.CompletedTask;});
+        await Case("several sessions add disjoint durations without duplicating sessions",f=>
+        {for(int n=0;n<3;n++){f.Start();f.Animal();f.Interval(0,100);f.Close(100);}Check(f.Activity().Sessions.Value==3 && f.Activity().EffectiveMs.Value==300);return Task.CompletedTask;});
+        await Case("confirmed death differs from retry and voluntary request",f=>
+        {f.Start();f.Animal();f.Events.RecordEvent(f.Event(GameplayEventKind.ANIMAL_DIED,10));f.Events.RecordEvent(f.Event(GameplayEventKind.ANIMAL_RETRY_REQUESTED,20));f.Animal(0,20);f.Events.RecordEvent(f.Event(GameplayEventKind.ANIMAL_RESTART_REQUESTED,30));var a=f.Activity();Check(a.Deaths.Value==1 && a.RetryRequests.Value==1 && a.RestartRequests.Value==1);return Task.CompletedTask;});
+        await Case("idempotent death is counted once in the visible aggregate",f=>
+        {f.Start();f.Animal();var death=f.Event(GameplayEventKind.ANIMAL_DIED,10);f.Events.RecordEvent(death);f.Events.RecordEvent(death);Check(f.Activity().Deaths.Value==1);return Task.CompletedTask;});
+        await Case("pause menu background Game Over and loading excluded",f=>
+        {f.Start();f.Animal();long offset=0;foreach(var state in new[]{GameplayTimeState.ActiveAnimal,GameplayTimeState.Paused,GameplayTimeState.Menu,GameplayTimeState.GameOver,GameplayTimeState.Loading,GameplayTimeState.Background}){f.Interval(offset,offset+100,state);offset+=100;}Check(f.Activity().EffectiveMs.Value==100);return Task.CompletedTask;});
+        for(int i=0;i<5;i++)
+        {int index=i;await Case("canonical biome subtotal "+Biomes[i],f=>
+        {f.Start();f.Animal(index);f.Interval(0,100+index);var a=f.Activity();Check(a.ByBiome.Single(b=>b.BiomeId==Biomes[index]).EffectiveMs.Value==100+index && a.ByBiome.Count(b=>b.EffectiveMs.Value is null)==4);return Task.CompletedTask;});}
+        await Case("all five biome totals sum to effective total",f=>
+        {f.Start();for(int i=0;i<5;i++){f.Animal(i,i*100);f.Interval(i*100,(i+1)*100);f.Events.RecordEvent(f.Event(GameplayEventKind.ANIMAL_SEGMENT_EXITED,(i+1)*100));}var a=f.Activity();Check(a.EffectiveMs.Value==500 && a.ByBiome.Sum(b=>b.EffectiveMs.Value??0)==500 && a.Sessions.Value==1);return Task.CompletedTask;});
+        await Case("measured zero is distinct from an unobserved biome",f=>
+        {f.Start();f.Animal();f.Interval(0,0);var a=f.Activity();Check(a.EffectiveMs.State==StatisticsAvailability.Available && a.EffectiveMs.Value==0 && a.ByBiome.Single(b=>b.BiomeId=="forest").EffectiveMs.State==StatisticsAvailability.NoData);return Task.CompletedTask;});
+        await Case("session alone does not invent zero animal deaths",f=>
+        {f.Start();Check(f.Activity().Sessions.Value==1 && f.Activity().Deaths.Value is null && f.Activity().EffectiveMs.Value is null);return Task.CompletedTask;});
+        await Case("active game and history activity remain separate",f=>
+        {
+            f.Start();f.Animal();f.Interval(0,100);f.Events.RecordEvent(f.Event(GameplayEventKind.ANIMAL_SEGMENT_EXITED,100));f.Close(100);
+            RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);f.NewGame();f.Start();f.Animal(1);f.Interval(0,200);f.Close(200);
+            var p=f.Player();Check(p.Activity?.EffectiveMs.Value==300 && p.ActiveGame?.Activity?.EffectiveMs.Value==200 && p.HistoricalActivity?.EffectiveMs.Value==100 && p.HistoricalGames.Single().Activity?.EffectiveMs.Value==100);return Task.CompletedTask;
+        });
+        await Case("queries preserve bytes times decisions environments and receipts",f=>
+        {f.Start();f.Animal();f.Interval(0,100);string h=f.Hash();long time=File.GetLastWriteTimeUtc(f.Db.Path).Ticks;string domain=SaveValidation.Digest(f.Save.LoadGame(f.Owner,f.Game));for(int i=0;i<3;i++){f.Player();f.Stats().GetGameStatistics(f.Owner,f.Game);}Check(f.Hash()==h && time==File.GetLastWriteTimeUtc(f.Db.Path).Ticks && domain==SaveValidation.Digest(f.Save.LoadGame(f.Owner,f.Game)));return Task.CompletedTask;});
+        await Case("activity view reuses plain text scope labels and retains existing sections",f=>
+        {f.Start();f.Animal();f.Interval(0,37614);string text=LocalStatisticsText.Render(new(StatisticsAvailability.Available,f.Player()));Check(text.Contains("37.614 s confirmados") && text.Contains("ACTIVIDAD LOCAL CONFIRMADA") && text.Contains("PARTIDA ACTUAL") && text.Contains("TODAS LAS PARTIDAS") && text.Contains("HISTORIAL") && text.Contains("anterior a la instrumentación es desconocida") && text.Contains("Solicitudes confirmadas de reintento") && !text.Contains(f.Owner) && !text.Contains(f.Session));return Task.CompletedTask;});
+        await Case("incompatible extension fails controlled without changing storage",f=>
+        {using(var c=f.Db.Open()){using var q=c.CreateCommand();q.CommandText="UPDATE gameplay_schema_migrations SET checksum='invalid';";q.ExecuteNonQuery();}string h=f.Hash();try{f.Player();throw new Exception("Expected schema error");}catch(SaveException e){Check(e.Code=="UNSUPPORTED_EVENT_SCHEMA");}Check(f.Hash()==h);return Task.CompletedTask;});
+        await Case("overlapping intervals rejected before read aggregation",f=>
+        {f.Start();f.Animal();f.Interval(0,100);try{f.Interval(50,150);throw new Exception("Expected overlap");}catch(SaveException e){Check(e.Code=="INTERVAL_OVERLAP");}Check(f.Activity().EffectiveMs.Value==100);return Task.CompletedTask;});
+        Check(typeof(StatisticsService).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "System.Net.Http" and not "GodotSharp" && !(a.Name??"").Contains("Mongo")));
+        _count++;Console.WriteLine("PASS local activity query contracts remain independent of HTTP MongoDB and Godot");
+        Console.WriteLine($"Activity statistics: {_count} passed, 0 failed; synthetic read-only SQLite and text presentation, not Godot runtime.");return 0;
+    }
+}

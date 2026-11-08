@@ -1,0 +1,161 @@
+using System;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+public static class SchemaManager
+{
+    public const int CurrentVersion = 2;
+    private const string Initial = """
+CREATE TABLE schema_migrations(version INTEGER NOT NULL PRIMARY KEY CHECK(version>0), migration_key TEXT NOT NULL UNIQUE, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);
+CREATE TABLE local_profiles(
+ local_player_id TEXT NOT NULL PRIMARY KEY, singleton_key INTEGER NOT NULL UNIQUE CHECK(singleton_key=1),
+ display_name TEXT NOT NULL CHECK(length(display_name)>0), revision INTEGER NOT NULL CHECK(revision>=0),
+ registration_status TEXT NOT NULL CHECK(registration_status IN('LOCAL_ONLY','REGISTRATION_PENDING','REGISTERED','RECOVERY_REQUIRED')),
+ registration_id TEXT UNIQUE, technical_account_id TEXT UNIQUE, internal_email TEXT, credential_ref TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ CHECK(registration_status!='LOCAL_ONLY' OR (registration_id IS NULL AND technical_account_id IS NULL AND internal_email IS NULL AND credential_ref IS NULL)),
+ CHECK(registration_status!='REGISTRATION_PENDING' OR (registration_id IS NOT NULL AND credential_ref IS NOT NULL AND technical_account_id IS NULL AND internal_email IS NULL)),
+ CHECK(registration_status!='REGISTERED' OR (registration_id IS NOT NULL AND technical_account_id IS NOT NULL AND internal_email IS NOT NULL AND credential_ref IS NOT NULL)));
+CREATE TABLE saved_games(
+ game_id TEXT NOT NULL PRIMARY KEY, local_player_id TEXT NOT NULL REFERENCES local_profiles(local_player_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+ is_current INTEGER NOT NULL CHECK(is_current IN(0,1)), status TEXT NOT NULL CHECK(status IN('in_progress','final_pending','completed','archived')),
+ revision INTEGER NOT NULL CHECK(revision>=0), save_format_version INTEGER NOT NULL CHECK(save_format_version>0), rules_version TEXT NOT NULL, content_version TEXT NOT NULL,
+ current_biome_id TEXT, resume_kind TEXT NOT NULL CHECK(resume_kind IN('menu','human_decision','decision_info','animal_start','animal_checkpoint','ending')),
+ checkpoint_key TEXT, ending TEXT CHECK(ending IN('good','medium','bad')), ending_rules_version TEXT,
+ created_at TEXT NOT NULL, saved_at TEXT NOT NULL, completed_at TEXT, archived_at TEXT,
+ UNIQUE(game_id,local_player_id), CHECK(is_current=0 OR status IN('in_progress','final_pending')),
+ CHECK(status!='final_pending' OR (ending IS NOT NULL AND ending_rules_version IS NOT NULL AND completed_at IS NOT NULL AND resume_kind='ending')),
+ CHECK(resume_kind NOT IN('animal_start','animal_checkpoint') OR (current_biome_id IS NOT NULL AND checkpoint_key IS NOT NULL)));
+CREATE UNIQUE INDEX ux_current_game ON saved_games(local_player_id) WHERE is_current=1;
+CREATE INDEX ix_games_profile_date ON saved_games(local_player_id,saved_at DESC);
+CREATE TABLE biome_progress(
+ game_id TEXT NOT NULL REFERENCES saved_games(game_id) ON DELETE RESTRICT ON UPDATE RESTRICT, biome_id TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN('human_pending','animal_pending','completed')), result TEXT CHECK(result IN('good','bad')),
+ attempt_number INTEGER NOT NULL CHECK(attempt_number>=0), human_completed_at TEXT, animal_completed_at TEXT, updated_at TEXT NOT NULL,
+ PRIMARY KEY(game_id,biome_id),
+ CHECK((status='human_pending' AND result IS NULL AND human_completed_at IS NULL AND animal_completed_at IS NULL)
+ OR (status='animal_pending' AND result IS NULL AND human_completed_at IS NOT NULL AND animal_completed_at IS NULL)
+ OR (status='completed' AND result IS NOT NULL AND human_completed_at IS NOT NULL AND animal_completed_at IS NOT NULL)));
+CREATE INDEX ix_biome_status ON biome_progress(game_id,status);
+CREATE TABLE biome_objectives(
+ game_id TEXT NOT NULL, biome_id TEXT NOT NULL, objective_key TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN('pending','completed')), completed_at TEXT, updated_at TEXT NOT NULL,
+ PRIMARY KEY(game_id,biome_id,objective_key),
+ FOREIGN KEY(game_id,biome_id) REFERENCES biome_progress(game_id,biome_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+ CHECK((status='pending' AND completed_at IS NULL) OR (status='completed' AND completed_at IS NOT NULL)));
+CREATE TABLE local_operations(
+ operation_id TEXT NOT NULL PRIMARY KEY, local_player_id TEXT NOT NULL REFERENCES local_profiles(local_player_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+ game_id TEXT, operation_kind TEXT NOT NULL, payload_digest TEXT NOT NULL CHECK(length(payload_digest)=64), result_revision INTEGER CHECK(result_revision>=0), committed_at TEXT NOT NULL,
+ FOREIGN KEY(game_id,local_player_id) REFERENCES saved_games(game_id,local_player_id) ON DELETE RESTRICT ON UPDATE RESTRICT);
+CREATE TABLE environmental_decisions(
+ decision_id TEXT NOT NULL PRIMARY KEY, game_id TEXT NOT NULL, biome_id TEXT NOT NULL, decision_key TEXT NOT NULL, option_id TEXT NOT NULL,
+ decision_order INTEGER NOT NULL CHECK(decision_order>0), consequences_json TEXT NOT NULL CHECK(json_valid(consequences_json)), consequences_version INTEGER NOT NULL CHECK(consequences_version>0),
+ rules_version TEXT NOT NULL, operation_id TEXT NOT NULL UNIQUE REFERENCES local_operations(operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT, occurred_at TEXT NOT NULL,
+ UNIQUE(game_id,decision_order), UNIQUE(game_id,biome_id,decision_id),
+ FOREIGN KEY(game_id,biome_id) REFERENCES biome_progress(game_id,biome_id) ON DELETE RESTRICT ON UPDATE RESTRICT);
+CREATE TABLE environmental_state(
+ game_id TEXT NOT NULL, biome_id TEXT NOT NULL, state_kind TEXT CHECK(state_kind IN('healthy','degraded')), last_decision_id TEXT,
+ payload_version INTEGER NOT NULL CHECK(payload_version>0), extensions_json TEXT NOT NULL CHECK(json_valid(extensions_json)), updated_at TEXT NOT NULL,
+ PRIMARY KEY(game_id,biome_id), FOREIGN KEY(game_id,biome_id) REFERENCES biome_progress(game_id,biome_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+ FOREIGN KEY(game_id,biome_id,last_decision_id) REFERENCES environmental_decisions(game_id,biome_id,decision_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+ CHECK((state_kind IS NULL AND last_decision_id IS NULL) OR (state_kind IS NOT NULL AND last_decision_id IS NOT NULL)));
+CREATE TABLE continuation_snapshots(
+ game_id TEXT NOT NULL PRIMARY KEY REFERENCES saved_games(game_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+ captured_revision INTEGER NOT NULL CHECK(captured_revision>=0), payload_version INTEGER NOT NULL CHECK(payload_version>0),
+ snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)), captured_at TEXT NOT NULL);
+CREATE TABLE local_settings(
+ local_player_id TEXT NOT NULL REFERENCES local_profiles(local_player_id) ON DELETE RESTRICT ON UPDATE RESTRICT, setting_key TEXT NOT NULL,
+ value_json TEXT NOT NULL CHECK(json_valid(value_json)), value_version INTEGER NOT NULL CHECK(value_version>0), updated_at TEXT NOT NULL,
+ PRIMARY KEY(local_player_id,setting_key));
+""";
+    private const string Indexes = """
+CREATE INDEX ix_decisions_biome_order ON environmental_decisions(game_id,biome_id,decision_order);
+CREATE INDEX ix_operations_game_date ON local_operations(game_id,committed_at);
+""";
+    public static string MigrationChecksum(int version)
+    {
+        var sql=version switch {1=>Initial,2=>Indexes,_=>throw new SaveException("UNSUPPORTED_SCHEMA")};
+        var bytes=Encoding.UTF8.GetBytes(sql.ReplaceLineEndings("\n"));
+        var digest=SHA256.HashData(bytes);
+        return Convert.ToHexString(digest).ToLowerInvariant();
+    }
+
+    private static long Scalar(SqliteConnection connection, string sql, SqliteTransaction? transaction = null)
+    {
+        using var command = connection.CreateCommand(); command.Transaction = transaction; command.CommandText = sql;
+        return Convert.ToInt64(command.ExecuteScalar());
+    }
+    public static int ReadVersion(ISaveDatabase database)
+    {
+        using var connection = database.Open();
+        return checked((int)Scalar(connection, "PRAGMA user_version;"));
+    }
+    public static void Initialize(ISaveDatabase database, int targetVersion = CurrentVersion, Action<int>? beforeCommit = null)
+    {
+        SaveValidation.Require(targetVersion is >= 1 and <= CurrentVersion, "UNSUPPORTED_SCHEMA");
+        try
+        {
+            using var connection = database.Open();
+            var current = checked((int)Scalar(connection, "PRAGMA user_version;"));
+            SaveValidation.Require(current <= targetVersion && current >= 0, "UNSUPPORTED_SCHEMA");
+            if (current == 0) SaveValidation.Require(Scalar(connection, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';") == 0, "UNSUPPORTED_SCHEMA");
+            else VerifyHistory(connection, current);
+            using (var configure = connection.CreateCommand())
+            {
+                configure.CommandText = "PRAGMA journal_mode=DELETE; SELECT json_valid('{}');";
+                configure.ExecuteNonQuery();
+            }
+            for (var next = current + 1; next <= targetVersion; next++)
+            {
+                using var transaction = connection.BeginTransaction(deferred: false);
+                using var command = connection.CreateCommand(); command.Transaction = transaction;
+                command.CommandText = next == 1 ? Initial : Indexes; command.ExecuteNonQuery();
+                command.CommandText = "INSERT INTO schema_migrations VALUES($version,$key,$checksum,$at);";
+                command.Parameters.AddWithValue("$version", next);
+                command.Parameters.AddWithValue("$key", next == 1 ? "initial-relational-schema" : "documented-query-indexes");
+                command.Parameters.AddWithValue("$checksum", MigrationChecksum(next));
+                command.Parameters.AddWithValue("$at", SaveValidation.Timestamp(DateTimeOffset.UtcNow));
+                command.ExecuteNonQuery(); command.Parameters.Clear();
+                command.CommandText = next == 1 ? "PRAGMA user_version=1;" : "PRAGMA user_version=2;"; command.ExecuteNonQuery();
+                beforeCommit?.Invoke(next);
+                transaction.Commit();
+            }
+        }
+        catch (SqliteException error) { throw StorageErrors.Map(error); }
+    }
+    private static void VerifyHistory(SqliteConnection connection, int version)
+    {
+        SaveValidation.Require(version is >= 1 and <= CurrentVersion, "UNSUPPORTED_SCHEMA");
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT version,checksum FROM schema_migrations ORDER BY version;";
+        using var reader = command.ExecuteReader();
+        var expected = 1;
+        while (reader.Read())
+        {
+            var actual = reader.GetInt32(0);
+            SaveValidation.Require(actual == expected && actual <= version && reader.GetString(1) == MigrationChecksum(actual), "UNSUPPORTED_SCHEMA");
+            expected++;
+        }
+        SaveValidation.Require(expected == version + 1, "UNSUPPORTED_SCHEMA");
+    }
+    public static void Verify(ISaveDatabase database)
+    {
+        try
+        {
+            using var connection = database.Open();
+            var version = checked((int)Scalar(connection, "PRAGMA user_version;"));
+            SaveValidation.Require(version == CurrentVersion, "UNSUPPORTED_SCHEMA");
+            VerifyHistory(connection, version);
+            using var command = connection.CreateCommand(); command.CommandText = "PRAGMA quick_check;";
+            SaveValidation.Require((string?)command.ExecuteScalar() == "ok", "CORRUPT_STORAGE");
+            command.CommandText = "PRAGMA foreign_key_check;";
+            using var reader = command.ExecuteReader();
+            SaveValidation.Require(!reader.Read(), "CORRUPT_STORAGE");
+        }
+        catch (SqliteException error) { throw StorageErrors.Map(error); }
+    }
+}

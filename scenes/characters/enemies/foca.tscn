@@ -1,0 +1,93 @@
+[gd_scene format=3 uid="uid://b3oawc4rlye0v"]
+
+[ext_resource type="Texture2D" uid="uid://cgvaasm8esa0f" path="res://assets/sprites/characters/enemies/ANIMACION FOCA.png" id="1_avuuq"]
+[ext_resource type="Script" uid="uid://d3yp18irtsr7x" path="res://scripts/enemies/NpcFoca.cs" id="1_mtrxa"]
+[ext_resource type="Script" uid="uid://e2hbk1y72d1r" path="res://scripts/globals/Hurtbox.cs" id="2_84dj4"]
+[ext_resource type="PackedScene" uid="uid://brjccjw4mabge" path="res://scenes/props/item_comida.tscn" id="2_pxrfe"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_84dj4"]
+atlas = ExtResource("1_avuuq")
+region = Rect2(0, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_mtrxa"]
+atlas = ExtResource("1_avuuq")
+region = Rect2(32, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_pxrfe"]
+atlas = ExtResource("1_avuuq")
+region = Rect2(64, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_lajfy"]
+atlas = ExtResource("1_avuuq")
+region = Rect2(0, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_5mp1m"]
+atlas = ExtResource("1_avuuq")
+region = Rect2(32, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_h4ld2"]
+atlas = ExtResource("1_avuuq")
+region = Rect2(64, 0, 32, 16)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_lajfy"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_84dj4")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_mtrxa")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_pxrfe")
+}],
+"loop": true,
+"name": &"idle",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_lajfy")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_5mp1m")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_h4ld2")
+}],
+"loop": true,
+"name": &"run",
+"speed": 5.0
+}]
+
+[sub_resource type="CapsuleShape2D" id="CapsuleShape2D_5mp1m"]
+radius = 6.0
+
+[sub_resource type="CapsuleShape2D" id="CapsuleShape2D_mtrxa"]
+radius = 7.0
+height = 32.0
+
+[node name="Foca" type="CharacterBody2D" unique_id=1523082198]
+collision_layer = 3
+script = ExtResource("1_mtrxa")
+EscenaComida = ExtResource("2_pxrfe")
+CantidadComidaSaludable = 2
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=2008091687]
+position = Vector2(0, -8)
+sprite_frames = SubResource("SpriteFrames_lajfy")
+animation = &"idle"
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=1347489244]
+position = Vector2(0, -8)
+rotation = 1.5707964
+shape = SubResource("CapsuleShape2D_5mp1m")
+
+[node name="Hurtbox" type="Area2D" parent="." unique_id=517206582]
+script = ExtResource("2_84dj4")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Hurtbox" unique_id=1369140435]
+position = Vector2(0, -8)
+rotation = -1.5707964
+shape = SubResource("CapsuleShape2D_mtrxa")
+debug_color = Color(0.95902747, 0, 0.5265665, 0.41960785)

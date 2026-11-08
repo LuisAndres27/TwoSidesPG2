@@ -1,0 +1,19 @@
+﻿<Project Sdk="Godot.NET.Sdk/4.6.1">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework Condition=" '$(GodotTargetPlatform)' == 'android' ">net9.0</TargetFramework>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <!-- Distribution builds must not disclose compiler/PDB paths. Debug checks keep their symbols. -->
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'ExportRelease' Or '$(Configuration)' == 'Release'">
+    <PathMap>$(MSBuildProjectDirectory)=/_/TwoSides</PathMap>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="local-persistence/src/TwoSides.LocalPersistence.csproj" />
+    <ProjectReference Include="local-persistence/sync-http/TwoSides.SyncHttp.csproj" />
+    <Compile Remove="local-persistence/**/*;integration/sqlite/.work/**/*" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,72 @@
+using System;
+using System.Collections.Generic;
+
+namespace TwoSides.LocalPersistence;
+
+internal sealed record SyncSourceCandidate(int Rank,string Id,SyncFact Fact);
+internal static class SyncFactInventory
+{
+    // Keyset pages are hints. Start a fresh pass after completion to discover earlier-key inserts/updates.
+    internal static IReadOnlyList<SyncSourceCandidate> Page(SQLiteRepository r,string owner,string origin,int rank,string after,int limit)
+    {
+        bool telemetry=r.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name GLOB 'gameplay_*';")>0;
+        if(telemetry)GameplayEventSchema.Verify(r);
+        const string games="SELECT 0 AS rank,game_id AS id,'game' AS kind,revision,NULL AS phase FROM saved_games WHERE local_player_id=$p";
+        const string events="""
+UNION ALL SELECT 1,session_id,'session',NULL,'open' FROM gameplay_sessions WHERE local_player_id=$p
+UNION ALL SELECT CASE WHEN kind='ANIMAL_SEGMENT_STARTED' THEN 2 ELSE 3 END,event_id,'event',NULL,NULL FROM gameplay_events
+ WHERE local_player_id=$p AND kind NOT IN('SESSION_STARTED','SESSION_ENDED')
+UNION ALL SELECT 4,interval_id,'interval',NULL,NULL FROM gameplay_intervals WHERE local_player_id=$p
+UNION ALL SELECT 5,session_id,'session',NULL,'terminal' FROM gameplay_sessions WHERE local_player_id=$p AND status IN('closed','interrupted')
+""";
+        using var q=r.Command("WITH facts AS ("+games+(telemetry?"\n"+events:"")+") SELECT rank,id,kind,revision,phase FROM facts WHERE rank>$rank OR (rank=$rank AND id>$after) ORDER BY rank,id LIMIT $limit;",
+            ("$p",owner),("$rank",rank),("$after",after),("$limit",limit));
+        using var data=q.ExecuteReader();var result=new List<SyncSourceCandidate>();
+        while(data.Read())
+        {
+            var kind=data.GetString(2) switch{"game"=>SyncFactKind.GameReport,"session"=>SyncFactKind.SessionReport,
+                "event"=>SyncFactKind.GameplayEvent,"interval"=>SyncFactKind.GameplayInterval,_=>throw new SaveException("INVALID_SYNC_FACT")};
+            result.Add(new(data.GetInt32(0),data.GetString(1),new(kind,data.GetString(1),
+                data.IsDBNull(3)?null:data.GetInt64(3),data.IsDBNull(4)?null:data.GetString(4),origin)));
+        }
+        return result.AsReadOnly();
+    }
+    internal static IReadOnlyList<SyncFact> Parents(SQLiteRepository r,string owner,SyncFact fact)
+    {
+        var result=new List<SyncFact>();
+        if(fact.Kind==SyncFactKind.GameReport)return result;
+        if(fact.Kind==SyncFactKind.SessionReport)
+        {if(fact.Phase=="terminal")result.Add(new(SyncFactKind.SessionReport,fact.SourceId,Phase:"open",Origin:fact.Origin));return result;}
+        GameplayEventSchema.Verify(r);var events=new GameplayEventRepository(r);
+        string session;string? game,run,biome;bool isStart=false;
+        if(fact.Kind==SyncFactKind.GameplayEvent)
+        {
+            var e=events.FindEvent(fact.SourceId)?.Event;
+            SaveValidation.Require(e is not null && e.LocalPlayerId==owner,"NOT_FOUND");
+            session=e!.SessionId;game=e.GameId;run=e.AnimalRunId;biome=e.BiomeId;isStart=e.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED;
+        }
+        else
+        {
+            using var q=r.Command("SELECT session_id,game_id,animal_run_id,biome_id FROM gameplay_intervals WHERE interval_id=$id AND local_player_id=$p;",("$id",fact.SourceId),("$p",owner));
+            using var d=q.ExecuteReader();SaveValidation.Require(d.Read(),"NOT_FOUND");
+            session=d.GetString(0);game=d.IsDBNull(1)?null:d.GetString(1);run=d.IsDBNull(2)?null:d.GetString(2);biome=d.IsDBNull(3)?null:d.GetString(3);
+        }
+        var sourceSession=events.Session(session);
+        SaveValidation.Require(sourceSession is not null && sourceSession.LocalPlayerId==owner,"SOURCE_DEPENDENCY_MISSING");
+        result.Add(new(SyncFactKind.SessionReport,session,Phase:"open",Origin:fact.Origin));
+        if(game is not null)
+        {
+            var g=r.Game(owner,game);SaveValidation.Require(g is not null,"SOURCE_DEPENDENCY_MISSING");
+            result.Add(new(SyncFactKind.GameReport,game,g!.Revision,Origin:fact.Origin));
+        }
+        if(run is not null && !isStart)
+        {
+            var start=events.FindEvent(run)?.Event;
+            SaveValidation.Require(start is not null && start.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED &&
+                start.LocalPlayerId==owner && start.SessionId==session && start.GameId==game && start.BiomeId==biome,"SOURCE_DEPENDENCY_MISSING");
+            result.Add(new(SyncFactKind.GameplayEvent,run,Origin:fact.Origin));
+        }
+        return result.AsReadOnly();
+    }
+}
+

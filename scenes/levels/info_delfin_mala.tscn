@@ -1,0 +1,41 @@
+[gd_scene format=3 uid="uid://dko6gyt42ocj1"]
+
+[ext_resource type="Script" uid="uid://f44yi7xnypk6" path="res://scripts/InfoDecision.cs" id="1_7roet"]
+
+[node name="InfoMala" type="Control" unique_id=964135740]
+layout_mode = 3
+anchors_preset = 0
+script = ExtResource("1_7roet")
+Texto = "Tirar limpiadores químicos o aceite de motor por el desagüe o en vertederos ilegales hace que la basura sea arrastrada al mar. Estos desechos químicos destruyen el hábitat marino y provocan el blanqueamiento de los corales."
+EscenaSiguiente = "uid://dj4xevqgif1t2"
+metadata/_edit_vertical_guides_ = [326.0]
+
+[node name="Fondo" type="ColorRect" parent="." unique_id=683321040]
+layout_mode = 0
+offset_right = 647.0
+offset_bottom = 369.0
+color = Color(0, 0, 0, 1)
+
+[node name="Titulo" type="Label" parent="." unique_id=1514477661]
+layout_mode = 0
+offset_left = 215.0
+offset_top = 5.0
+offset_right = 437.0
+offset_bottom = 28.0
+text = "Bioma Océano: consecuencia"
+
+[node name="Texto" type="RichTextLabel" parent="." unique_id=1935541013]
+layout_mode = 0
+offset_left = 74.0
+offset_top = 108.0
+offset_right = 600.0
+offset_bottom = 273.0
+scroll_active = false
+
+[node name="Continuar" type="Label" parent="." unique_id=4038731]
+layout_mode = 0
+offset_left = 245.0
+offset_top = 319.0
+offset_right = 409.0
+offset_bottom = 342.0
+text = "Clic para continuar ▼"

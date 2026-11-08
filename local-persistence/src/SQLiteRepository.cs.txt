@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+public sealed class SQLiteRepository
+{
+    public SqliteConnection Connection { get; }
+    public SqliteTransaction Transaction { get; }
+    public SQLiteRepository(SqliteConnection connection, SqliteTransaction transaction) { Connection = connection; Transaction = transaction; }
+    public SqliteCommand Command(string sql, params (string Key, object? Value)[] values)
+    {
+        var command = Connection.CreateCommand(); command.Transaction = Transaction; command.CommandText = sql;
+        foreach (var (key, value) in values) command.Parameters.AddWithValue(key, value ?? DBNull.Value);
+        return command;
+    }
+    public int Execute(string sql, params (string, object?)[] values) { using var cmd = Command(sql, values); return cmd.ExecuteNonQuery(); }
+    public long Number(string sql, params (string, object?)[] values) { using var cmd = Command(sql, values); return Convert.ToInt64(cmd.ExecuteScalar()); }
+    private List<T> Rows<T>(string sql, Func<SqliteDataReader, T> map, params (string, object?)[] values)
+    {
+        using var cmd = Command(sql, values); using var reader = cmd.ExecuteReader(); var result = new List<T>();
+        while (reader.Read()) result.Add(map(reader)); return result;
+    }
+    private static string S(SqliteDataReader r, string key) => r.GetString(r.GetOrdinal(key));
+    private static string? N(SqliteDataReader r, string key) => r.IsDBNull(r.GetOrdinal(key)) ? null : S(r, key);
+    private static long L(SqliteDataReader r, string key) => r.GetInt64(r.GetOrdinal(key));
+    private static long? NL(SqliteDataReader r, string key) => r.IsDBNull(r.GetOrdinal(key)) ? null : L(r, key);
+    public LocalProfile? Profile() => Rows("SELECT * FROM local_profiles WHERE singleton_key=1;", r => new LocalProfile(
+        S(r,"local_player_id"),S(r,"display_name"),L(r,"revision"),S(r,"registration_status"),S(r,"created_at"),S(r,"updated_at"),N(r,"registration_id"),N(r,"technical_account_id"),N(r,"internal_email"),N(r,"credential_ref"))).SingleOrDefault();
+    public SaveReceipt? Receipt(string operation) => Rows("SELECT * FROM local_operations WHERE operation_id=$id;", r => new SaveReceipt(
+        S(r,"operation_id"),S(r,"local_player_id"),N(r,"game_id"),S(r,"operation_kind"),S(r,"payload_digest"),NL(r,"result_revision"),S(r,"committed_at")),("$id",operation)).SingleOrDefault();
+    private static SavedGame MapGame(SqliteDataReader r) => new(S(r,"game_id"),S(r,"local_player_id"),L(r,"is_current")==1,
+        S(r,"status"),L(r,"revision"),(int)L(r,"save_format_version"),S(r,"rules_version"),S(r,"content_version"),N(r,"current_biome_id"),S(r,"resume_kind"),N(r,"checkpoint_key"),S(r,"created_at"),S(r,"saved_at"),N(r,"ending"),N(r,"ending_rules_version"),N(r,"completed_at"),N(r,"archived_at"));
+    public SavedGame? Game(string owner, string game) => Rows("SELECT * FROM saved_games WHERE local_player_id=$p AND game_id=$g;", MapGame,("$p",owner),("$g",game)).SingleOrDefault();
+    public SavedGame? CurrentGame(string owner) => Rows("SELECT * FROM saved_games WHERE local_player_id=$p AND is_current=1;", MapGame,("$p",owner)).SingleOrDefault();
+    public IReadOnlyList<SavedGame> Games(string owner, int offset, int limit) => Rows(
+        "SELECT * FROM saved_games WHERE local_player_id=$p ORDER BY created_at DESC,game_id DESC LIMIT $limit OFFSET $offset;",
+        MapGame,("$p",owner),("$limit",limit),("$offset",offset));
+    public IReadOnlyList<BiomeProgress> Biomes(string game) => Rows("SELECT * FROM biome_progress WHERE game_id=$g ORDER BY biome_id;", r => new BiomeProgress(
+        S(r,"game_id"),S(r,"biome_id"),S(r,"status"),N(r,"result"),(int)L(r,"attempt_number"),N(r,"human_completed_at"),N(r,"animal_completed_at"),S(r,"updated_at")),("$g",game));
+    public IReadOnlyList<EnvironmentalState> Environments(string game) => Rows("SELECT * FROM environmental_state WHERE game_id=$g ORDER BY biome_id;", r => new EnvironmentalState(
+        S(r,"game_id"),S(r,"biome_id"),N(r,"state_kind"),N(r,"last_decision_id"),(int)L(r,"payload_version"),S(r,"extensions_json"),S(r,"updated_at")),("$g",game));
+    public IReadOnlyList<BiomeObjective> Objectives(string game) => Rows("SELECT * FROM biome_objectives WHERE game_id=$g ORDER BY biome_id,objective_key;", r => new BiomeObjective(
+        S(r,"game_id"),S(r,"biome_id"),S(r,"objective_key"),S(r,"status"),N(r,"completed_at"),S(r,"updated_at")),("$g",game));
+    public IReadOnlyList<EnvironmentalDecision> Decisions(string game, string? biome = null, long after = 0, int limit = 100) => Rows(
+        "SELECT * FROM environmental_decisions WHERE game_id=$g AND ($b IS NULL OR biome_id=$b) AND decision_order>$after ORDER BY decision_order LIMIT $limit;", r => new EnvironmentalDecision(
+        S(r,"decision_id"),S(r,"game_id"),S(r,"biome_id"),S(r,"decision_key"),S(r,"option_id"),L(r,"decision_order"),S(r,"consequences_json"),(int)L(r,"consequences_version"),S(r,"rules_version"),S(r,"operation_id"),S(r,"occurred_at")),("$g",game),("$b",biome),("$after",after),("$limit",limit));
+    public ContinuationSnapshot? Snapshot(string game) => Rows("SELECT * FROM continuation_snapshots WHERE game_id=$g;", r => new ContinuationSnapshot(
+        S(r,"game_id"),L(r,"captured_revision"),(int)L(r,"payload_version"),S(r,"snapshot_json"),S(r,"captured_at")),("$g",game)).SingleOrDefault();
+    public LocalSetting? Setting(string owner, string key) => Rows("SELECT * FROM local_settings WHERE local_player_id=$p AND setting_key=$k;", r => new LocalSetting(
+        S(r,"local_player_id"),S(r,"setting_key"),S(r,"value_json"),(int)L(r,"value_version"),S(r,"updated_at")),("$p",owner),("$k",key)).SingleOrDefault();
+
+    public void InsertProfile(LocalProfile p) => Execute("INSERT INTO local_profiles(local_player_id,singleton_key,display_name,revision,registration_status,created_at,updated_at) VALUES($p,1,$name,0,'LOCAL_ONLY',$at,$at);",("$p",p.LocalPlayerId),("$name",p.DisplayName),("$at",p.CreatedAt));
+    public void Rename(string owner, string name, long expected, string at)
+    {
+        SaveValidation.Require(Execute("UPDATE local_profiles SET display_name=$name,revision=revision+1,updated_at=$at WHERE local_player_id=$p AND revision=$rev;",("$name",name),("$at",at),("$p",owner),("$rev",expected))==1,"REVISION_CONFLICT");
+    }
+    public void InsertReceipt(SaveReceipt r) => Execute("INSERT INTO local_operations VALUES($id,$p,$g,$kind,$digest,$revision,$at);",("$id",r.OperationId),("$p",r.LocalPlayerId),("$g",r.GameId),("$kind",r.OperationKind),("$digest",r.PayloadDigest),("$revision",r.ResultRevision),("$at",r.CommittedAt));
+    public void InsertGame(SavedGame g) => Execute("""
+INSERT INTO saved_games(game_id,local_player_id,is_current,status,revision,save_format_version,rules_version,content_version,current_biome_id,resume_kind,checkpoint_key,created_at,saved_at)
+VALUES($g,$p,1,'in_progress',0,1,$rules,$content,NULL,'menu',NULL,$at,$at);
+""",("$g",g.GameId),("$p",g.LocalPlayerId),("$rules",g.RulesVersion),("$content",g.ContentVersion),("$at",g.CreatedAt));
+    public void UpdateGame(SavedGame g, long expected) => SaveValidation.Require(Execute("""
+UPDATE saved_games SET is_current=$current,status=$status,revision=$revision,current_biome_id=$biome,resume_kind=$resume,checkpoint_key=$checkpoint,saved_at=$at,archived_at=$archive
+WHERE game_id=$g AND local_player_id=$p AND revision=$expected;
+""",("$current",g.IsCurrent?1:0),("$status",g.Status),("$revision",g.Revision),("$biome",g.CurrentBiomeId),("$resume",g.ResumeKind),("$checkpoint",g.CheckpointKey),("$at",g.SavedAt),("$archive",g.ArchivedAt),("$g",g.GameId),("$p",g.LocalPlayerId),("$expected",expected))==1,"REVISION_CONFLICT");
+    public void PrepareFinal(SavedGame g,long expected) => SaveValidation.Require(Execute("""
+UPDATE saved_games SET status='final_pending',revision=$r,current_biome_id=NULL,resume_kind='ending',checkpoint_key=NULL,
+ending=$ending,ending_rules_version=$rules,completed_at=$at,saved_at=$at
+WHERE game_id=$g AND local_player_id=$p AND revision=$expected AND is_current=1 AND status='in_progress';
+""",("$r",g.Revision),("$ending",g.Ending),("$rules",g.EndingRulesVersion),("$at",g.SavedAt),("$g",g.GameId),("$p",g.LocalPlayerId),("$expected",expected))==1,"REVISION_CONFLICT");
+    public void PutBiome(BiomeProgress b)
+    {
+        SaveValidation.Require(Number("SELECT count(*) FROM biome_progress WHERE game_id=$g AND biome_id=$b AND status='completed';",("$g",b.GameId),("$b",b.BiomeId))==0,"BIOME_COMPLETED");
+        Execute("""
+INSERT INTO biome_progress VALUES($g,$b,$status,$result,$attempt,$human,$animal,$at)
+ON CONFLICT(game_id,biome_id) DO UPDATE SET status=excluded.status,result=excluded.result,attempt_number=excluded.attempt_number,human_completed_at=excluded.human_completed_at,animal_completed_at=excluded.animal_completed_at,updated_at=excluded.updated_at;
+""",("$g",b.GameId),("$b",b.BiomeId),("$status",b.Status),("$result",b.Result),("$attempt",b.AttemptNumber),("$human",b.HumanCompletedAt),("$animal",b.AnimalCompletedAt),("$at",b.UpdatedAt));
+    }
+    public void PutEnvironment(EnvironmentalState e) => Execute("""
+INSERT INTO environmental_state VALUES($g,$b,$state,$decision,$version,$json,$at)
+ON CONFLICT(game_id,biome_id) DO UPDATE SET state_kind=excluded.state_kind,last_decision_id=excluded.last_decision_id,payload_version=excluded.payload_version,extensions_json=excluded.extensions_json,updated_at=excluded.updated_at;
+""",("$g",e.GameId),("$b",e.BiomeId),("$state",e.StateKind),("$decision",e.LastDecisionId),("$version",e.PayloadVersion),("$json",e.ExtensionsJson),("$at",e.UpdatedAt));
+    public void PutSnapshot(ContinuationSnapshot s) => Execute("""
+INSERT INTO continuation_snapshots VALUES($g,$revision,$version,$json,$at)
+ON CONFLICT(game_id) DO UPDATE SET captured_revision=excluded.captured_revision,payload_version=excluded.payload_version,snapshot_json=excluded.snapshot_json,captured_at=excluded.captured_at;
+""",("$g",s.GameId),("$revision",s.CapturedRevision),("$version",s.PayloadVersion),("$json",s.SnapshotJson),("$at",s.CapturedAt));
+    public bool HasDecision(string game,string biome,string key) => Number(
+        "SELECT count(*) FROM environmental_decisions WHERE game_id=$g AND biome_id=$b AND decision_key=$key;",
+        ("$g",game),("$b",biome),("$key",key))>0;
+    public void InsertDecision(EnvironmentalDecision d)
+    {
+        SaveValidation.Require(!HasDecision(d.GameId,d.BiomeId,d.DecisionKey),"DECISION_CONFLICT");
+        Execute("INSERT INTO environmental_decisions VALUES($id,$g,$b,$key,$option,$order,$json,$version,$rules,$op,$at);",("$id",d.DecisionId),("$g",d.GameId),("$b",d.BiomeId),("$key",d.DecisionKey),("$option",d.OptionId),("$order",d.DecisionOrder),("$json",d.ConsequencesJson),("$version",d.ConsequencesVersion),("$rules",d.RulesVersion),("$op",d.OperationId),("$at",d.OccurredAt));
+    }
+    public void PutSetting(LocalSetting s) => Execute("""
+INSERT INTO local_settings VALUES($p,$key,$json,$version,$at)
+ON CONFLICT(local_player_id,setting_key) DO UPDATE SET value_json=excluded.value_json,value_version=excluded.value_version,updated_at=excluded.updated_at;
+""",("$p",s.LocalPlayerId),("$key",s.SettingKey),("$json",s.ValueJson),("$version",s.ValueVersion),("$at",s.UpdatedAt));
+}

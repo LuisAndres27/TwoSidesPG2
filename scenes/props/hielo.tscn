@@ -1,0 +1,26 @@
+[gd_scene format=3 uid="uid://bn7qbj52p3s6q"]
+
+[ext_resource type="Texture2D" uid="uid://c02xvu0n47xc8" path="res://assets/sprites/fondos/props/HIELO FLOTANTE GRANDE 2.png" id="1_jtf1b"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_j12vv"]
+size = Vector2(64, 13)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_efvp8"]
+size = Vector2(62, 10)
+
+[node name="Hielo" type="AnimatableBody2D" unique_id=310026114]
+
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=1112633376]
+texture = ExtResource("1_jtf1b")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=1102484378]
+position = Vector2(0, -1.5)
+shape = SubResource("RectangleShape2D_j12vv")
+
+[node name="Area2D" type="Area2D" parent="." unique_id=2011368568]
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Area2D" unique_id=938134894]
+position = Vector2(0, -5)
+shape = SubResource("RectangleShape2D_efvp8")
+
+[node name="Timer" type="Timer" parent="." unique_id=482506409]

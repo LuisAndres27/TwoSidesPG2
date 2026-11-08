@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.npm-cache/
+.tmp/
+tmp/
+*.tmp
+*.log
+coverage/
+.nyc_output/
+
+# Never commit local secret backups or secret material.
+Respaldo_ENV/
+*.pem
+*.key
+.env.*.local
+*authorization*.json
+*-integrity-manifest*.json
+*.sqlite
+*.sqlite3
+*.db
+*.secret
+*.bak

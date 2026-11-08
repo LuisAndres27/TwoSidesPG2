@@ -1,0 +1,136 @@
+// verify-synthetic-run.mjs.template — ONE-SHOT, READ-ONLY verification of the synthetic run of B30 BY IDENTIFIER (B31). NOT run by the repository, NOT part of src/.
+// It answers: is operation <operationId> persisted exactly once, with a valid receipt, and did the run leave exactly the documents B29 predicts?
+// Reads (and nothing else): connectionStatus, then `find` by identifier on the six collections of ONE technical account:
+//   main_v2_identities (by registrationId) · main_v2_ownerGuards (_id) · main_v2_identitySessions (technicalAccountId) · main_v2_operations (technicalAccountId)
+//   main_v2_facts (scope) · main_v2_fences (_id "ingestion-v1:<T>") · main_v2_revocations (technicalAccountId, ids only).
+// Projections EXCLUDE every secret field (credentialVerifier, tokenHash). There is no write, no create, no index change, no command other than connectionStatus,
+// no read of documents of other accounts, no read of the historical collections, no use of the HTTP API (so it creates NO session and bumps NO guard/fence).
+// Copy it OUTSIDE the project (e.g. %LOCALAPPDATA%\TwoSidesSyntheticRun\verify.mjs). Run it ONLY through run-verify-synthetic.ps1 (hidden password prompt) and ONLY with
+// the owner's explicit authorization; it needs a fresh inspection-format authorization file (a single use, <= 60 minutes) generated with
+// scripts/new-main-inspection-authorization.js rotated-backend. The password never appears in arguments, environment, files or output.
+import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const NS = 'main_v2_';
+export const ALLOWED = Object.freeze({
+  identities: ['registrationId'], ownerGuards: ['_id'], identitySessions: ['technicalAccountId'], operations: ['technicalAccountId'],
+  facts: ['scope'], fences: ['_id'], revocations: ['technicalAccountId'],
+});
+const SECRET_FIELDS = /^(credentialVerifier|tokenHash|credential|password|token)$/i;
+
+// `reader(name, filter, projection)` is the ONLY access to the database: it is a function that performs a bounded find (limit <= 5).
+export function guardedReader(db) {
+  return async (name, filter, projection) => {
+    if (!Object.hasOwn(ALLOWED, name)) throw new Error('collection_not_allowed');
+    const keys = Object.keys(filter ?? {});
+    if (keys.length !== 1 || !ALLOWED[name].includes(keys[0]) || typeof filter[keys[0]] !== 'string') throw new Error('filter_not_allowed');
+    if (Object.keys(projection ?? {}).some(k => SECRET_FIELDS.test(k.split('.').pop())) || !projection || Object.keys(projection).length === 0) throw new Error('projection_not_allowed');
+    return db.collection(NS + name).find(filter, { projection }).limit(5).toArray();
+  };
+}
+
+// expected = { technicalAccountId, registrationId, installationId, localPlayerId, operationId, payloadHash, factDigest, sourceKey, guardRevision (optional) }
+export async function verifySyntheticRun(read, expected) {
+  for (const k of ['technicalAccountId', 'registrationId', 'installationId', 'localPlayerId', 'operationId']) if (!UUID.test(expected?.[k] ?? '')) throw new Error('expected_invalid');
+  const T = expected.technicalAccountId, scope = [T, expected.installationId, expected.localPlayerId, 1].join(':');
+  const rows = {
+    identities: await read('identities', { registrationId: expected.registrationId }, { technicalAccountId: 1, registrationId: 1, installationId: 1, localPlayerId: 1, bindingGeneration: 1, credentialVersion: 1, authzVersion: 1, active: 1, linked: 1, role: 1, createdAt: 1 }),
+    ownerGuards: await read('ownerGuards', { _id: T }, { revision: 1 }),
+    identitySessions: await read('identitySessions', { technicalAccountId: T }, { sessionId: 1, technicalAccountId: 1, bindingGeneration: 1, createdAt: 1, expiresAt: 1, revoked: 1 }),
+    operations: await read('operations', { technicalAccountId: T }, { operationId: 1, scope: 1, technicalAccountId: 1, authorizationDecision: 1, 'record.factKey': 1, 'record.payloadHash': 1, 'record.dependencies': 1, 'record.receivedAtUtc': 1, 'record.receipt': 1 }),
+    facts: await read('facts', { scope }, { scope: 1, sourceKey: 1, 'record.factDigest': 1, 'record.type': 1, 'record.sourceId': 1, 'record.gameId': 1 }),
+    fences: await read('fences', { _id: 'ingestion-v1:' + T }, { revision: 1 }),
+    revocations: await read('revocations', { technicalAccountId: T }, { _id: 1 }),
+  };
+  const id = rows.identities[0], guard = rows.ownerGuards[0], op = rows.operations[0], rec = op?.record, receipt = rec?.receipt, fact = rows.facts[0], fence = rows.fences[0], session = rows.identitySessions[0];
+  const checks = {
+    identity_single: rows.identities.length === 1,
+    identity_matches: !!id && id._id === T && id.technicalAccountId === T && id.installationId === expected.installationId && id.localPlayerId === expected.localPlayerId && id.bindingGeneration === 1 && id.active === true && id.linked === true && id.role === 'player',
+    guard_single: rows.ownerGuards.length === 1,
+    session_single: rows.identitySessions.length === 1,
+    session_matches: !!session && session.technicalAccountId === T && session.revoked === false,
+    operation_single: rows.operations.length === 1,
+    operation_id: !!op && op.operationId === expected.operationId && op._id === T + ':' + expected.operationId,
+    operation_scope: !!op && op.scope === scope && op.technicalAccountId === T,
+    receipt_present: !!receipt,
+    receipt_accepted_as_committed: receipt?.acceptedAs === 'committed',
+    receipt_binds_operation: !!receipt && receipt.operationId === expected.operationId && receipt.technicalAccountId === T && receipt.installationId === expected.installationId && receipt.localPlayerId === expected.localPlayerId && receipt.bindingGeneration === 1,
+    receipt_payload_hash: !!receipt && receipt.payloadHash === expected.payloadHash && rec?.payloadHash === expected.payloadHash,
+    receipt_ids_valid: !!receipt && UUID.test(receipt.receiptId ?? '') && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(receipt.committedAtUtc ?? ''),
+    operation_no_dependencies: Array.isArray(rec?.dependencies) && rec.dependencies.length === 0,
+    fact_single: rows.facts.length === 1,
+    fact_digest: !!fact && fact.record?.factDigest === expected.factDigest && fact.record?.type === 'session.report',
+    fact_key: !!fact && fact.sourceKey === expected.sourceKey && fact._id === scope + '|' + expected.sourceKey && rec?.factKey === fact._id,
+    authorization_decision: !!op && op.authorizationDecision?.owner === T && Number.isSafeInteger(op.authorizationDecision?.revision) && op.authorizationDecision.revision >= 1,
+    fence_present: !!fence && Number.isSafeInteger(fence.revision) && fence.revision >= 1,
+    revocations_none: rows.revocations.length === 0,
+  };
+  // Informative (not pass/fail): after register(0) + session(+1) + ONE committed sync transaction(+1) the guard is 2 and the owner fence 1; each extra transaction (e.g. a re-send) adds 1 to both.
+  const failed = Object.entries(checks).filter(([, ok]) => !ok).map(([name]) => name);
+  return Object.freeze({
+    verdict: failed.length === 0 ? 'consistent' : 'inconsistent', failed,
+    counts: Object.fromEntries(Object.entries(rows).map(([k, v]) => [k, v.length])),
+    receipt: receipt ? { acceptedAs: receipt.acceptedAs, receiptId: receipt.receiptId, committedAtUtc: receipt.committedAtUtc, payloadHash: receipt.payloadHash } : null,
+    guardRevision: Number.isSafeInteger(guard?.revision) ? guard.revision : null, fenceRevision: Number.isSafeInteger(fence?.revision) ? fence.revision : null,
+    authorizationRevision: op?.authorizationDecision?.revision ?? null,
+    revisionsConsistentWithOneCommit: guard?.revision === 2 && fence?.revision === 1 && op?.authorizationDecision?.revision === 2,
+    checks,
+  });
+}
+
+// ---- runner (only when executed directly through the PowerShell launcher) ---------------------------------------------------------------------------------
+const fail = code => { const e = new Error('verification unavailable'); e.code = code; throw e; };
+function parseArgs(argv) {
+  const names = { '--enable-synthetic-verification': false, '--authorization': true, '--run-dir': true, '--account': true, '--backend': true }, v = new Map();
+  for (let i = 0; i < argv.length; i++) {
+    if (!Object.hasOwn(names, argv[i]) || v.has(argv[i])) fail('arguments_rejected');
+    if (names[argv[i]]) { const x = argv[++i]; if (typeof x !== 'string' || x.startsWith('--')) fail('arguments_rejected'); v.set(argv[i - 1], x); } else v.set(argv[i], true);
+  }
+  if (v.get('--enable-synthetic-verification') !== true) fail('not_enabled');
+  for (const k of ['--authorization', '--run-dir', '--account', '--backend']) if (!v.has(k)) fail('arguments_rejected');
+  return Object.fromEntries([...v].map(([k, x]) => [k.slice(2), x]));
+}
+export async function main(argv, stdin, stdout) {
+  const a = parseArgs(argv);
+  if (!stdin || stdin.isTTY || !path.isAbsolute(a.backend) || !path.isAbsolute(a['run-dir']) || !path.isAbsolute(a.authorization) || !UUID.test(a.account)) fail('arguments_rejected');
+  const src = rel => import(pathToFileURL(path.join(a.backend, 'src', rel)).href);
+  const { parseInspectionAuthorization } = await src('main/inspection-authorization.js');
+  const { inspectionConnector, assertInspectionConnection, verifyInspectionPermissions } = await src('main/inspection.js');
+  const { MAIN_AUTH_MECHANISM, MAIN_TARGET, MAIN_URI } = await src('main/policy.js');
+  const { receiveAtlasCredential, consumeAtlasCredential, destroyAtlasCredential } = await src('modules/sync/atlas-credentials.js');
+  const stat = fs.lstatSync(a.authorization); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) fail('authorization_invalid');
+  const authorization = parseInspectionAuthorization(fs.readFileSync(a.authorization, 'utf8'), Date.now());
+  const marker = path.join(path.dirname(a.authorization), authorization.executionId + '.verification.json');
+  const ids = JSON.parse(fs.readFileSync(path.join(a['run-dir'], 'run-ids.json'), 'utf8')), batch = JSON.parse(fs.readFileSync(path.join(a['run-dir'], 'batch.json'), 'utf8'));
+  const expected = { technicalAccountId: a.account, registrationId: ids.registrationId, installationId: ids.installationId, localPlayerId: ids.localPlayerId, operationId: ids.operationId,
+    payloadHash: batch.operations[0].payloadHash, factDigest: ids.factDigest, sourceKey: ids.sourceKey };
+  if (batch.operations.length !== 1 || batch.operations[0].operationId !== ids.operationId) fail('run_inconsistent');
+  let credential; try { credential = await receiveAtlasCredential(stdin); } catch { fail('credential_required'); }
+  let mongoose; try { mongoose = createRequire(path.join(a.backend, 'package.json'))('mongoose'); } catch { destroyAtlasCredential(credential); fail('dependencies_missing'); }
+  try { fs.writeFileSync(marker, JSON.stringify({ kind: 'synthetic-run-verification', executionId: authorization.executionId, startedAt: new Date().toISOString(), note: 'No secrets.' }), { flag: 'wx' }); }
+  catch { destroyAtlasCredential(credential); fail('authorization_consumed'); }
+  let connection;
+  try {
+    const pass = consumeAtlasCredential(credential);
+    connection = await inspectionConnector(mongoose, authorization.user)(MAIN_URI, { dbName: MAIN_TARGET.database, user: authorization.user, pass, authSource: 'admin', authMechanism: MAIN_AUTH_MECHANISM,
+      tls: true, tlsAllowInvalidCertificates: false, tlsAllowInvalidHostnames: false, directConnection: false, readPreference: 'primary', retryWrites: false,
+      maxPoolSize: 1, minPoolSize: 0, serverSelectionTimeoutMS: 10000, connectTimeoutMS: 10000, socketTimeoutMS: 15000, waitQueueTimeoutMS: 2000,
+      autoIndex: false, autoCreate: false, bufferCommands: false, monitorCommands: false, appName: 'TwoSides-SyntheticVerification' });
+    assertInspectionConnection(connection, authorization.user);
+    verifyInspectionPermissions(await connection.db.command({ connectionStatus: 1, showPrivileges: true }), authorization);
+    const report = await verifySyntheticRun(guardedReader(connection.db), expected);
+    await connection.close(); connection = null;
+    stdout.write(JSON.stringify({ syntheticRunVerification: 'finished', executionId: authorization.executionId, technicalAccountId: a.account, operationId: ids.operationId, writes: 0, ...report, closed: true }) + '\n');
+    fs.writeFileSync(marker, JSON.stringify({ kind: 'synthetic-run-verification', executionId: authorization.executionId, finishedAt: new Date().toISOString(), verdict: report.verdict, note: 'No secrets.' }));
+  } catch (error) {
+    if (connection) try { await connection.close(); } catch { /* already failing */ }
+    throw error;
+  } finally { destroyAtlasCredential(credential); }
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try { await main(process.argv.slice(2), process.stdin, process.stdout); process.exit(0); }
+  catch (error) { process.stderr.write('Unable to complete the synthetic run verification\nreason=' + (/^[a-z_]{3,48}$/.test(error?.code ?? '') ? error.code : 'unexpected') + '\n'); process.exit(1); }
+}

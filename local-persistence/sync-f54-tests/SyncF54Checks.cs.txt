@@ -1,0 +1,360 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+using TwoSides.Integration.SyncHttp;
+
+// B54: owner-quota handling of the synchronization client, WITHOUT any server process. The HTTP side is an in-process HttpMessageHandler that answers exactly like the real
+// Sync v2 service does for an exhausted owner quota (batch answer with per-operation error code "quota_exceeded") and for the rate limiter (error envelope, no "results").
+// Databases are disposable synthetic SQLite. No Express, no Caddy, no Atlas, no real saves.
+internal static class SyncF54Checks
+{
+    private static int _count;
+    private static readonly DateTimeOffset Start=DateTimeOffset.Parse("2026-10-27T12:00:00.000Z",CultureInfo.InvariantCulture);
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok,string label="check"){if(!ok)throw new Exception("B54 assertion failed: "+label);}
+
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly string Owner=Id(),Game=Id(),Installation=Id();
+        internal DateTimeOffset Clock=Start;
+        internal SyncBinding Binding=>new(Owner,Installation,1);
+        internal SyncOutboxService Queue=>new(Db,()=>Clock,()=>0);
+        internal F()
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);var save=new GameSaveService(Db,RealGameCatalog.InitialState(),()=>Start);
+            save.CreateLocalProfile(Id(),Owner,"Synthetic B54");save.CreateNewGame(new(Id(),Owner,Game));
+            GameplayEventSchema.MigrateSynthetic(Db);SyncOutboxSchema.MigrateSynthetic(Db);Queue.RegisterInstallation(Binding);
+        }
+        // n sessions; returns the open-report ids (independent operations).
+        internal List<string> Sessions(int n,bool closedToo=false,List<string>? closedIds=null)
+        {
+            var ids=new List<string>();var events=new GameplayEventService(Db);
+            for(int i=0;i<n;i++)
+            {
+                string session=Id();
+                events.RecordEvent(new(Id(),Owner,session,GameplayEventKind.SESSION_STARTED,Start,0));
+                events.RecordEvent(new(Id(),Owner,session,GameplayEventKind.SESSION_ENDED,Start.AddSeconds(1),1000,SessionEnd:GameplaySessionEnd.Normal));
+                string open=Queue.Capture(new(Id(),Binding,new(SyncFactKind.SessionReport,session,Phase:"open"))).Operation.OperationId;ids.Add(open);
+                if(closedToo)closedIds?.Add(Queue.Capture(new(Id(),Binding,new(SyncFactKind.SessionReport,session,Phase:"terminal"),new[]{open})).Operation.OperationId);
+            }
+            return ids;
+        }
+        internal long Number(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+        internal string Text(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToString(q.ExecuteScalar(),CultureInfo.InvariantCulture)??"";}
+        internal int State(string state)=>(int)Number("SELECT count(*) FROM sync_outbox WHERE state='"+state+"';");
+        internal long MinNextAttempt(string where)=>Number("SELECT COALESCE(min(next_attempt_ms),0) FROM sync_outbox WHERE "+where+";");
+        // Everything that must never change: identifiers, payloads, hashes, source keys, creation order and the dependency graph.
+        internal string Fingerprint()=>Text("SELECT group_concat(operation_id||'|'||payload_hash||'|'||source_key||'|'||created_at_utc||'|'||type||'|'||length(canonical_envelope),';') FROM (SELECT * FROM sync_outbox ORDER BY operation_id)")
+            +"#"+Text("SELECT group_concat(operation_id||'>'||depends_on_id,';') FROM (SELECT * FROM sync_dependencies ORDER BY operation_id,depends_on_id)");
+        internal long NowMs=>Clock.ToUnixTimeMilliseconds();
+        public void Dispose()=>Sandbox.Dispose();
+    }
+
+    private sealed class Ticks{internal long Ms=0;}
+    internal enum Mode{Normal,RateLimiter,CommitThenDrop}
+    private sealed record Request(string Path,JsonElement Body);
+
+    private sealed class FakeServer:HttpMessageHandler
+    {
+        private readonly SyncBinding _binding;
+        internal Mode Behaviour=Mode.Normal;
+        internal int Capacity=int.MaxValue;                                   // new operations the owner may still store
+        internal readonly List<Request> Requests=new();
+        internal readonly Dictionary<string,JsonElement> Receipts=new();
+        internal readonly List<string> Committed=new();
+        internal FakeServer(SyncBinding binding){_binding=binding;}
+        internal IEnumerable<Request> Batches=>Requests.Where(r=>r.Path.EndsWith("/sync/batches",StringComparison.Ordinal));
+        internal static string[] OperationIds(Request r)=>r.Body.GetProperty("operations").EnumerateArray().Select(o=>o.GetProperty("operationId").GetString()!).ToArray();
+        private static HttpResponseMessage Json(HttpStatusCode status,object body)=>new(status){Content=new StringContent(JsonSerializer.Serialize(body),new UTF8Encoding(false),"application/json")};
+        private JsonElement Receipt(JsonElement op)
+        {
+            string id=op.GetProperty("operationId").GetString()!;
+            var receipt=JsonSerializer.SerializeToElement(new{receiptVersion=1,operationContractVersion=1,technicalAccountId=Id(),operationId=id,localPlayerId=_binding.LocalPlayerId,
+                installationId=_binding.InstallationId,bindingGeneration=1,payloadHash=op.GetProperty("payloadHash").GetString(),receiptId=Id(),committedAtUtc="2026-10-27T12:00:00.000Z",acceptedAs="committed"});
+            Receipts[id]=receipt;Committed.Add(id);return receipt;
+        }
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken cancellation)
+        {
+            string path=request.RequestUri!.AbsolutePath;
+            JsonElement body=default;
+            if(request.Content is not null){var bytes=await request.Content.ReadAsByteArrayAsync(cancellation);using var doc=JsonDocument.Parse(bytes);body=doc.RootElement.Clone();}
+            Requests.Add(new(path,body));
+            if(path.EndsWith("/technical/registrations",StringComparison.Ordinal))return Json(HttpStatusCode.Created,new{schemaVersion=2,technicalAccountId=Id()});
+            if(path.EndsWith("/technical/sessions",StringComparison.Ordinal))return Json(HttpStatusCode.OK,new{schemaVersion=2,accessToken="synthetic-token",expiresIn=900});
+            if(path.EndsWith("/sync/receipts/query",StringComparison.Ordinal))
+            {
+                var results=body.GetProperty("attempts").EnumerateArray().Select(a=>
+                {
+                    string id=a.GetProperty("operationId").GetString()!;
+                    return Receipts.TryGetValue(id,out var r)?(object)new{operationId=id,status="found",receipt=r,attempt=new{leaseId=a.GetProperty("leaseId").GetString(),attempt=a.GetProperty("attempt").GetInt32()}}
+                                                              :new{operationId=id,status="not_found"};
+                }).ToArray();
+                return Json(HttpStatusCode.OK,new{schemaVersion=2,requestId=Id(),results});
+            }
+            if(path.EndsWith("/sync/batches",StringComparison.Ordinal))
+            {
+                var ops=body.GetProperty("operations").EnumerateArray().ToArray();
+                if(Behaviour==Mode.RateLimiter)
+                {   // the rate limiter answers from the router error handler: error envelope, NO results[]
+                    var limited=new HttpResponseMessage((HttpStatusCode)429){Content=new StringContent(JsonSerializer.Serialize(new{schemaVersion=2,error=new{code="rate_limited",message="Sync request unavailable.",retryable=true},requestId=Id()}),new UTF8Encoding(false),"application/json")};
+                    limited.Headers.RetryAfter=new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(1));return limited;
+                }
+                if(Behaviour==Mode.CommitThenDrop){foreach(var op in ops)if(Capacity>0){Capacity--;Receipt(op);}throw new HttpRequestException("response lost after commit");}
+                var list=new List<object>();int accepted=0;
+                for(int i=0;i<ops.Length;i++)
+                {
+                    var o=ops[i];string id=o.GetProperty("operationId").GetString()!;
+                    var attempt=new{leaseId=o.GetProperty("leaseId").GetString(),attempt=o.GetProperty("attempt").GetInt32()};
+                    if(Receipts.TryGetValue(id,out var again)){accepted++;list.Add(new{index=i,operationId=id,status="duplicate",httpStatus=200,receipt=again,attempt});continue;}   // duplicates are answered BEFORE the quota, as the real engine does
+                    if(Capacity<=0){list.Add(new{index=i,operationId=id,status="deferred",httpStatus=429,error=new{code="quota_exceeded",retryable=true,retryAfterSeconds=1}});continue;}
+                    Capacity--;accepted++;list.Add(new{index=i,operationId=id,status="committed",httpStatus=201,receipt=Receipt(o),attempt});
+                }
+                var status=accepted==ops.Length?HttpStatusCode.OK:accepted>0?(HttpStatusCode)207:(HttpStatusCode)429;
+                return Json(status,new{schemaVersion=2,batchId=body.GetProperty("batchId").GetString(),requestId=Id(),outcome=accepted==ops.Length?"all_accepted":accepted>0?"partial":"none_accepted",results=list});
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        }
+    }
+
+    private sealed class Client:IDisposable
+    {
+        internal readonly Ticks Time=new();
+        internal readonly FakeServer Server;
+        internal readonly SyncHttpTransport Transport;
+        internal readonly SyncSessionManager Session;
+        internal readonly SyncOutboxDispatcher Dispatcher;
+        // `server` lets a "restarted game" (a new Client) talk to the same fake server.
+        internal Client(F f,FakeServer? server=null,TimeSpan[]? pauses=null)
+        {
+            Server=server??new FakeServer(f.Binding);
+            var options=new SyncHttpOptions(new Uri("http://127.0.0.1:9/"),null,allowLoopbackHttp:true);
+            Transport=new(options,Server);
+            Session=new(Transport,f.Binding,new InMemorySyncSecretStore());
+            Dispatcher=new(f.Queue,Session,f.Binding,SyncHttpOptions.InitialBatchOperations,SyncHttpOptions.MaxBatchOperationsLimit,()=>Time.Ms,pauses);
+        }
+        internal Task<SyncPassSummary> Pass()=>Dispatcher.RunPassAsync(CancellationToken.None);
+        public void Dispose()=>Transport.Dispose();
+    }
+
+    private static async Task Case(string label,Func<F,Task> body){using var f=new F();await body(f);_count++;Console.WriteLine("PASS "+label);}
+    private static async Task Case(string label,Action<F> body){using var f=new F();body(f);_count++;Console.WriteLine("PASS "+label);await Task.CompletedTask;}
+
+    public static async Task<int> Run(string[] args)
+    {
+        bool onlyReal=args.Any(a=>a.StartsWith("--express-case=",StringComparison.Ordinal));
+        if(!onlyReal){
+        // ---------------------------------------------------------------- identification and stop
+        await Case("quota exhausted: the pass stops, accepted operations stay confirmed, nothing becomes a permanent failure",async f=>{
+            var ids=f.Sessions(20);using var c=new Client(f);c.Server.Capacity=3;
+            var first=await c.Pass();
+            Check(first.Code=="SYNC_QUOTA_BLOCKED" && first.Confirmed==3 && first.Retried==2 && first.Rejected==0,"first pass "+first.DiagnosticSummary);
+            Check(f.State("confirmed")==3 && f.State("permanent_failure")==0 && f.State("retryable_failure")==2 && f.State("pending")==15,"states");
+            Check(f.Number("SELECT count(*) FROM sync_outbox WHERE last_error_code='quota_exceeded'")==2,"the quota is stored as its own code");
+            Check(f.Queue.QuotaPauseUntil(f.Binding) is not null,"pause visible");
+        });
+        await Case("an entire batch refused for quota (HTTP 429 with results) is identified from the per-operation code, not from the status alone",async f=>{
+            f.Sessions(6);using var c=new Client(f);c.Server.Capacity=0;
+            var first=await c.Pass();
+            Check(first.Code=="SYNC_QUOTA_BLOCKED" && first.Confirmed==0 && first.Retried==5 && first.Transport==SyncHttpFailure.RateLimited,"summary "+first.DiagnosticSummary);
+            Check(f.State("permanent_failure")==0 && f.State("confirmed")==0,"nothing confirmed or lost");
+        });
+        await Case("the pause outranks the server's retryAfterSeconds=1: every unconfirmed operation waits at least 15 minutes",async f=>{
+            f.Sessions(12);using var c=new Client(f);c.Server.Capacity=0;await c.Pass();
+            long min=f.MinNextAttempt("state IN('pending','retryable_failure')");
+            Check(min>=f.NowMs+15*60*1000,"all deferred, min wait "+(min-f.NowMs)+" ms");
+        });
+        await Case("no repeated attempts while blocked: 200 passes over 14 minutes send no request and keep the same code",async f=>{
+            f.Sessions(12);using var c=new Client(f);c.Server.Capacity=0;await c.Pass();
+            int requests=c.Server.Requests.Count;long attempts=f.Number("SELECT sum(attempts) FROM sync_outbox");
+            for(int i=0;i<200;i++){f.Clock=f.Clock.AddSeconds(4);var s=await c.Pass();Check(s.Code=="SYNC_QUOTA_BLOCKED" && s.Reserved==0,"pass "+i+" "+s.DiagnosticSummary);}
+            Check(c.Server.Requests.Count==requests,"no request");Check(f.Number("SELECT sum(attempts) FROM sync_outbox")==attempts,"attempt counters untouched");
+        });
+
+        // ---------------------------------------------------------------- rate limiting is a different thing
+        await Case("the rate limiter (429 error envelope, no results) is NOT a quota block: normal short retry, no pause, no probe mode",async f=>{
+            f.Sessions(10);using var c=new Client(f);c.Server.Behaviour=Mode.RateLimiter;
+            var s=await c.Pass();
+            Check(s.Code=="SYNC_RATELIMITED" && s.Retried==5 && s.Confirmed==0,"summary "+s.DiagnosticSummary);
+            Check(f.Queue.QuotaPauseUntil(f.Binding) is null && !c.Dispatcher.QuotaProbePending,"no quota state");
+            Check(f.Number("SELECT count(*) FROM sync_outbox WHERE last_error_code='rate_limited'")==5 && f.Number("SELECT count(*) FROM sync_outbox WHERE last_error_code='quota_exceeded'")==0,"codes");
+            Check(f.MinNextAttempt("state='retryable_failure'")<f.NowMs+60_000,"short backoff only");
+            f.Clock=f.Clock.AddSeconds(30);c.Server.Behaviour=Mode.Normal;
+            var again=await c.Pass();
+            Check(again.Confirmed>=1 && again.Code!="SYNC_QUOTA_BLOCKED","recovers after the limit");
+        });
+
+        // ---------------------------------------------------------------- resume
+        await Case("capacity returns: after the pause ONE operation probes, a new commit proves it, then the queue drains with the same identifiers and no duplicates",async f=>{
+            var ids=f.Sessions(20);var before=f.Fingerprint();using var c=new Client(f);c.Server.Capacity=3;await c.Pass();
+            c.Server.Capacity=1000;
+            f.Clock=f.Clock.AddMinutes(14);Check((await c.Pass()).Code=="SYNC_QUOTA_BLOCKED","still paused at 14 min");
+            f.Clock=f.Clock.AddMinutes(2);int batches=c.Server.Batches.Count();
+            var probe=await c.Pass();
+            Check(probe.Reserved==1 && probe.Confirmed==1 && c.Server.Batches.Count()==batches+1 && FakeServer.OperationIds(c.Server.Batches.Last()).Length==1,"probe of one "+probe.DiagnosticSummary);
+            Check(!c.Dispatcher.QuotaProbePending,"probe cleared by a NEW commit");
+            for(int i=0;i<10 && f.State("confirmed")<20;i++)await c.Pass();
+            Check(f.State("confirmed")==20 && f.State("permanent_failure")==0,"drained");
+            Check(c.Server.Committed.Count==20 && c.Server.Committed.Distinct().Count()==20 && ids.All(c.Server.Committed.Contains),"each operationId committed exactly once");
+            Check(f.Fingerprint().Split('#')[1]==before.Split('#')[1],"dependency graph identical");
+        });
+        await Case("the probe fails again: the pause grows 15 min, 1 h, 6 h and stays at 6 h; each probe sends one operation",async f=>{
+            f.Sessions(10);using var c=new Client(f);c.Server.Capacity=0;
+            var expected=new[]{15,60,360,360,360};
+            for(int i=0;i<expected.Length;i++)
+            {
+                if(i>0){f.Clock=f.Clock.AddMinutes(expected[i-1]+1);int b=c.Server.Batches.Count();var p=await c.Pass();Check(p.Code=="SYNC_QUOTA_BLOCKED" && p.Reserved==1 && c.Server.Batches.Count()==b+1 && FakeServer.OperationIds(c.Server.Batches.Last()).Length==1,"probe "+i);}
+                else await c.Pass();
+                long wait=f.MinNextAttempt("state IN('pending','retryable_failure')")-f.NowMs;
+                Check(wait>=expected[i]*60_000L-1000 && wait<=expected[i]*60_000L+1000,$"round {i}: {wait/60000} min");
+            }
+            Check(f.State("permanent_failure")==0 && f.State("confirmed")==0,"nothing lost");
+        });
+        await Case("a duplicate answer does not prove capacity (the engine answers duplicates before the quota): the probe stays active",async f=>{
+            f.Sessions(8);using var c=new Client(f);
+            c.Server.Behaviour=Mode.CommitThenDrop;await c.Pass();                    // committed, answer lost: the operations stay unconfirmed locally
+            c.Server.Behaviour=Mode.Normal;c.Server.Capacity=0;
+            f.Clock=f.Clock.AddMinutes(1);await c.Pass();                             // receipts/query finds them (reconciled), the remaining ones hit the quota
+            Check(c.Dispatcher.QuotaProbePending || f.State("confirmed")>=5,"state after reconciliation");
+            for(int i=0;i<4;i++){f.Clock=f.Clock.AddMinutes(30);await c.Pass();}
+            Check(c.Server.Committed.Count==c.Server.Committed.Distinct().Count(),"never committed twice");
+            Check(f.State("permanent_failure")==0,"no permanent failure");
+        });
+        await Case("manual resume: ReleaseQuotaPause ends the pause at once, touches only unconfirmed operations and the next pass probes with one",async f=>{
+            f.Sessions(12);using var c=new Client(f);c.Server.Capacity=2;await c.Pass();
+            Check(f.State("confirmed")==2,"two confirmed");var confirmedBefore=f.Text("SELECT group_concat(operation_id||receipt_json,';') FROM (SELECT * FROM sync_outbox WHERE state='confirmed' ORDER BY operation_id)");
+            c.Server.Capacity=1000;int released=c.Dispatcher.ResumeAfterQuotaChange();
+            Check(released==10,"released "+released);
+            Check(confirmedBefore==f.Text("SELECT group_concat(operation_id||receipt_json,';') FROM (SELECT * FROM sync_outbox WHERE state='confirmed' ORDER BY operation_id)"),"confirmed rows untouched");
+            var probe=await c.Pass();Check(probe.Reserved==1 && probe.Confirmed==1,"probe "+probe.DiagnosticSummary);
+            for(int i=0;i<8 && f.State("confirmed")<12;i++)await c.Pass();
+            Check(f.State("confirmed")==12,"drained after resume");
+        });
+
+        // ---------------------------------------------------------------- restart
+        await Case("restart of the game while blocked: the pause is in SQLite, so the new process stays blocked with ZERO requests and then probes normally",async f=>{
+            f.Sessions(14);var server=new FakeServer(f.Binding){Capacity=0};
+            using(var first=new Client(f,server)){await first.Pass();}
+            int requests=server.Requests.Count;
+            using var second=new Client(f,server);
+            f.Clock=f.Clock.AddMinutes(5);
+            var s=await second.Pass();
+            Check(s.Code=="SYNC_QUOTA_BLOCKED" && s.Reserved==0 && server.Requests.Count==requests,"blocked from SQLite "+s.DiagnosticSummary);
+            server.Capacity=100;f.Clock=f.Clock.AddMinutes(11);
+            var probe=await second.Pass();Check(probe.Reserved>=1 && probe.Confirmed>=1,"normal operation after the pause "+probe.DiagnosticSummary);
+            for(int i=0;i<6 && f.State("confirmed")<14;i++)await second.Pass();
+            Check(f.State("confirmed")==14,"drained");
+        });
+
+        // ---------------------------------------------------------------- integrity, dependencies, order
+        await Case("a quota block never changes an identifier, payload, hash, source key, creation time, order or dependency",async f=>{
+            var closed=new List<string>();var open=f.Sessions(10,true,closed);var before=f.Fingerprint();
+            using var c=new Client(f);c.Server.Capacity=4;
+            await c.Pass();await c.Pass();f.Clock=f.Clock.AddHours(2);c.Server.Capacity=0;for(int i=0;i<3;i++){await c.Pass();f.Clock=f.Clock.AddHours(7);}
+            Check(f.Fingerprint()==before,"fingerprint equal");Check(f.Number("SELECT count(*) FROM sync_outbox")==20 && f.Number("SELECT count(*) FROM sync_dependencies")==10,"counts");
+        });
+        await Case("dependencies are respected across block and resume: a child is never sent before its parent is confirmed, and creation order is kept",async f=>{
+            var closed=new List<string>();var open=f.Sessions(12,true,closed);
+            using var c=new Client(f);c.Server.Capacity=7;
+            for(int i=0;i<3;i++){await c.Pass();}
+            c.Server.Capacity=1000;f.Clock=f.Clock.AddMinutes(20);
+            for(int i=0;i<60 && f.State("confirmed")<24;i++){f.Clock=f.Clock.AddMinutes(1);await c.Pass();}
+            Check(f.State("confirmed")==24,"all confirmed");
+            var order=c.Server.Committed;
+            for(int i=0;i<12;i++)Check(order.IndexOf(open[i])>=0 && order.IndexOf(open[i])<order.IndexOf(closed[i]),"parent before child "+i);
+            Check(order.Count==24 && order.Distinct().Count()==24,"one commit each");
+            // children of unconfirmed parents were never offered to the server
+            foreach(var batch in c.Server.Batches)foreach(var op in batch.Body.GetProperty("operations").EnumerateArray())
+                foreach(var dep in op.GetProperty("dependencies").EnumerateArray())Check(order.IndexOf(dep.GetString()!)>=0,"dependency known to the server");
+        });
+        await Case("a mixed batch (some committed, some over quota) keeps the receipts of the committed ones and pauses only the rest",async f=>{
+            f.Sessions(5);using var c=new Client(f);c.Server.Capacity=2;
+            var s=await c.Pass();
+            Check(s.Confirmed==2 && s.Retried==3 && s.Code=="SYNC_QUOTA_BLOCKED","mixed "+s.DiagnosticSummary);
+            Check(f.Number("SELECT count(*) FROM sync_outbox WHERE state='confirmed' AND receipt_json IS NOT NULL")==2,"receipts kept");
+        });
+        await Case("no decision or progress is lost: every game report and session report is still present with its original envelope after a long block",async f=>{
+            var open=f.Sessions(6);var before=f.Text("SELECT group_concat(operation_id||canonical_envelope,';') FROM (SELECT * FROM sync_outbox ORDER BY operation_id)");
+            using var c=new Client(f);c.Server.Capacity=0;
+            for(int i=0;i<30;i++){await c.Pass();f.Clock=f.Clock.AddHours(7);}
+            Check(f.Number("SELECT count(*) FROM sync_outbox WHERE state IN('pending','retryable_failure')")==6,"all still deliverable");
+            Check(before==f.Text("SELECT group_concat(operation_id||canonical_envelope,';') FROM (SELECT * FROM sync_outbox ORDER BY operation_id)"),"envelopes identical");
+        });
+
+        // ---------------------------------------------------------------- service guards
+        await Case("service guards: DeferForQuota touches only next_attempt_ms of unconfirmed operations and refuses nonsensical pauses",f=>{
+            f.Sessions(4);var q=f.Queue;
+            foreach(var bad in new[]{TimeSpan.Zero,TimeSpan.FromMilliseconds(500),TimeSpan.FromDays(2),TimeSpan.FromSeconds(-5)})
+            {bool refused=false;try{q.DeferForQuota(f.Binding,bad);}catch(SaveException){refused=true;}Check(refused,"refused "+bad);}
+            var beforeStates=f.Text("SELECT group_concat(operation_id||state||attempts||COALESCE(last_error_code,''),';') FROM (SELECT * FROM sync_outbox ORDER BY operation_id)");
+            Check(q.DeferForQuota(f.Binding,TimeSpan.FromMinutes(15))==4,"four rows deferred");
+            Check(beforeStates==f.Text("SELECT group_concat(operation_id||state||attempts||COALESCE(last_error_code,''),';') FROM (SELECT * FROM sync_outbox ORDER BY operation_id)"),"states and attempts unchanged");
+            Check(q.QuotaPauseUntil(f.Binding) is null,"pending rows alone do not carry the quota marker");
+            Check(q.ReleaseQuotaPause(f.Binding)==4,"released");
+            bool unknown=false;try{f.Queue.DeferForQuota(new(Id(),Id(),1),TimeSpan.FromMinutes(1));}catch(SaveException){unknown=true;}Check(unknown,"unknown binding refused");
+        });
+        await Case("compatibility: F3.1 constants unchanged (batch 5/8, lease 60 s, timeout 15 s) and the default pauses are 15 min, 1 h, 6 h",f=>{
+            Check(SyncHttpOptions.InitialBatchOperations==5 && SyncHttpOptions.MaxBatchOperationsLimit==8 && SyncOutboxService.DefaultLease==TimeSpan.FromSeconds(60) && SyncHttpOptions.DefaultRequestTimeout==TimeSpan.FromSeconds(15),"F3.1");
+            var d=SyncOutboxDispatcher.DefaultQuotaPauses;Check(d.Length==3 && d[0]==TimeSpan.FromMinutes(15) && d[1]==TimeSpan.FromHours(1) && d[2]==TimeSpan.FromHours(6),"pauses");
+            bool refused=false;using var t=new SyncHttpTransport(new SyncHttpOptions(new Uri("https://api.example.invalid/")));
+            try{_=new SyncOutboxDispatcher(f.Queue,new SyncSessionManager(t,f.Binding),f.Binding,5,8,null,new[]{TimeSpan.FromDays(3)});}catch(SaveException){refused=true;}Check(refused,"pause above one day refused");
+        });
+
+        }
+        // ---------------------------------------------------------------- optional: the REAL Express service (offline-test composition, loopback, in-memory synthetic repositories; never Atlas)
+        string? express=args.Select(a=>a.StartsWith("--express=",StringComparison.Ordinal)?a.Substring(10):null).FirstOrDefault(a=>a is not null);
+        // The offline-test composition keeps ONE in-memory store for all owners, so each real-server case needs its own Express process: --express-case=quota | rate.
+        string? which=args.Select(a=>a.StartsWith("--express-case=",StringComparison.Ordinal)?a.Substring(15):null).FirstOrDefault(a=>a is not null);
+        if(express is not null && which=="quota")
+            await Case("REAL Express offline-test: a queue larger than the owner quota (1000) is accepted up to the quota, then SYNC_QUOTA_BLOCKED; the real rate limiter is told apart; nothing is lost",async f=>{
+                int total=1012;var ids=f.Sessions(total);var before=f.Fingerprint();
+                var options=new SyncHttpOptions(new Uri(express),null,allowLoopbackHttp:true);
+                using var transport=new SyncHttpTransport(options);var session=new SyncSessionManager(transport,f.Binding,new InMemorySyncSecretStore());
+                var dispatcher=new SyncOutboxDispatcher(f.Queue,session,f.Binding);
+                int rateLimited=0,passes=0;string last="";
+                for(;passes<600;passes++)
+                {
+                    var s=await dispatcher.RunPassAsync(CancellationToken.None);last=s.Code;
+                    if(s.Code=="SYNC_QUOTA_BLOCKED")break;
+                    if(s.Code=="SYNC_RATELIMITED"){rateLimited++;f.Clock=f.Clock.AddSeconds(30);await Task.Delay(1500);}
+                    else if(s.Code.StartsWith("SYNC_STORAGE_",StringComparison.Ordinal) || s.Code is "SYNC_NETWORKUNAVAILABLE" or "SYNC_TIMEOUT"){throw new Exception("unexpected "+s.DiagnosticSummary);}
+                }
+                Console.WriteLine($"  real server: passes={passes} rateLimitedPasses={rateLimited} last={last} confirmed={f.State("confirmed")} retryable={f.State("retryable_failure")} pending={f.State("pending")}");
+                Check(last=="SYNC_QUOTA_BLOCKED","blocked by the real quota");
+                // The in-memory offline-test store also has a 2 MiB valve (ingestion-engine.js:121, answered with the SAME quota_exceeded code), which it reaches before 1000 operations; the Mongo-backed service uses the count only.
+                int accepted=f.State("confirmed");
+                Check(accepted>=500 && accepted<=1000,"accepted up to the server limit: "+accepted);
+                Check(f.State("permanent_failure")==0 && f.State("confirmed")+f.State("pending")+f.State("retryable_failure")==total,"nothing lost, nothing permanent");
+                Check(f.Number("SELECT count(*) FROM sync_outbox WHERE state<>'confirmed' AND next_attempt_ms>="+(f.NowMs+14*60*1000))==total-accepted,"every unconfirmed operation is paused");
+                Check(f.Fingerprint()==before,"identifiers and payloads unchanged");
+                int again=0;for(int i=0;i<30;i++){var s=await dispatcher.RunPassAsync(CancellationToken.None);if(s.Reserved==0 && s.Code=="SYNC_QUOTA_BLOCKED")again++;}
+                Check(again==30,"30 further passes: no reservation, no request");
+            });
+
+        if(express is not null && which=="rate")
+            await Case("REAL Express offline-test: the real rate limiter (120 requests/min per owner) answers a different 429 shape and is NOT treated as a quota block",async f=>{
+                f.Sessions(160);var options=new SyncHttpOptions(new Uri(express),null,allowLoopbackHttp:true);
+                using var transport=new SyncHttpTransport(options);var session=new SyncSessionManager(transport,f.Binding,new InMemorySyncSecretStore());
+                var dispatcher=new SyncOutboxDispatcher(f.Queue,session,f.Binding,1,1);
+                string last="";int limited=0;
+                for(int i=0;i<200 && limited==0;i++){var s=await dispatcher.RunPassAsync(CancellationToken.None);last=s.Code;if(s.Code=="SYNC_RATELIMITED")limited++;}
+                Console.WriteLine("  real server: last="+last+" confirmed="+f.State("confirmed")+" rate_limited rows="+f.Number("SELECT count(*) FROM sync_outbox WHERE last_error_code='rate_limited'"));
+                Check(limited==1 && last=="SYNC_RATELIMITED","the real limiter was reached and reported as rate limiting");
+                Check(f.Queue.QuotaPauseUntil(f.Binding) is null && !dispatcher.QuotaProbePending,"no quota state");
+                Check(f.Number("SELECT count(*) FROM sync_outbox WHERE last_error_code='quota_exceeded'")==0 && f.State("permanent_failure")==0,"no quota code, no permanent failure");
+            });
+
+        Console.WriteLine($"B54 quota checks: {_count} cases passed.");
+        return 0;
+    }
+}

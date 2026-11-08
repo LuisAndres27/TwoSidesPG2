@@ -1,0 +1,44 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace TwoSides.LocalPersistence;
+
+public sealed record FinalDecision(string GameId,string BiomeId,string OptionId,string Environment,string Result,bool Completed);
+public sealed record LocalFinalResult(string Ending,int RejectCount,string RulesVersion);
+
+// New rules expressly authorized by the user; not recovered historical behavior.
+public static class LocalFinalEvaluator
+{
+    public const string Version="local-ending-reject-count-1";
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    public static LocalFinalResult Evaluate(string game,IReadOnlyList<FinalDecision> decisions)
+    {
+        SaveValidation.Id(game);
+        if(decisions is null || decisions.Count!=5)throw new SaveException("FINAL_INPUT_INVALID");
+        SaveValidation.Require(decisions.All(d=>d is not null) && decisions.Select(d=>d.BiomeId).OrderBy(x=>x,StringComparer.Ordinal)
+            .SequenceEqual(Biomes.OrderBy(x=>x,StringComparer.Ordinal)),"FINAL_INPUT_INVALID");
+        foreach(var d in decisions)
+            SaveValidation.Require(d.GameId==game && d.Completed && d.OptionId is "reject" or "approve" &&
+                d.Environment==(d.OptionId=="reject"?"healthy":"degraded") && d.Result==(d.OptionId=="reject"?"good":"bad"),"FINAL_INPUT_INVALID");
+        int rejects=decisions.Count(d=>d.OptionId=="reject");
+        return new(rejects==5?"good":rejects>=3?"medium":"bad",rejects,Version);
+    }
+    public static LocalFinalResult Evaluate(GameAggregate aggregate)
+    {
+        SaveValidation.Require(aggregate.Decisions.Count==5 && aggregate.Biomes.Count==5 && aggregate.Environments.Count==5,"FINAL_INPUT_INVALID");
+        var input=new List<FinalDecision>();
+        foreach(var biome in Biomes)
+        {
+            var ds=aggregate.Decisions.Where(d=>d.BiomeId==biome).ToArray();
+            var bs=aggregate.Biomes.Where(b=>b.BiomeId==biome).ToArray();
+            var es=aggregate.Environments.Where(e=>e.BiomeId==biome).ToArray();
+            SaveValidation.Require(ds.Length==1 && bs.Length==1 && es.Length==1,"FINAL_INPUT_INVALID");
+            var d=ds[0];var b=bs[0];var e=es[0];
+            SaveValidation.Require(b.GameId==aggregate.Game.GameId && e.GameId==b.GameId && e.LastDecisionId==d.DecisionId &&
+                e.StateKind==SaveValidation.DecisionState(d.ConsequencesJson,d.ConsequencesVersion),"FINAL_INPUT_INVALID");
+            input.Add(new(d.GameId,biome,d.OptionId,e.StateKind!,b.Result!,b.Status=="completed"));
+        }
+        return Evaluate(aggregate.Game.GameId,input);
+    }
+}

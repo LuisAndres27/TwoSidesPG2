@@ -1,0 +1,159 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+
+namespace TwoSides.LocalPersistence;
+
+public sealed class GameplayEventService
+{
+    private readonly ISaveDatabase _database;private readonly Action? _beforeCommit;
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    public GameplayEventService(ISaveDatabase database,Action? beforeCommit=null)
+    {
+        try{GameplayEventSchema.Verify(database);}
+        catch(UnauthorizedAccessException){throw new SaveException("ACCESS_DENIED");}
+        catch(IOException){throw new SaveException("IO_ERROR");}
+        _database=database;_beforeCommit=beforeCommit;
+    }
+    private static void Require(bool condition,string code="INVALID_EVENT")=>SaveValidation.Require(condition,code);
+    private T Transaction<T>(bool write,Func<GameplayEventRepository,T> work)
+    {
+        try
+        {
+            using var c=_database.Open();using var tx=c.BeginTransaction(deferred:!write);var r=new GameplayEventRepository(new(c,tx));
+            GameplayEventSchema.Verify(r.Base);var result=work(r);if(write && result is GameplayWriteReceipt {Inserted:true})_beforeCommit?.Invoke();tx.Commit();return result;
+        }
+        catch(Microsoft.Data.Sqlite.SqliteException e){throw StorageErrors.Map(e);}
+        catch(UnauthorizedAccessException){throw new SaveException("ACCESS_DENIED");}
+        catch(IOException){throw new SaveException("IO_ERROR");}
+        catch(OverflowException){throw new SaveException("INVALID_EVENT");}
+        catch(ArgumentException){throw new SaveException("INVALID_EVENT_STORAGE");}
+        catch(FormatException){throw new SaveException("INVALID_EVENT_STORAGE");}
+    }
+    private static void Owner(GameplayEventRepository r,string owner)
+    {SaveValidation.Id(owner);Require(r.Base.Profile()?.LocalPlayerId==owner,"NOT_FOUND");}
+    private static GameplaySession Session(GameplayEventRepository r,string owner,string session)
+    {Owner(r,owner);var s=r.Session(session);Require(s is not null && s.LocalPlayerId==owner,"NOT_FOUND");return s!;}
+    private static void Scope(GameplayEventRepository r,string owner,string? game,string? biome)
+    {
+        if(game is null){Require(biome is null);return;}SaveValidation.Id(game);
+        Require(r.Base.Game(owner,game) is not null,"NOT_FOUND");
+        if(biome is not null)Require(Biomes.Contains(biome) && r.Base.Biomes(game).Any(b=>b.BiomeId==biome),"UNKNOWN_BIOME");
+    }
+    private static GameplayEvent Run(GameplayEventRepository r,string owner,string session,string game,string biome,string run)
+    {
+        SaveValidation.Id(run);var stored=r.FindEvent(run)?.Event;
+        Require(stored is not null && stored.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED && stored.LocalPlayerId==owner && stored.SessionId==session && stored.GameId==game && stored.BiomeId==biome,"INVALID_ANIMAL_RUN");return stored!;
+    }
+    private static bool Terminal(GameplayEventKind kind)=>kind is GameplayEventKind.ANIMAL_DIED or GameplayEventKind.ANIMAL_SEGMENT_EXITED or GameplayEventKind.ANIMAL_SEGMENT_COMPLETED or GameplayEventKind.ANIMAL_RESTART_REQUESTED;
+    public GameplayWriteReceipt RecordEvent(GameplayEvent input)
+    {
+        if(input is null)throw new SaveException("INVALID_EVENT");SaveValidation.Id(input.EventId);SaveValidation.Id(input.SessionId);SaveValidation.Id(input.LocalPlayerId);
+        Require(input.Version==1 && input.OffsetMs>=0 && Enum.IsDefined(input.Kind),"UNSUPPORTED_EVENT_CONTRACT");
+        var e=input with {OccurredAtUtc=input.OccurredAtUtc.ToUniversalTime(),DeathCause=input.Kind==GameplayEventKind.ANIMAL_DIED?input.DeathCause??GameplayDeathCause.Unknown:input.DeathCause};
+        Require(e.DeathCause is null || Enum.IsDefined(e.DeathCause.Value));Require(e.SessionEnd is null || Enum.IsDefined(e.SessionEnd.Value));
+        bool sessionEvent=e.Kind is GameplayEventKind.SESSION_STARTED or GameplayEventKind.SESSION_ENDED;
+        Require(sessionEvent ? e.GameId is null && e.BiomeId is null && e.AnimalRunId is null && e.DeathCause is null
+            : e.GameId is not null && e.BiomeId is not null && e.AnimalRunId is not null && e.SessionEnd is null);
+        Require(e.Kind==GameplayEventKind.ANIMAL_DIED || e.DeathCause is null);
+        Require(e.Kind==GameplayEventKind.SESSION_ENDED ? e.SessionEnd is not null : e.SessionEnd is null);
+        string digest=SaveValidation.Digest(e);
+        return Transaction(true,r=>
+        {
+            Owner(r,e.LocalPlayerId);var previous=r.FindEvent(e.EventId);
+            if(previous is not null){Require(previous.Value.Digest==digest && previous.Value.Event.LocalPlayerId==e.LocalPlayerId,"EVENT_CONFLICT");return new GameplayWriteReceipt(e.EventId,false);}
+            string key=e.Kind+":"+(sessionEvent?e.SessionId:e.AnimalRunId);
+            Require(r.Base.Number("SELECT count(*) FROM gameplay_events WHERE local_player_id=$p AND dedupe_key=$k;",("$p",e.LocalPlayerId),("$k",key))==0,"EVENT_CONFLICT");
+            if(e.Kind==GameplayEventKind.SESSION_STARTED)
+            {
+                Require(e.OffsetMs==0);
+                Require(r.Base.Number("SELECT count(*) FROM gameplay_sessions WHERE local_player_id=$p AND status='open';",("$p",e.LocalPlayerId))==0,"SESSION_ALREADY_OPEN");
+                r.Base.Execute("INSERT INTO gameplay_sessions(session_id,local_player_id,started_at_utc,status) VALUES($s,$p,$at,'open');",("$s",e.SessionId),("$p",e.LocalPlayerId),("$at",SaveValidation.Timestamp(e.OccurredAtUtc)));
+            }
+            else
+            {
+                var s=Session(r,e.LocalPlayerId,e.SessionId);Require(s.Status=="open","SESSION_CLOSED");
+                Require(e.OffsetMs>=r.DurableOffset(e.SessionId),"EVENT_TIME_CONFLICT");
+                if(e.Kind==GameplayEventKind.SESSION_ENDED)
+                {
+                    if(e.SessionEnd==GameplaySessionEnd.Interrupted)Require(e.OffsetMs==r.DurableOffset(e.SessionId),"INTERRUPTED_TIME_INVENTED");
+                    r.Base.Execute("UPDATE gameplay_sessions SET status=$state,ended_at_utc=$at,end_offset_ms=$offset WHERE session_id=$s;",("$state",e.SessionEnd==GameplaySessionEnd.Normal?"closed":"interrupted"),("$at",e.SessionEnd==GameplaySessionEnd.Normal?SaveValidation.Timestamp(e.OccurredAtUtc):null),("$offset",e.OffsetMs),("$s",e.SessionId));
+                }
+                else
+                {
+                    Scope(r,e.LocalPlayerId,e.GameId,e.BiomeId);var events=r.Events(e.LocalPlayerId,session:e.SessionId);
+                    if(e.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED)
+                    {
+                        Require(e.AnimalRunId==e.EventId,"INVALID_ANIMAL_RUN");
+                        var g=r.Base.Game(e.LocalPlayerId,e.GameId!)!;Require(g.IsCurrent && g.Status=="in_progress","GAME_NOT_ACTIVE");
+                        var p=r.Base.Biomes(e.GameId!).Single(b=>b.BiomeId==e.BiomeId);Require(p.Status!="completed","BIOME_COMPLETED");Require(p.Status=="animal_pending","DECISION_REQUIRED");
+                        var decision=r.Base.Decisions(e.GameId!,e.BiomeId,limit:10000).LastOrDefault();
+                        var environment=r.Base.Environments(e.GameId!).Single(b=>b.BiomeId==e.BiomeId);
+                        Require(decision is not null && environment.LastDecisionId==decision.DecisionId &&
+                            environment.StateKind==SaveValidation.DecisionState(decision.ConsequencesJson,decision.ConsequencesVersion),"DECISION_REQUIRED");
+                        Require(decision is not null && ((decision.OptionId=="reject" && environment.StateKind=="healthy") || (decision.OptionId=="approve" && environment.StateKind=="degraded")),"INVALID_ENVIRONMENT");
+                        Require(events.Where(x=>x.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED).All(start=>events.Any(end=>end.AnimalRunId==start.AnimalRunId && Terminal(end.Kind))),"ANIMAL_RUN_ALREADY_OPEN");
+                    }
+                    else
+                    {
+                        Run(r,e.LocalPlayerId,e.SessionId,e.GameId!,e.BiomeId!,e.AnimalRunId!);
+                        var runEvents=events.Where(x=>x.AnimalRunId==e.AnimalRunId).ToArray();
+                        if(e.Kind==GameplayEventKind.ANIMAL_RETRY_REQUESTED)
+                        {
+                            Require(runEvents.Any(x=>x.Kind==GameplayEventKind.ANIMAL_DIED),"RETRY_REQUIRES_DEATH");
+                            Require(!runEvents.Any(x=>x.Kind is GameplayEventKind.ANIMAL_SEGMENT_EXITED or GameplayEventKind.ANIMAL_SEGMENT_COMPLETED or GameplayEventKind.ANIMAL_RESTART_REQUESTED),"ANIMAL_RUN_CLOSED");
+                        }
+                        else if(e.Kind!=GameplayEventKind.ANIMAL_SEGMENT_EXITED)Require(!runEvents.Any(x=>Terminal(x.Kind)),"ANIMAL_RUN_CLOSED");
+                        if(e.Kind==GameplayEventKind.ANIMAL_SEGMENT_COMPLETED)Require(r.Base.Biomes(e.GameId!).Single(b=>b.BiomeId==e.BiomeId).Status=="completed","COMPLETION_NOT_CONFIRMED");
+                    }
+                }
+            }
+            r.Insert(e,digest,key);return new GameplayWriteReceipt(e.EventId,true);
+        });
+    }
+    public GameplayWriteReceipt InterruptSession(string owner,string session,string eventId,DateTimeOffset discoveredAtUtc)
+    {
+        SaveValidation.Id(owner);SaveValidation.Id(session);SaveValidation.Id(eventId);
+        long offset=Transaction(false,r=>{Session(r,owner,session);return r.DurableOffset(session);});
+        return RecordEvent(new(eventId,owner,session,GameplayEventKind.SESSION_ENDED,discoveredAtUtc,offset,SessionEnd:GameplaySessionEnd.Interrupted));
+    }
+    public GameplayWriteReceipt RecordInterval(GameplayInterval i)
+    {
+        if(i is null)throw new SaveException("INVALID_EVENT");SaveValidation.Id(i.IntervalId);SaveValidation.Id(i.LocalPlayerId);SaveValidation.Id(i.SessionId);
+        Require(i.Version==1 && i.StartMs>=0 && i.EndMs>=i.StartMs && Enum.IsDefined(i.State));
+        string digest=SaveValidation.Digest(i);
+        return Transaction(true,r=>
+        {
+            var previous=r.IntervalDigest(i.IntervalId);
+            if(previous is not null){Require(previous==digest,"INTERVAL_CONFLICT");return new GameplayWriteReceipt(i.IntervalId,false);}
+            var s=Session(r,i.LocalPlayerId,i.SessionId);Require(s.Status=="open","SESSION_CLOSED");Scope(r,i.LocalPlayerId,i.GameId,i.BiomeId);
+            Require(i.GameId is not null || i.AnimalRunId is null);
+            if(i.State is GameplayTimeState.ActiveHuman or GameplayTimeState.ActiveAnimal)Require(i.GameId is not null && i.BiomeId is not null);
+            if(i.State==GameplayTimeState.ActiveAnimal)Require(i.AnimalRunId is not null);
+            if(i.State==GameplayTimeState.ActiveHuman)Require(i.AnimalRunId is null);
+            if(i.AnimalRunId is not null)
+            {
+                Require(i.GameId is not null && i.BiomeId is not null);var start=Run(r,i.LocalPlayerId,i.SessionId,i.GameId!,i.BiomeId!,i.AnimalRunId);Require(i.StartMs>=start.OffsetMs,"INTERVAL_TIME_CONFLICT");
+                if(i.State==GameplayTimeState.ActiveAnimal)
+                    Require(!r.Events(i.LocalPlayerId,session:i.SessionId).Any(e=>e.AnimalRunId==i.AnimalRunId && Terminal(e.Kind) && i.EndMs>e.OffsetMs),"INTERVAL_AFTER_RUN_END");
+            }
+            Require(r.Base.Number("SELECT count(*) FROM gameplay_intervals WHERE session_id=$s AND ((start_ms<$end AND end_ms>$start AND $end>$start) OR (start_ms=$start AND end_ms=$end AND state=$state));",("$s",i.SessionId),("$start",i.StartMs),("$end",i.EndMs),("$state",i.State.ToString()))==0,"INTERVAL_OVERLAP");
+            r.Insert(i,digest);return new GameplayWriteReceipt(i.IntervalId,true);
+        });
+    }
+    public IReadOnlyList<GameplayEvent> GetEvents(string owner,string? game=null,string? biome=null)=>Transaction(false,r=>{Owner(r,owner);Scope(r,owner,game,biome);return r.Events(owner,game,biome);});
+    public IReadOnlyList<GameplaySession> GetSessions(string owner)=>Transaction(false,r=>{Owner(r,owner);return r.Sessions(owner);});
+    public GameplayTotals GetTotals(string owner,string? game=null,string? biome=null)=>Transaction(false,r=>
+    {
+        Owner(r,owner);Scope(r,owner,game,biome);var events=r.Events(owner,game,biome);var intervals=r.Intervals(owner,game,biome);
+        var sessions=r.Sessions(owner).Where(s=>game is null || events.Any(e=>e.SessionId==s.SessionId) || intervals.Any(i=>i.SessionId==s.SessionId)).ToArray();bool captured=events.Any(e=>e.Kind==GameplayEventKind.ANIMAL_SEGMENT_STARTED);
+        StatisticCount Measured(long n)=>new(StatisticsAvailability.Available,n);
+        StatisticCount Count(GameplayEventKind kind)=>captured?Measured(events.LongCount(e=>e.Kind==kind)):new(StatisticsAvailability.NotAvailable,null,"NO_ANIMAL_COVERAGE");
+        StatisticCount Time(Func<GameplayInterval,bool> predicate)=>intervals.Count==0?new(StatisticsAvailability.Unknown,null,"NO_CONFIRMED_INTERVALS"):Measured(intervals.Where(predicate).Sum(i=>i.EndMs-i.StartMs));
+        bool incomplete=sessions.Any(s=>s.Status!="closed" || r.Intervals(owner,session:s.SessionId).Sum(i=>i.EndMs-i.StartMs)!=s.EndOffsetMs);
+        StatisticCount duration=game is not null?new(StatisticsAvailability.NotAvailable,null,"SESSION_SPANS_GAMES"):sessions.Length==0?new(StatisticsAvailability.NoData,null):sessions.Any(s=>s.Status!="closed")?new(StatisticsAvailability.Unknown,null,"OPEN_OR_INTERRUPTED_SESSION"):Measured(sessions.Sum(s=>s.EndOffsetMs!.Value));
+        return new GameplayTotals("RecordedCoverageOnly",game,Count(GameplayEventKind.ANIMAL_DIED),Count(GameplayEventKind.ANIMAL_RESTART_REQUESTED),Count(GameplayEventKind.ANIMAL_RETRY_REQUESTED),
+            Time(i=>(i.State is GameplayTimeState.ActiveHuman or GameplayTimeState.ActiveAnimal)&&i.EndMs-i.StartMs<=StatisticsTelemetry.MaxIntervalMs),Time(i=>i.State==GameplayTimeState.Paused),Time(_=>true),duration,incomplete,true);
+    });
+}

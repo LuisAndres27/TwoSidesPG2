@@ -1,0 +1,119 @@
+[gd_scene format=3 uid="uid://blfxc6vyt1os5"]
+
+[ext_resource type="Texture2D" uid="uid://d0xmkc1l14nuu" path="res://assets/sprites/characters/Delfin/DELFIN JUGADOR DAÑO.png" id="1_dhs1b"]
+[ext_resource type="Script" uid="uid://cten5ckof5du1" path="res://scripts/PlayerDelfin.cs" id="1_svtff"]
+[ext_resource type="Texture2D" uid="uid://cs7dbdojrivln" path="res://assets/sprites/characters/Delfin/DELFIN JUGADOR.png" id="2_rqpis"]
+[ext_resource type="Script" uid="uid://e2hbk1y72d1r" path="res://scripts/globals/Hurtbox.cs" id="3_rqpis"]
+[ext_resource type="Script" uid="uid://626atmjpyhm5" path="res://scripts/Estadisticas.cs" id="5_hbucx"]
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_svtff"]
+atlas = ExtResource("1_dhs1b")
+region = Rect2(0, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_m7ocl"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(0, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_bivxy"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(32, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_rnvqc"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(64, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_hh53h"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(96, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_4tx81"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(0, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_f01ss"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(32, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_bb8l2"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(64, 0, 32, 16)
+
+[sub_resource type="AtlasTexture" id="AtlasTexture_eae5v"]
+atlas = ExtResource("2_rqpis")
+region = Rect2(96, 0, 32, 16)
+
+[sub_resource type="SpriteFrames" id="SpriteFrames_47wke"]
+animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_svtff")
+}],
+"loop": true,
+"name": &"damage",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_m7ocl")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_bivxy")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_rnvqc")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_hh53h")
+}],
+"loop": true,
+"name": &"idle",
+"speed": 5.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_4tx81")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_f01ss")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_bb8l2")
+}, {
+"duration": 1.0,
+"texture": SubResource("AtlasTexture_eae5v")
+}],
+"loop": true,
+"name": &"run",
+"speed": 7.0
+}]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_dhs1b"]
+size = Vector2(32, 20)
+
+[sub_resource type="CapsuleShape2D" id="CapsuleShape2D_rqpis"]
+radius = 12.0
+height = 40.0
+
+[node name="PlayerDelfin" type="CharacterBody2D" unique_id=1890858087]
+script = ExtResource("1_svtff")
+
+[node name="AnimatedSprite2D" type="AnimatedSprite2D" parent="." unique_id=1157180652]
+sprite_frames = SubResource("SpriteFrames_47wke")
+animation = &"run"
+frame_progress = 0.33456686
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=1350011524]
+shape = SubResource("RectangleShape2D_dhs1b")
+
+[node name="Hurtbox" type="Area2D" parent="." unique_id=985499637]
+script = ExtResource("3_rqpis")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Hurtbox" unique_id=74245728]
+position = Vector2(1, 0)
+rotation = 1.5707964
+shape = SubResource("CapsuleShape2D_rqpis")
+debug_color = Color(0.9500951, 3.272891e-06, 0.57267934, 0.41960785)
+
+[node name="Estadisticas" type="Node" parent="." unique_id=691141853]
+script = ExtResource("5_hbucx")
+ActivarAgua = false

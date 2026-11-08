@@ -1,0 +1,167 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+using TwoSides.LocalPersistence;
+using Microsoft.Data.Sqlite;
+using TwoSides.Integration.Sqlite;
+
+internal static partial class Program
+{
+    private static string OutboxPrivateBase=>Path.Combine(Local,"TwoSides","PrivateBackups","B05_OUTBOX");
+    private static void PrivateExisting(string path)
+    {
+        if(!OperatingSystem.IsWindows())throw new SaveException("WINDOWS_REQUIRED");
+        GuardChain(path,Local);
+        var acl=new DirectoryInfo(path).GetAccessControl(AccessControlSections.Access|AccessControlSections.Owner);
+        string user=WindowsIdentity.GetCurrent().User!.Value;
+        Require(acl.GetOwner(typeof(SecurityIdentifier))?.Value==user,"PRIVATE_OWNER_UNEXPECTED");
+        foreach(FileSystemAccessRule ace in acl.GetAccessRules(true,true,typeof(SecurityIdentifier)))
+            Require(ace.AccessControlType!=AccessControlType.Allow || new[]{user,"S-1-5-18","S-1-5-32-544"}.Contains(ace.IdentityReference.Value),"PRIVATE_ACCESS_UNPROVEN");
+    }
+    private static string TrialRoot()
+    {
+        PrivateExisting(Path.GetDirectoryName(OutboxPrivateBase)!);
+        if(!Directory.Exists(OutboxPrivateBase))Directory.CreateDirectory(OutboxPrivateBase);
+        PrivateExisting(OutboxPrivateBase);
+        string root=Path.Combine(OutboxPrivateBase,DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssZ")+"-"+Guid.NewGuid().ToString("N"));
+        Require(!Directory.Exists(root),"TRIAL_EXISTS");Directory.CreateDirectory(root);PrivateExisting(root);return root;
+    }
+    // Harness reuses exact schema constant and checksum; public SyntheticDatabase restriction stays intact.
+    private static bool TrialSyncMigration(CopyDatabase copy,Action? beforeCommit=null)
+    {
+        copy.Check();Require(copy.Role==Role.Rehearsal || copy.Role==Role.Failure,"TRIAL_ROLE_REQUIRED");
+        SchemaManager.Verify(copy);GameplayEventSchema.Verify(copy);
+        using var c=copy.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);
+        if(r.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'sync_*';")!=0)
+        {tx.Commit();SyncOutboxSchema.Verify(copy);return false;}
+        string sql=(string)typeof(SyncOutboxSchema).GetField("Sql",BindingFlags.NonPublic|BindingFlags.Static)!.GetRawConstantValue()!;
+        Require(Hash(sql.ReplaceLineEndings("\n"))==SyncOutboxSchema.Checksum,"MIGRATION_SQL_DIVERGENCE");
+        r.Execute(sql);
+        r.Execute("INSERT INTO sync_schema_migrations VALUES(1,'local-sync-outbox-v1',$hash,$at);",
+            ("$hash",SyncOutboxSchema.Checksum),("$at",SaveValidation.Timestamp(DateTimeOffset.UtcNow)));
+        beforeCommit?.Invoke();tx.Commit();SyncOutboxSchema.Verify(copy);return true;
+    }
+    private static string StatisticsFingerprint(ISaveDatabase copy)=>Hash(JsonSerializer.Serialize(new StatisticsService(copy,RealGameCatalog.InitialState()).GetLocalStatistics()));
+    private static void DomainEqual(Snapshot before,Snapshot after)
+    {
+        Require(before.Version==after.Version && before.ApplicationId==after.ApplicationId,"SOURCE_HEADER_CHANGED");
+        foreach(var table in before.Tables)Require(after.Tables.SingleOrDefault(t=>t.Name==table.Name)==table,"DOMAIN_CHANGED");
+        Require(after.Tables.Where(t=>!before.Tables.Any(old=>old.Name==t.Name)).All(t=>t.Name.StartsWith("sync_",StringComparison.Ordinal)),"UNEXPECTED_NEW_TABLE");
+    }
+    private static string QueueFingerprint(ISaveDatabase copy)
+    {
+        using var c=copy.Open();using var tx=c.BeginTransaction(deferred:true);var r=new SQLiteRepository(c,tx);
+        using var q=r.Command("SELECT operation_id,source_key,payload_hash,canonical_envelope,state,attempts,receipt_json FROM sync_outbox ORDER BY operation_id;");
+        using var d=q.ExecuteReader();var rows=new List<string>();
+        while(d.Read()){var fields=new object[d.FieldCount];d.GetValues(fields);rows.Add(JsonSerializer.Serialize(fields));}
+        tx.Commit();return Hash(string.Join("\n",rows));
+    }
+    private static object RunTrialPass(CopyDatabase copy,SyncBinding binding)
+    {
+        var issues=new Dictionary<string,int>();int inserted=0,existing=0,pages=0,historical=0;
+        SyncReconciliationCursor? cursor=null;
+        do
+        {
+            using var c=copy.Open();using var tx=c.BeginTransaction(deferred:false);
+            var page=SyntheticOutboxReconciler.PrepareSyntheticPage(new(c,tx),binding,DateTimeOffset.UtcNow,25,cursor);
+            tx.Commit();inserted+=page.Inserted;existing+=page.Existing;historical+=page.HistoricalSnapshots;pages++;
+            foreach(var issue in page.Diagnostics){issues.TryGetValue(issue.Key,out int count);issues[issue.Key]=count+issue.Value;}
+            cursor=page.Next;Require(pages<10000,"TRIAL_BUDGET");
+        }while(cursor is not null);
+        Require(issues.Count==0,"TRIAL_CONSISTENCY_BLOCKED");
+        return new{Pages=pages,Inserted=inserted,Existing=existing,HistoricalSnapshots=historical,Diagnostics=issues};
+    }
+    private static (CopyDatabase Copy,SyncBinding Binding) ReadTrialContext(string root)
+    {
+        root=Path.GetFullPath(root);
+        Require(Path.GetDirectoryName(root)==OutboxPrivateBase,"TRIAL_ROOT_OUTSIDE_PRIVATE");
+        PrivateExisting(root);
+        using var doc=JsonDocument.Parse(File.ReadAllText(Path.Combine(root,"trial-context.json")));
+        string file=doc.RootElement.GetProperty("WorkingFile").GetString()!;
+        Require(Path.GetFileName(file)==file && file.EndsWith(".rehearsal.sqlite3",StringComparison.Ordinal),"TRIAL_FILE_REJECTED");
+        var b=doc.RootElement.GetProperty("Binding");
+        return(new CopyDatabase(root,Path.Combine(root,file),Role.Rehearsal),new(b.GetProperty("LocalPlayerId").GetString()!,
+            b.GetProperty("InstallationId").GetString()!,b.GetProperty("BindingGeneration").GetInt64()));
+    }
+    private static int OutboxTrialRestart(string root)
+    {
+        var (copy,binding)=ReadTrialContext(root);
+        string before=QueueFingerprint(copy),stats=StatisticsFingerprint(copy);
+        var pass=RunTrialPass(copy,binding);var snapshot=Inspect(copy.Path);
+        Require(before==QueueFingerprint(copy),"SECOND_PASS_NOT_IDEMPOTENT");
+        Require(stats==StatisticsFingerprint(copy),"SECOND_PASS_STATISTICS_CHANGED");
+        File.WriteAllText(Path.Combine(root,"restart-result.json"),JsonSerializer.Serialize(new{ProcessId=Environment.ProcessId,Pass=pass,
+            QueueFingerprint=before,Idempotent=true,Integrity=snapshot.Integrity,ForeignKeysValid=snapshot.ForeignKeysValid},Json),new UTF8Encoding(false));
+        return 0;
+    }
+    private static string? _latestOutboxTrialRoot;
+    private static int OutboxTrial(bool forActivation=false)
+    {
+        WriterCheck();
+        string source=Path.Combine(Project,"local-persistence",".work","runtime-game","save.sqlite3");
+        using var locks=new DisposableLocks(LockSource(source));
+        var sourceBefore=Metadata(source);var sourceSnapshot=Inspect(source);
+        Require(sourceSnapshot.Version==2 && !sourceSnapshot.Tables.Any(t=>t.Name.StartsWith("sync_",StringComparison.Ordinal)),"SOURCE_SCHEMA_UNEXPECTED");
+        string root=TrialRoot();
+        _latestOutboxTrialRoot=root;
+        var backup=Backup(source,root,"runtime-consistent",Role.Backup);var backed=Inspect(backup.Path);Equal(sourceSnapshot,backed);
+        SchemaManager.Verify(backup);GameplayEventSchema.Verify(backup);
+        var backupMetadata=Metadata(backup.Path);
+        string backupStats=StatisticsFingerprint(backup);
+        File.WriteAllText(Path.Combine(root,"backup-manifest.json"),JsonSerializer.Serialize(new{Phase=forActivation?"B05.3B.2B-preparation":"B05.3B.2A",CapturedUtc=DateTimeOffset.UtcNow,
+            Source=source,SourceMetadata=sourceBefore,Method="SQLite BackupDatabase; read-only source; deny-write source/lease/manifest handles; DELETE mode, no sidecars",
+            BackupFile=Path.GetFileName(backup.Path),BackupMetadata=backupMetadata,Snapshot=backed,StatisticsFingerprint=backupStats,
+            BaseVersion=2,GameplayVersion=1,SyncPresent=false,Restored=false},Json),new UTF8Encoding(false));
+        var work=Backup(backup.Path,root,"independent-outbox-trial",Role.Rehearsal);
+        DomainEqual(backed,Inspect(work.Path));Require(StatisticsFingerprint(work)==backupStats,"COPY_STATISTICS_MISMATCH");
+        Require(TrialSyncMigration(work),"EXPECTED_SYNC_MIGRATION");
+        var migrated=Inspect(work.Path);DomainEqual(backed,migrated);
+        Require(migrated.Tables.Length==backed.Tables.Length+4,"SYNC_TABLE_COUNT");
+        Require(StatisticsFingerprint(work)==backupStats,"MIGRATION_STATISTICS_CHANGED");
+        string migratedHash=FileHash(work.Path);Require(!TrialSyncMigration(work) && FileHash(work.Path)==migratedHash,"SYNC_REAPPLY_CHANGED");
+        string owner=new GameSaveService(work,RealGameCatalog.InitialState()).GetLocalProfile()?.LocalPlayerId??throw new SaveException("PROFILE_ABSENT");
+        var binding=new SyncBinding(owner,Guid.NewGuid().ToString("D"),1);
+        File.WriteAllText(Path.Combine(root,"trial-context.json"),JsonSerializer.Serialize(new{WorkingFile=Path.GetFileName(work.Path),Binding=binding},Json),new UTF8Encoding(false));
+        var first=RunTrialPass(work,binding);string queue=QueueFingerprint(work);
+        var psi=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true};
+        psi.ArgumentList.Add("--outbox-trial-restart");psi.ArgumentList.Add(root);
+        using(var child=Process.Start(psi)!)
+        {
+            if(!child.WaitForExit(30000)){child.Kill();throw new SaveException("RESTART_TIMEOUT");}
+            Require(child.ExitCode==0 && child.StandardOutput.ReadToEnd().Length==0 && child.StandardError.ReadToEnd().Length==0,"RESTART_TRIAL_FAILED");
+        }
+        Require(queue==QueueFingerprint(work),"QUEUE_CHANGED_AFTER_RESTART");
+        var after=Inspect(work.Path);DomainEqual(backed,after);
+        Require(StatisticsFingerprint(work)==backupStats,"RECONCILIATION_STATISTICS_CHANGED");
+        var failures=Backup(backup.Path,root,"migration-rollback-disposable",Role.Failure);
+        string failureHash=FileHash(failures.Path);
+        try{TrialSyncMigration(failures,()=>throw new SaveException("INJECTED_TRIAL_FAILURE"));throw new SaveException("FAILURE_NOT_INJECTED");}
+        catch(SaveException e)when(e.Code=="INJECTED_TRIAL_FAILURE"){}
+        Require(FileHash(failures.Path)==failureHash,"TRIAL_MIGRATION_ROLLBACK_FAILED");Equal(backed,Inspect(failures.Path));
+        Require(Metadata(backup.Path)==backupMetadata,"IMMUTABLE_BACKUP_CHANGED");
+        Require(Metadata(source)==sourceBefore,"RUNTIME_CHANGED");Equal(sourceSnapshot,Inspect(source));
+        var counts=after.Tables.Select(t=>new{Table=t.Name,Rows=t.Rows}).ToArray();
+        var result=new{Status="COMPLETED",Phase="B05.3B.2A",DateUtc=DateTimeOffset.UtcNow,ProcessId=Environment.ProcessId,
+            PrivateRoot=root,Backup=backup.Path,BackupSha256=backupMetadata.Sha256,WorkingCopy=work.Path,BaseVersion=2,GameplayVersion=1,SyncVersion=1,
+            Integrity=after.Integrity,ForeignKeysValid=after.ForeignKeysValid,DomainUnchanged=true,StatisticsUnchanged=true,
+            OriginalUnchanged=true,BackupUnchanged=true,FirstPass=first,SecondPassAfterRestartIdempotent=true,
+            QueueFingerprint=queue,MigrationReappliedIdempotent=true,MigrationFailureRollback=true,Counts=counts,RemoteConfirmed=0};
+        File.WriteAllText(Path.Combine(root,"trial-result.json"),JsonSerializer.Serialize(result,Json),new UTF8Encoding(false));
+        // Counts only, no UUIDs, individual decisions, names or payloads in console/report.
+        if(!forActivation)Console.WriteLine(JsonSerializer.Serialize(result));return 0;
+    }
+    private sealed class DisposableLocks:IDisposable
+    {
+        private readonly List<FileStream> _locks;
+        internal DisposableLocks(List<FileStream> locks)=>_locks=locks;
+        public void Dispose(){foreach(var l in _locks)l.Dispose();}
+    }
+}
+

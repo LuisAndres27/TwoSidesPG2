@@ -1,0 +1,24 @@
+[remap]
+
+importer="wav"
+type="AudioStreamWAV"
+uid="uid://5d8k5g3hptyp"
+path="res://.godot/imported/Snowy Tundra Ambient.wav-8a3bd65c682094bba70159ce0c4346ec.sample"
+
+[deps]
+
+source_file="res://assets/sprites/fondos/Music/Tundra/Snowy Tundra Ambient.wav"
+dest_files=["res://.godot/imported/Snowy Tundra Ambient.wav-8a3bd65c682094bba70159ce0c4346ec.sample"]
+
+[params]
+
+force/8_bit=false
+force/mono=false
+force/max_rate=false
+force/max_rate_hz=44100
+edit/trim=false
+edit/normalize=false
+edit/loop_mode=0
+edit/loop_begin=0
+edit/loop_end=-1
+compress/mode=2

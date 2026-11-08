@@ -1,0 +1,99 @@
+[gd_scene format=3 uid="uid://108x05n4bf20"]
+
+[ext_resource type="Texture2D" uid="uid://b7juon744yy8k" path="res://assets/sprites/ui/BOTONES 1_0002.png" id="1_sd4cx"]
+[ext_resource type="Script" uid="uid://bpjsa0b28fjav" path="res://assets/sprites/ui/MenuPausa.cs" id="1_tj42f"]
+[ext_resource type="PackedScene" uid="uid://bxw8mxlhurrf8" path="res://scenes/levels/menu_niveles.tscn" id="2_eo25j"]
+[ext_resource type="Texture2D" uid="uid://c4fthwoyrm7e" path="res://assets/sprites/ui/TABLERO1.png" id="2_tj42f"]
+[ext_resource type="Texture2D" uid="uid://dawc1fb4wan0m" path="res://assets/sprites/ui/BOTONES 1_0004.png" id="3_eo25j"]
+[ext_resource type="Script" uid="uid://d27kpos4abex5" path="res://scripts/EfectoBoton.cs" id="4_3cty4"]
+[ext_resource type="Texture2D" uid="uid://uxcn0ifbg8ug" path="res://assets/sprites/ui/BOTONES 1_0001.png" id="4_eb2k0"]
+[ext_resource type="Texture2D" uid="uid://ccn18lvllhm87" path="res://assets/sprites/ui/BOTONES 1_0005.png" id="5_3cty4"]
+
+[node name="MenuPausa" type="CanvasLayer" unique_id=241665659]
+script = ExtResource("1_tj42f")
+EscenaMenuNiveles = ExtResource("2_eo25j")
+metadata/_edit_vertical_guides_ = [319.0]
+metadata/_edit_horizontal_guides_ = [156.0]
+
+[node name="Interfaz" type="Control" parent="." unique_id=1541400114]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+
+[node name="BotonPausa" type="TextureButton" parent="Interfaz" unique_id=1430389451]
+layout_mode = 0
+offset_left = 593.0
+offset_top = 6.0
+offset_right = 633.0
+offset_bottom = 46.0
+texture_normal = ExtResource("1_sd4cx")
+ignore_texture_size = true
+stretch_mode = 0
+
+[node name="Efecto" type="Node" parent="Interfaz/BotonPausa" unique_id=1829984384]
+script = ExtResource("4_3cty4")
+
+[node name="FondoMenu" type="Control" parent="Interfaz" unique_id=496553476]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Oscurecer" type="ColorRect" parent="Interfaz/FondoMenu" unique_id=2134824422]
+layout_mode = 0
+offset_right = 640.0
+offset_bottom = 360.0
+color = Color(0, 0, 0, 0.23529412)
+
+[node name="Tablero" type="TextureRect" parent="Interfaz/FondoMenu" unique_id=343689613]
+layout_mode = 0
+offset_left = 130.0
+offset_top = 94.0
+offset_right = 504.0
+offset_bottom = 275.0
+texture = ExtResource("2_tj42f")
+
+[node name="BotonInicio" type="TextureButton" parent="Interfaz/FondoMenu/Tablero" unique_id=467037175]
+layout_mode = 0
+offset_left = 154.0
+offset_top = 39.0
+offset_right = 224.0
+offset_bottom = 109.0
+texture_normal = ExtResource("3_eo25j")
+ignore_texture_size = true
+stretch_mode = 0
+
+[node name="Efecto" type="Node" parent="Interfaz/FondoMenu/Tablero/BotonInicio" unique_id=2065290295]
+script = ExtResource("4_3cty4")
+
+[node name="BotonReiniciar" type="TextureButton" parent="Interfaz/FondoMenu/Tablero" unique_id=455434280]
+layout_mode = 0
+offset_left = 58.0
+offset_top = 79.0
+offset_right = 110.0
+offset_bottom = 131.0
+texture_normal = ExtResource("4_eb2k0")
+ignore_texture_size = true
+stretch_mode = 0
+
+[node name="Efecto" type="Node" parent="Interfaz/FondoMenu/Tablero/BotonReiniciar" unique_id=243550713]
+script = ExtResource("4_3cty4")
+
+[node name="BotonCerrar" type="TextureButton" parent="Interfaz/FondoMenu/Tablero" unique_id=661597560]
+layout_mode = 0
+offset_left = 262.0
+offset_top = 79.0
+offset_right = 314.0
+offset_bottom = 131.0
+texture_normal = ExtResource("5_3cty4")
+ignore_texture_size = true
+stretch_mode = 0
+
+[node name="Efecto" type="Node" parent="Interfaz/FondoMenu/Tablero/BotonCerrar" unique_id=2061572502]
+script = ExtResource("4_3cty4")

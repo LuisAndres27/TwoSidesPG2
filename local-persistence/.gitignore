@@ -1,0 +1,5 @@
+.work/
+**/bin/
+**/obj/
+*.sqlite3
+*.sqlite3-*

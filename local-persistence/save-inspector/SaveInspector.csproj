@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- B73: READ-ONLY inspector for the per-user production save. It never opens the original database with SQLite: it validates the store
+       (ownership manifest, file identity, SQLite header), copies it to a private temporary folder and queries the COPY (Mode=ReadOnly, query_only).
+       Self-contained win-x64 so it does not depend on DOTNET_ROOT. Same offline recipe as the other local-persistence projects. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>SaveInspector</AssemblyName>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <RuntimeFrameworkVersion>8.0.30</RuntimeFrameworkVersion>
+    <TargetLatestRuntimePatch>false</TargetLatestRuntimePatch>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="[8.0.32]"/>
+    <Compile Include="*.cs.txt"/>
+  </ItemGroup>
+</Project>

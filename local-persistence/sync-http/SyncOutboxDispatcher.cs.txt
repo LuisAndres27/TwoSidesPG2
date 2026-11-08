@@ -1,0 +1,282 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+using TwoSides.LocalPersistence;
+
+namespace TwoSides.Integration.SyncHttp;
+
+public sealed record SyncPassSummary(string Code,int Reserved,int Confirmed,int Reconciled,int Retried,int Rejected,int Skipped,SyncHttpFailure Transport)
+{
+    // Safe for logs: counts and fixed codes only.
+    public string DiagnosticSummary=>$"code={Code};reserved={Reserved};confirmed={Confirmed};reconciled={Reconciled};retried={Retried};rejected={Rejected};skipped={Skipped};transport={Transport}";
+}
+
+// Moves operations from the EXISTING local outbox to the Express v2 API and back. It adds no queue and no database: every state change goes
+// through SyncOutboxService (Reserve / Confirm / Retry / Reject), so identifiers never change, nothing is deleted, and a network problem can only
+// move an operation to retryable_failure. An operation becomes confirmed only with a server receipt that matches it exactly.
+// Synchronous SQLite calls run on the caller's thread: invoke from a background worker, never from the Godot frame thread.
+public sealed class SyncOutboxDispatcher
+{
+    private readonly SyncOutboxService _outbox;
+    private readonly SyncSessionManager _session;
+    private readonly SyncBinding _binding;
+    // F3.1 (B48 5): a pass reserves at most `CurrentBatchSize` operations: it starts at 5 and never exceeds 8 (SyncHttpOptions.MaxBatchOperationsLimit), because the server
+    // gives one batch at most 10 s and one operation costs about 0.7-1.5 s there. It grows by one only after a FULL batch confirmed completely and the measured time says
+    // the next size still fits in TargetBatchMs; it shrinks by one (never below 1) after a timeout, a 5xx/503 answer or a batch slower than SlowBatchMs.
+    // It changes how many operations travel together, never an identifier, a payload, a lease rule or the order of the outbox.
+    public const int TargetBatchMs=6000;
+    public const int SlowBatchMs=8000;
+    private readonly int _maxBatch;
+    private int _batchSize;
+    private readonly Func<long> _clockMs;
+    private readonly SemaphoreSlim _pass=new(1,1);
+    public int CurrentBatchSize=>Volatile.Read(ref _batchSize);
+    public int MaxBatchSize=>_maxBatch;
+    // B54: owner quota exhausted at the server (per-operation error code "quota_exceeded" inside a batch answer; the rate limiter answers a different shape: no "results", code "rate_limited").
+    // The pass stops, every not-yet-confirmed operation is paused in SQLite (next_attempt_ms only, so the pause survives a restart) for a growing time, and nothing is rejected, renumbered or
+    // deleted. When the pause ends ONE operation probes the server; only a really NEW commit proves that capacity is back (a "duplicate" answer is not checked against the quota).
+    public static readonly TimeSpan[] DefaultQuotaPauses={TimeSpan.FromMinutes(15),TimeSpan.FromHours(1),TimeSpan.FromHours(6)};
+    private readonly TimeSpan[] _quotaPauses;
+    private int _quotaLevel;
+    private volatile bool _probe;
+    public bool QuotaProbePending=>_probe;
+    // Call when the quota was raised or freed: the pause ends now and the next pass probes with one operation.
+    public int ResumeAfterQuotaChange()
+    {
+        int released=_outbox.ReleaseQuotaPause(_binding);
+        Volatile.Write(ref _quotaLevel,0);_probe=true;return released;
+    }
+    public SyncOutboxDispatcher(SyncOutboxService outbox,SyncSessionManager session,SyncBinding binding,int batchSize=SyncHttpOptions.InitialBatchOperations,
+        int maxBatchSize=SyncHttpOptions.MaxBatchOperationsLimit,Func<long>? clockMs=null,TimeSpan[]? quotaPauses=null)
+    {
+        _quotaPauses=quotaPauses is {Length:>0}?quotaPauses.ToArray():DefaultQuotaPauses;
+        SaveValidation.Require(_quotaPauses.All(p=>p>=TimeSpan.FromSeconds(1) && p<=SyncOutboxService.MaxQuotaPause),"INVALID_SYNC_QUOTA_PAUSE");
+        SaveValidation.Require(maxBatchSize is >=1 and <=SyncHttpOptions.MaxBatchOperationsLimit && batchSize >=1 && batchSize<=maxBatchSize,"INVALID_SYNC_BATCH");
+        _outbox=outbox;_session=session;_binding=binding;_batchSize=batchSize;_maxBatch=maxBatchSize;
+        _clockMs=clockMs??(()=>Stopwatch.GetTimestamp()*1000/Stopwatch.Frequency);
+    }
+
+    // Called once per pass that actually sent a batch. `full`: the batch had CurrentBatchSize operations (there may be more waiting).
+    private void AdaptBatchSize(int sent,long tookMs,SyncHttpFailure transport,bool allConfirmed,bool full)
+    {
+        int current=CurrentBatchSize,next=current;
+        if(transport is SyncHttpFailure.Timeout or SyncHttpFailure.ServerUnavailable || tookMs>=SlowBatchMs)next=Math.Max(1,current-1);
+        else if(allConfirmed && full && sent>0 && current<_maxBatch && tookMs*(current+1)/sent<=TargetBatchMs)next=current+1;
+        if(next!=current)Volatile.Write(ref _batchSize,next);
+    }
+
+    private sealed class Tally{public int Confirmed,Reconciled,Retried,Rejected,Skipped;}
+
+    public async Task<SyncPassSummary> RunPassAsync(CancellationToken cancellation)
+    {
+        await _pass.WaitAsync(cancellation).ConfigureAwait(false);
+        try{return await PassAsync(cancellation).ConfigureAwait(false);}
+        finally{_pass.Release();}
+    }
+
+    private SyncPassSummary Summary(string code,int reserved,Tally t,SyncHttpFailure transport=SyncHttpFailure.None)=>new(code,reserved,t.Confirmed,t.Reconciled,t.Retried,t.Rejected,t.Skipped,transport);
+
+    private async Task<SyncPassSummary> PassAsync(CancellationToken cancellation)
+    {
+        var tally=new Tally();IReadOnlyList<OutboxOperation> reserved;
+        try{_outbox.RecoverExpired(_binding);reserved=_outbox.Reserve(_binding,_probe?1:CurrentBatchSize);}
+        catch(SaveException error){return Summary("SYNC_STORAGE_"+error.Code,0,tally);}
+        if(reserved.Count==0)
+        {
+            try{if(_outbox.QuotaPauseUntil(_binding) is not null)return Summary("SYNC_QUOTA_BLOCKED",0,tally);}
+            catch(SaveException error){return Summary("SYNC_STORAGE_"+error.Code,0,tally);}
+            return Summary("SYNC_IDLE",0,tally);
+        }
+
+        var auth=await _session.EnsureAsync(cancellation).ConfigureAwait(false);
+        if(!auth.Ok)return Failure(reserved,tally,auth.Failure,auth.RetryAfter);
+
+        var toSend=reserved.ToList();
+        // An operation that was already sent once may have been committed although the answer was lost: ask for receipts before sending it again.
+        var uncertain=reserved.Where(o=>o.Attempts>1).ToList();
+        if(uncertain.Count>0)
+        {
+            var query=await PostAsync("/api/v2/sync/receipts/query",new{schemaVersion=2,attempts=uncertain.Select(Descriptor).ToArray()},cancellation).ConfigureAwait(false);
+            if(query.Ok && query.Body is {ValueKind:JsonValueKind.Object} q && q.TryGetProperty("results",out var found) && found.ValueKind==JsonValueKind.Array)
+            {
+                foreach(var item in found.EnumerateArray())
+                {
+                    if(Text(item,"status")!="found"||Text(item,"operationId") is not string id)continue;
+                    var op=uncertain.FirstOrDefault(o=>o.OperationId==id);
+                    if(op is null||!item.TryGetProperty("receipt",out var receipt))continue;
+                    if(Confirm(op,receipt,tally)){tally.Reconciled++;toSend.Remove(op);}
+                }
+            }
+            else if(query.Failure is SyncHttpFailure.Canceled)return Summary("SYNC_CANCELED",reserved.Count,tally,query.Failure);
+            else if(query.Status!=409 && query.Failure!=SyncHttpFailure.None)return FailureRemaining(toSend,reserved.Count,tally,query);
+            // 409 (hash conflict for some operation): send the batch and let the server judge each operation individually.
+        }
+        if(toSend.Count==0)return Summary(tally.Reconciled>0?"SYNC_RECONCILED":"SYNC_IDLE",reserved.Count,tally);
+
+        var operations=toSend.Select(o=>new{operationId=o.OperationId,payloadHash=o.PayloadHash,leaseId=o.LeaseId,attempt=o.Attempts,
+            canonicalEnvelope=o.CanonicalEnvelope,dependencies=_outbox.Dependencies(o.LocalPlayerId,o.OperationId)}).ToArray();
+        int attemptSize=CurrentBatchSize;long startedMs=_clockMs();
+        var response=await PostAsync("/api/v2/sync/batches",new{schemaVersion=2,batchId=Guid.NewGuid().ToString("D"),operations},cancellation).ConfigureAwait(false);
+        long tookMs=Math.Max(0,_clockMs()-startedMs);
+        if(response.Failure==SyncHttpFailure.Canceled)return Summary("SYNC_CANCELED",reserved.Count,tally,response.Failure);
+        if(response.Body is not {ValueKind:JsonValueKind.Object} body||!body.TryGetProperty("results",out var results)||results.ValueKind!=JsonValueKind.Array)
+        {AdaptBatchSize(toSend.Count,tookMs,response.Failure==SyncHttpFailure.None?SyncHttpFailure.InvalidResponse:response.Failure,false,false);return FailureRemaining(toSend,reserved.Count,tally,response);}
+
+        var byId=new Dictionary<string,JsonElement>();
+        foreach(var r in results.EnumerateArray())if(Text(r,"operationId") is string rid)byId[rid]=r;
+        bool quotaHit=false,newCommit=false;
+        foreach(var op in toSend)
+        {
+            if(!byId.TryGetValue(op.OperationId,out var res)){Retry(op,"remote_unavailable",null,tally);continue;}
+            switch(Text(res,"status"))
+            {
+                case "committed" or "duplicate" or "superseded":
+                    if(!res.TryGetProperty("receipt",out var receipt)||!Confirm(op,receipt,tally))Retry(op,"remote_unavailable",null,tally);
+                    else if(Text(res,"status")=="committed")newCommit=true;
+                    break;
+                case "deferred":
+                    if(Error(res,"code")=="quota_exceeded"){quotaHit=true;Retry(op,"quota_exceeded",null,tally);}   // the server's 1 s hint is meaningless for a quota
+                    else Retry(op,RetryCode(Error(res,"code")),Seconds(res),tally);
+                    break;
+                case "conflict" or "rejected":
+                    var permanent=PermanentCode(Error(res,"code"));
+                    if(permanent is null)Retry(op,"remote_unavailable",null,tally);else Reject(op,permanent,tally);
+                    break;
+                default:Retry(op,"remote_unavailable",null,tally);break;
+            }
+        }
+        bool allConfirmed=tally.Confirmed+tally.Reconciled==reserved.Count;
+        AdaptBatchSize(toSend.Count,tookMs,response.Failure,allConfirmed,reserved.Count>=attemptSize);
+        if(quotaHit)return BlockForQuota(reserved.Count,tally);
+        if(newCommit){Volatile.Write(ref _quotaLevel,0);_probe=false;}
+        string code=allConfirmed?"SYNC_OK":"SYNC_PARTIAL";
+        return Summary(code,reserved.Count,tally);
+    }
+
+    private SyncPassSummary BlockForQuota(int reserved,Tally tally)
+    {
+        int level=Volatile.Read(ref _quotaLevel);var pause=_quotaPauses[Math.Min(level,_quotaPauses.Length-1)];
+        Volatile.Write(ref _quotaLevel,level+1);_probe=true;
+        try{_outbox.DeferForQuota(_binding,pause);}
+        catch(SaveException error){return Summary("SYNC_STORAGE_"+error.Code,reserved,tally);}   // the per-operation backoff still applies; nothing is lost
+        return Summary("SYNC_QUOTA_BLOCKED",reserved,tally,SyncHttpFailure.RateLimited);
+    }
+
+    // ---- HTTP ----
+    private static object Descriptor(OutboxOperation o)=>new{operationId=o.OperationId,payloadHash=o.PayloadHash,leaseId=o.LeaseId,attempt=o.Attempts};
+
+    private Task<SyncHttpResponse> PostAsync(string path,object body,CancellationToken cancellation)
+        =>_session.SendAsync(HttpMethod.Post,path,SyncHttpTransport.Json(body),cancellation);   // one re-login on 401; the operations keep their leases
+
+    private SyncPassSummary Failure(IReadOnlyList<OutboxOperation> reserved,Tally tally,SyncHttpFailure failure,TimeSpan? retryAfter)
+    {
+        if(failure==SyncHttpFailure.Canceled)return Summary("SYNC_CANCELED",reserved.Count,tally,failure);    // leases expire and recover; nothing is lost
+        foreach(var op in reserved)Retry(op,TransportCode(failure),retryAfter,tally);
+        return Summary("SYNC_"+failure.ToString().ToUpperInvariant(),reserved.Count,tally,failure);
+    }
+    private SyncPassSummary FailureRemaining(IReadOnlyList<OutboxOperation> remaining,int reserved,Tally tally,SyncHttpResponse response)
+    {
+        var failure=response.Failure==SyncHttpFailure.None?SyncHttpFailure.InvalidResponse:response.Failure;
+        foreach(var op in remaining)Retry(op,TransportCode(failure),response.RetryAfter,tally);
+        return Summary("SYNC_"+failure.ToString().ToUpperInvariant(),reserved,tally,failure);
+    }
+
+    // ---- outbox transitions (never throw to the caller: a lost lease only means the operation is recovered later) ----
+    private void Retry(OutboxOperation op,string code,TimeSpan? after,Tally t)
+    {
+        try{_outbox.Retry(op.LocalPlayerId,op.OperationId,op.LeaseId!,op.Attempts,code,after);t.Retried++;}
+        catch(SaveException){t.Skipped++;}
+    }
+    private void Reject(OutboxOperation op,string code,Tally t)
+    {
+        try{_outbox.Reject(op.LocalPlayerId,op.OperationId,op.LeaseId!,op.Attempts,code);t.Rejected++;}
+        catch(SaveException){t.Skipped++;}
+    }
+    private bool Confirm(OutboxOperation op,JsonElement receipt,Tally t)
+    {
+        if(receipt.ValueKind!=JsonValueKind.Object||Text(receipt,"operationId")!=op.OperationId||Text(receipt,"payloadHash")!=op.PayloadHash||
+           Text(receipt,"installationId")!=op.InstallationId||Text(receipt,"localPlayerId")!=op.LocalPlayerId||
+           !receipt.TryGetProperty("bindingGeneration",out var generation)||!generation.TryGetInt64(out long g)||g!=op.BindingGeneration||
+           Text(receipt,"receiptId") is not string receiptId||Text(receipt,"committedAtUtc") is not string at||Text(receipt,"acceptedAs") is not string accepted)
+        {t.Skipped++;return false;}
+        try
+        {
+            _outbox.Confirm(new(op.OperationId,op.LocalPlayerId,op.InstallationId,op.BindingGeneration,op.PayloadHash,op.LeaseId!,op.Attempts,receiptId,at,accepted));
+            t.Confirmed++;return true;
+        }
+        catch(SaveException){t.Skipped++;return false;}
+    }
+
+    // ---- mapping of server codes to the outbox vocabulary (unknown codes are never turned into a permanent rejection) ----
+    private static string TransportCode(SyncHttpFailure f)=>f switch
+    {
+        SyncHttpFailure.NetworkUnavailable=>"network_unavailable",SyncHttpFailure.Timeout=>"timeout",SyncHttpFailure.RateLimited=>"rate_limited",_=>"remote_unavailable"
+    };
+    private static string RetryCode(string? code)=>code switch{"dependency_missing"=>"dependency_missing","rate_limited"=>"rate_limited",_=>"remote_unavailable"};
+    private static string? PermanentCode(string? code)=>code switch
+    {
+        "unsupported_contract"=>"unsupported_contract","unsupported_rules_version"=>"unsupported_rules_version",
+        "invalid_fact" or "invalid_operation" or "invalid_canonical_envelope" or "invalid_json" or "invalid_number" or "duplicate_json_key" or
+        "interval_overlap" or "invalid_dependencies"=>"invalid_fact",
+        "source_conflict" or "idempotency_conflict" or "dependency_conflict" or "forbidden"=>"payload_conflict",
+        _=>null
+    };
+    private static string? Text(JsonElement e,string name)=>e.ValueKind==JsonValueKind.Object && e.TryGetProperty(name,out var v) && v.ValueKind==JsonValueKind.String?v.GetString():null;
+    private static string? Error(JsonElement e,string name)=>e.TryGetProperty("error",out var err)?Text(err,name):null;
+    private static TimeSpan? Seconds(JsonElement e)=>e.TryGetProperty("error",out var err) && err.TryGetProperty("retryAfterSeconds",out var s) && s.TryGetInt32(out int n) && n is >=0 and <=86400?TimeSpan.FromSeconds(n):null;
+}
+
+public sealed record SyncWorkerDiagnostic(string Code,long Passes,bool Running);
+
+// Optional background loop; nothing in the game creates it. Dispose cancels and waits, never blocks the caller beyond one bounded step.
+public sealed class SyncOutboxWorker:IAsyncDisposable
+{
+    private readonly Func<CancellationToken,Task<SyncPassSummary>> _pass;
+    private readonly SemaphoreSlim _signal=new(0,1);
+    private readonly CancellationTokenSource _stop=new();
+    private readonly TimeSpan _idle,_failure;
+    private readonly Task _worker;
+    private int _requested;
+    private SyncWorkerDiagnostic _diagnostic=new("SYNC_WORKER_IDLE",0,false);
+    public SyncWorkerDiagnostic Diagnostic=>Volatile.Read(ref _diagnostic);
+    public SyncOutboxWorker(Func<CancellationToken,Task<SyncPassSummary>> pass,TimeSpan? idle=null,TimeSpan? failure=null)
+    {
+        _pass=pass;_idle=idle??TimeSpan.FromSeconds(15);_failure=failure??TimeSpan.FromSeconds(5);
+        SaveValidation.Require(_idle>TimeSpan.Zero && _failure>TimeSpan.Zero,"INVALID_SYNC_WORKER");
+        _worker=Task.Run(Run);
+    }
+    public void Request(){if(Interlocked.Exchange(ref _requested,1)==0){try{_signal.Release();}catch(SemaphoreFullException){}}}
+    private async Task Run()
+    {
+        var token=_stop.Token;
+        try
+        {
+            while(!token.IsCancellationRequested)
+            {
+                await _signal.WaitAsync(_idle,token).ConfigureAwait(false);
+                Interlocked.Exchange(ref _requested,0);
+                var before=Diagnostic;Volatile.Write(ref _diagnostic,before with{Running=true});
+                TimeSpan next=TimeSpan.Zero;string code;
+                try
+                {
+                    var summary=await _pass(token).ConfigureAwait(false);code=summary.Code;
+                    if(summary.Confirmed+summary.Reconciled==0 && summary.Reserved>0)next=_failure;   // failures wait; a draining pass runs again at once
+                    else if(summary.Reserved==0)next=_idle;
+                }
+                catch(OperationCanceledException) when(token.IsCancellationRequested){break;}
+                catch{code="SYNC_WORKER_FAILED";next=_failure;}
+                Volatile.Write(ref _diagnostic,new(code,Diagnostic.Passes+1,false));
+                if(next>TimeSpan.Zero)await Task.Delay(next,token).ConfigureAwait(false);
+            }
+        }
+        catch(OperationCanceledException) when(token.IsCancellationRequested){}
+        finally{Volatile.Write(ref _diagnostic,Diagnostic with{Running=false});}
+    }
+    public async ValueTask DisposeAsync(){_stop.Cancel();try{await _worker.ConfigureAwait(false);}catch(OperationCanceledException){}}
+}

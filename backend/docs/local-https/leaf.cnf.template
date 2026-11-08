@@ -1,0 +1,8 @@
+# OpenSSL request configuration of the local test server certificate (B23).
+# Usage:  openssl req -newkey rsa:2048 -nodes -keyout localhost.key -out localhost.csr -config leaf.cnf
+[req]
+distinguished_name = dn
+prompt = no
+
+[dn]
+CN = localhost

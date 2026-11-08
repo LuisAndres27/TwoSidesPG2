@@ -1,0 +1,249 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+// B77 statistics-only contract. No snapshots, names, local owner IDs, credentials, paths or HTTP.
+public sealed record StatisticalEvent(string EventId,int SchemaVersion,string InstallationId,string SessionId,string Type,
+    string OccurredAtUtc,string? GameId,string? BiomeId,long? DurationMs,string Data);
+public sealed record StatisticalDelivery(StatisticalEvent Event,string PayloadHash,string LeaseId,long Attempts);
+public sealed class StatisticsTelemetry : ITransactionalSaveExtension
+{
+    public const int Version=1;
+    public const long MaxIntervalMs=60_000;
+    private readonly ISaveDatabase _db;
+    public string SessionId {get;}=Guid.NewGuid().ToString("D");
+    public string? BiomeIntent {get;set;}
+    public string Diagnostic {get;private set;}="STATISTICS_READY";
+    private readonly Action? _captureFailure;
+    public StatisticsTelemetry(ISaveDatabase database,Action? captureFailure=null){_db=database;_captureFailure=captureFailure;}
+    private const string Sql="""
+CREATE TABLE statistics_schema_migrations(version INTEGER PRIMARY KEY,migration_key TEXT NOT NULL UNIQUE,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
+CREATE TABLE statistics_installation(singleton INTEGER PRIMARY KEY CHECK(singleton=1),installation_id TEXT NOT NULL UNIQUE,created_at_utc TEXT NOT NULL);
+CREATE TABLE statistics_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT NOT NULL UNIQUE,source_key TEXT NOT NULL UNIQUE,
+ event_type TEXT NOT NULL CHECK(event_type IN('installation_registered','game_started','game_completed','biome_entered','biome_completed','environmental_decision','playtime_interval','session_started','session_ended')),
+ session_id TEXT NOT NULL,occurred_at_utc TEXT NOT NULL,game_token TEXT,biome_id TEXT,duration_ms INTEGER CHECK(duration_ms>=0 AND duration_ms<=60000),data TEXT NOT NULL CHECK(json_valid(data)));
+CREATE TABLE statistics_outbox(event_id TEXT PRIMARY KEY REFERENCES statistics_events(event_id),
+ state TEXT NOT NULL CHECK(state IN('pending','in_flight','confirmed','retryable_failure','permanent_failure')),attempts INTEGER NOT NULL CHECK(attempts>=0),next_attempt_ms INTEGER NOT NULL,
+ lease_id TEXT,lease_until_ms INTEGER,receipt_hash TEXT,last_error_code TEXT,
+ CHECK((state='in_flight' AND lease_id IS NOT NULL AND lease_until_ms IS NOT NULL) OR (state!='in_flight' AND lease_id IS NULL AND lease_until_ms IS NULL)),
+ CHECK((state='confirmed' AND receipt_hash IS NOT NULL) OR (state!='confirmed' AND receipt_hash IS NULL)));
+CREATE INDEX ix_statistics_due ON statistics_outbox(state,next_attempt_ms);
+CREATE TABLE statistics_coverage(code TEXT PRIMARY KEY,occurred_at_utc TEXT NOT NULL);
+CREATE TABLE statistics_projection(source_key TEXT PRIMARY KEY,status TEXT NOT NULL CHECK(status IN('projected','excluded')));
+CREATE TABLE statistics_intents(operation_id TEXT PRIMARY KEY REFERENCES local_operations(operation_id),session_id TEXT NOT NULL,biome_id TEXT,projected INTEGER NOT NULL CHECK(projected IN(0,1)));
+CREATE INDEX ix_statistics_intents_pending ON statistics_intents(projected);
+CREATE TABLE statistics_cursors(source TEXT PRIMARY KEY CHECK(source IN('event','interval')),last_rowid INTEGER NOT NULL CHECK(last_rowid>=0));
+INSERT INTO statistics_cursors SELECT 'event',coalesce(max(rowid),0) FROM gameplay_events;
+INSERT INTO statistics_cursors SELECT 'interval',coalesce(max(rowid),0) FROM gameplay_intervals;
+CREATE TRIGGER statistics_event_immutable BEFORE UPDATE ON statistics_events BEGIN SELECT RAISE(ABORT,'immutable_statistical_event'); END;
+CREATE TRIGGER statistics_receipt_immutable BEFORE UPDATE ON statistics_outbox WHEN OLD.state='confirmed' BEGIN SELECT RAISE(ABORT,'immutable_statistical_receipt'); END;
+""";
+    public static string Checksum=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Sql.ReplaceLineEndings("\n"))));
+    private static string Utc(DateTimeOffset time)=>time.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'",System.Globalization.CultureInfo.InvariantCulture);
+    private static string Digest(string value)=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+    private static string Token(string installation,string source)=>Digest(installation+":"+source).Substring(0,32);
+    private static void Require(bool ok,string code="INVALID_STATISTICAL_EVENT")=>SaveValidation.Require(ok,code);
+    public static string Canonical(StatisticalEvent e)
+    {
+        if(e is null)throw new SaveException("INVALID_STATISTICAL_EVENT");
+        SaveValidation.Id(e.EventId);SaveValidation.Id(e.InstallationId);SaveValidation.Id(e.SessionId);
+        Require(e.SchemaVersion==1&&e.OccurredAtUtc is not null&&e.OccurredAtUtc.Length<=40&&DateTimeOffset.TryParse(e.OccurredAtUtc,System.Globalization.CultureInfo.InvariantCulture,System.Globalization.DateTimeStyles.RoundtripKind,out var time)&&time.Offset==TimeSpan.Zero);
+        Require(e.GameId is null || (e.GameId.Length==32&&e.GameId.All(c=>"0123456789abcdef".Contains(c))));
+        Require(e.BiomeId is null || new[]{"ocean","jungle","desert","forest","tundra"}.Contains(e.BiomeId));Require(e.Data is not null&&e.Data.Length<=1024&&e.DurationMs is null or >=0 and <=MaxIntervalMs);
+        using var json=ParseData(e.Data!);var d=json.RootElement;Require(d.ValueKind==JsonValueKind.Object);
+        string[] fields=e.Type switch{
+            "installation_registered" or "game_started" or "biome_entered"=>Array.Empty<string>(),
+            "game_completed"=>new[]{"ending"},"biome_completed"=>new[]{"result"},
+            "environmental_decision"=>new[]{"decisionKey","option","state"},
+            "session_started" or "session_ended"=>new[]{"status"},
+            "playtime_interval"=>new[]{"state","startMs","endMs","excluded","active"},
+            _=>throw new SaveException("INVALID_STATISTICAL_EVENT")};
+        Require(d.EnumerateObject().Count()==fields.Length&&fields.All(k=>d.TryGetProperty(k,out _)));
+        string Text(string key){Require(d.GetProperty(key).ValueKind==JsonValueKind.String);return d.GetProperty(key).GetString()!;}
+        if(e.Type=="environmental_decision"){
+            Require(new[]{"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"}.Contains(Text("decisionKey")));
+            Require(Text("option") is "reject" or "approve");Require(Text("state")== (Text("option")=="reject"?"healthy":"degraded"));
+        }
+        if(e.Type=="game_completed")Require(Text("ending") is "good" or "medium" or "bad");
+        if(e.Type=="biome_completed")Require(Text("result") is "good" or "bad");
+        if(e.Type=="session_started")Require(Text("status")=="open");
+        if(e.Type=="session_ended")Require(Text("status") is "closed" or "interrupted");
+        if(e.Type=="playtime_interval"){
+            Require(d.GetProperty("startMs").TryGetInt64(out long start)&&d.GetProperty("endMs").TryGetInt64(out long end));
+            start=d.GetProperty("startMs").GetInt64();end=d.GetProperty("endMs").GetInt64();
+            Require(start>=0&&end>=start&&end<=9_007_199_254_740_991&&Enum.TryParse<GameplayTimeState>(Text("state"),out var state)&&Enum.IsDefined(state));
+            bool excluded=end-start>MaxIntervalMs,active=!excluded&&(Text("state") is "ActiveHuman" or "ActiveAnimal");
+            Require(d.GetProperty("excluded").ValueKind is JsonValueKind.True or JsonValueKind.False && d.GetProperty("active").ValueKind is JsonValueKind.True or JsonValueKind.False);
+            Require(d.GetProperty("excluded").GetBoolean()==excluded&&d.GetProperty("active").GetBoolean()==active&&e.DurationMs==(active?end-start:0));
+        }else Require(e.DurationMs is null);
+        // The nested Data object has a closed per-event schema. Serialize the immutable DTO, never domain aggregates.
+        return JsonSerializer.Serialize(e);
+    }
+    private static JsonDocument ParseData(string value){try{return JsonDocument.Parse(value);}catch(JsonException){throw new SaveException("INVALID_STATISTICAL_EVENT");}}
+    public static void Initialize(ISaveDatabase db,Action? beforeCommit=null)
+    {
+        Require(db is SyntheticDatabase || db is CopyGameDatabase {IsProductionStore:true},"STATISTICS_STORE_NOT_AUTHORIZED");
+        SchemaManager.Verify(db);
+        try{
+            using var c=db.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);
+            // Never reinterpret or migrate the old snapshot Outbox automatically.
+            Require(r.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'sync_*';")==0,"LEGACY_SYNC_REVIEW_REQUIRED");
+            GameplayEventSchema.Install(r);
+            if(r.Number("SELECT count(*) FROM sqlite_master WHERE name GLOB 'statistics_*';")==0){
+                r.Execute(Sql);r.Execute("INSERT INTO statistics_schema_migrations VALUES(1,'statistics-only-v1',$h,$at);",("$h",Checksum),("$at",Utc(DateTimeOffset.UtcNow)));
+                r.Execute("INSERT INTO statistics_installation VALUES(1,$id,$at);",("$id",Guid.NewGuid().ToString("D")),("$at",Utc(DateTimeOffset.UtcNow)));
+                if(r.Number("SELECT count(*) FROM local_operations;")>0)r.Execute("INSERT INTO statistics_coverage VALUES('PREEXISTING_PROGRESS_NO_BACKFILL',$at);",("$at",Utc(DateTimeOffset.UtcNow)));
+            }
+            Verify(r);beforeCommit?.Invoke();tx.Commit();
+        }catch(SqliteException e){throw StorageErrors.Map(e);}
+    }
+    private static void Verify(SQLiteRepository r)
+    {
+        Require(r.Number("SELECT count(*) FROM sqlite_master WHERE name IN('statistics_schema_migrations','statistics_installation','statistics_events','statistics_outbox','statistics_coverage','statistics_projection','statistics_intents','statistics_cursors','ix_statistics_intents_pending','ix_statistics_due','statistics_event_immutable','statistics_receipt_immutable');")==12,"UNSUPPORTED_STATISTICS_SCHEMA");
+        Require(r.Number("SELECT count(*) FROM statistics_schema_migrations;")==1&&r.Number("SELECT count(*) FROM statistics_schema_migrations WHERE version=1 AND migration_key='statistics-only-v1' AND checksum=$h;",("$h",Checksum))==1,"UNSUPPORTED_STATISTICS_SCHEMA");
+        Require(r.Number("SELECT count(*) FROM statistics_installation WHERE singleton=1;")==1,"UNSUPPORTED_STATISTICS_SCHEMA");
+        Require(r.Number("SELECT count(*) FROM statistics_cursors;")==2,"UNSUPPORTED_STATISTICS_SCHEMA");
+        GameplayEventSchema.Verify(r);
+    }
+    private static string Installation(SQLiteRepository r){using var q=r.Command("SELECT installation_id FROM statistics_installation WHERE singleton=1;");return (string)q.ExecuteScalar()!;}
+    // B87: read-only accessor for the (non-secret) installation id, needed to hand the credential over to an explicitly authorized test run. Changes nothing.
+    public string GetInstallationId(){using var c=_db.Open();using var tx=c.BeginTransaction(deferred:true);var r=new SQLiteRepository(c,tx);Verify(r);return Installation(r);}
+    private static string Session(SQLiteRepository r,string fallback){using var q=r.Command("SELECT session_id FROM gameplay_sessions WHERE status='open' LIMIT 1;");return q.ExecuteScalar() as string??fallback;}
+    private static void Add(SQLiteRepository r,string source,string type,string session,string at,string? game=null,string? biome=null,long? duration=null,object? data=null)
+    {
+        SaveValidation.Id(session);Require(new[]{"installation_registered","game_started","game_completed","biome_entered","biome_completed","environmental_decision","playtime_interval","session_started","session_ended"}.Contains(type));
+        Require(biome is null || new[]{"ocean","jungle","desert","forest","tundra"}.Contains(biome));Require(duration is null || duration is >=0 and <=MaxIntervalMs);
+        string details=JsonSerializer.Serialize(data??new{});Require(Encoding.UTF8.GetByteCount(details)<=1024);
+        string installation=Installation(r);var idBytes=SHA256.HashData(Encoding.UTF8.GetBytes(installation+":"+source)).AsSpan(0,16).ToArray();
+        idBytes[7]=(byte)((idBytes[7]&15)|64);idBytes[8]=(byte)((idBytes[8]&63)|128);
+        string id=new Guid(idBytes).ToString("D");
+        string? token=game is null?null:Token(installation,game);
+        // A source retry must retain its first timestamp/session/content. No replacement or new identifier.
+        if(r.Number("SELECT count(*) FROM statistics_events WHERE source_key=$s;",("$s",source))!=0)return;
+        _=Canonical(new(id,1,installation,session,type,at,token,biome,duration,details));
+        r.Execute("INSERT INTO statistics_events(event_id,source_key,event_type,session_id,occurred_at_utc,game_token,biome_id,duration_ms,data) VALUES($id,$s,$t,$session,$at,$g,$b,$d,$data);",("$id",id),("$s",source),("$t",type),("$session",session),("$at",at),("$g",token),("$b",biome),("$d",duration),("$data",details));
+        r.Execute("INSERT INTO statistics_outbox VALUES($id,'pending',0,0,NULL,NULL,NULL,NULL);",("$id",id));
+    }
+    // Same commit as the validated domain command; isolation savepoint prevents telemetry errors undoing game progress.
+    public void BeforeCommit(SqliteConnection c,SqliteTransaction tx,SaveReceipt receipt)
+    {
+        var r=new SQLiteRepository(c,tx);string session=SessionId;string? biome=null;
+        // Retain a compact local projection intent in the game commit, even if the event insert fails.
+        // This journal contains no snapshot or visible name and never enters the outgoing DTO.
+        try{Verify(r);session=Session(r,SessionId);biome=BiomeIntent??(receipt.GameId is null?null:r.Game(receipt.LocalPlayerId,receipt.GameId)?.CurrentBiomeId);
+            r.Execute("INSERT INTO statistics_intents VALUES($id,$s,$b,0);",("$id",receipt.OperationId),("$s",session),("$b",biome));
+        }catch{Diagnostic="STATISTICS_CAPTURE_GAP";try{r.Execute("INSERT OR IGNORE INTO statistics_coverage VALUES('CAPTURE_GAP',$at);",("$at",receipt.CommittedAt));}catch{}return;}
+        r.Execute("SAVEPOINT statistics_capture;");
+        try{
+            _captureFailure?.Invoke();CaptureDomain(r,receipt,session,biome);
+            r.Execute("RELEASE statistics_capture;");Diagnostic="STATISTICS_READY";
+        }catch{
+            r.Execute("ROLLBACK TO statistics_capture;RELEASE statistics_capture;");Diagnostic="STATISTICS_CAPTURE_GAP";
+            try{r.Execute("INSERT OR IGNORE INTO statistics_coverage VALUES('CAPTURE_GAP',$at);",("$at",receipt.CommittedAt));}catch{/* Never invent missing events or undo a valid game save. */}
+        }
+    }
+    private static void CaptureDomain(SQLiteRepository r,SaveReceipt receipt,string session,string? biome)
+    {
+            Add(r,"installation","installation_registered",session,receipt.CommittedAt);
+            var game=receipt.GameId is null?null:r.Game(receipt.LocalPlayerId,receipt.GameId);
+            switch(receipt.OperationKind){
+                case "new_game":Add(r,"start:"+receipt.GameId,"game_started",session,receipt.CommittedAt,receipt.GameId);break;
+                case "enter_biome":Add(r,"entry:"+receipt.OperationId,"biome_entered",session,receipt.CommittedAt,receipt.GameId,biome);break;
+                case "decision":
+                    var d=r.Decisions(receipt.GameId!,limit:6).Single(x=>x.OperationId==receipt.OperationId);
+                    Add(r,"decision:"+d.DecisionId,"environmental_decision",session,d.OccurredAt,receipt.GameId,d.BiomeId,data:new{decisionKey=d.DecisionKey,option=d.OptionId,state=d.OptionId=="reject"?"healthy":"degraded"});break;
+                case "complete_biome":
+                    Require(biome is not null);Add(r,"complete:"+receipt.GameId+":"+biome,"biome_completed",session,receipt.CommittedAt,receipt.GameId,biome,data:new{result=r.Biomes(receipt.GameId!).Single(x=>x.BiomeId==biome).Result});break;
+                case "prepare_final":
+                    Require(game!.Ending is "good" or "medium" or "bad");Add(r,"final:"+receipt.GameId,"game_completed",session,receipt.CommittedAt,receipt.GameId,data:new{ending=game.Ending});break;
+            }
+            r.Execute("UPDATE statistics_intents SET projected=1 WHERE operation_id=$id;",("$id",receipt.OperationId));
+    }
+    // Reconcile committed gameplay facts after failures/restart, without interpreting old snapshots or importing game history.
+    public void ReconcileGameplay(int limit=128)
+    {
+        Require(limit is >=1 and <=512);
+        using var c=_db.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);Verify(r);
+        using(var q=r.Command("SELECT count(*) FROM statistics_events;")){if(Convert.ToInt64(q.ExecuteScalar())>=50_000)Diagnostic="STATISTICS_VOLUME_REVIEW";}
+        var events=new GameplayEventRepository(r);var profile=r.Profile();
+        if(profile is not null){
+            var intents=new List<(string Id,string Session,string? Biome)>();using(var q=r.Command("SELECT operation_id,session_id,biome_id FROM statistics_intents WHERE projected=0 ORDER BY rowid LIMIT $n;",("$n",limit)))using(var rows=q.ExecuteReader())while(rows.Read())intents.Add((rows.GetString(0),rows.GetString(1),rows.IsDBNull(2)?null:rows.GetString(2)));
+            foreach(var intent in intents){var receipt=r.Receipt(intent.Id);Require(receipt is not null,"STATISTICS_SOURCE_MISSING");CaptureDomain(r,receipt!,intent.Session,intent.Biome);}
+            Add(r,"installation","installation_registered",Session(r,SessionId),Utc(DateTimeOffset.UtcNow));
+            // Bound each pass; source IDs and unique keys make repeat passes idempotent.
+            var ids=new List<(long Row,string Id)>();using(var q=r.Command("SELECT rowid,event_id FROM gameplay_events WHERE rowid>(SELECT last_rowid FROM statistics_cursors WHERE source='event') ORDER BY rowid LIMIT $n;",("$n",limit)))using(var rows=q.ExecuteReader())while(rows.Read())ids.Add((rows.GetInt64(0),rows.GetString(1)));
+            foreach(var item in ids){var e=events.FindEvent(item.Id)!.Value.Event;
+                if(e.Kind is GameplayEventKind.SESSION_STARTED or GameplayEventKind.SESSION_ENDED)Add(r,"event:"+item.Id,e.Kind==GameplayEventKind.SESSION_STARTED?"session_started":"session_ended",e.SessionId,Utc(e.OccurredAtUtc),data:new{status=e.Kind==GameplayEventKind.SESSION_STARTED?"open":e.SessionEnd==GameplaySessionEnd.Normal?"closed":"interrupted"});
+                r.Execute("UPDATE statistics_cursors SET last_rowid=$row WHERE source='event';",("$row",item.Row));}
+            var intervals=new List<(long Row,GameplayInterval Value)>();using(var q=r.Command("SELECT interval_id,session_id,start_ms,end_ms,state,game_id,biome_id,animal_run_id,contract_version,rowid FROM gameplay_intervals WHERE rowid>(SELECT last_rowid FROM statistics_cursors WHERE source='interval') ORDER BY rowid LIMIT $n;",("$n",limit)))using(var rows=q.ExecuteReader())while(rows.Read())intervals.Add((rows.GetInt64(9),new(rows.GetString(0),profile.LocalPlayerId,rows.GetString(1),rows.GetInt64(2),rows.GetInt64(3),Enum.Parse<GameplayTimeState>(rows.GetString(4)),rows.IsDBNull(5)?null:rows.GetString(5),rows.IsDBNull(6)?null:rows.GetString(6),rows.IsDBNull(7)?null:rows.GetString(7),(int)rows.GetInt64(8))));
+            foreach(var item in intervals){var i=item.Value;long delta=i.EndMs-i.StartMs;bool valid=delta>=0&&delta<=MaxIntervalMs;bool active=i.State is GameplayTimeState.ActiveAnimal or GameplayTimeState.ActiveHuman;
+                if(valid&&active&&delta>0)Add(r,"interval:"+i.IntervalId,"playtime_interval",i.SessionId,Utc(DateTimeOffset.UtcNow),i.GameId,i.BiomeId,delta,new{state=i.State.ToString(),startMs=i.StartMs,endMs=i.EndMs,excluded=false,active=true});
+                r.Execute("INSERT INTO statistics_projection VALUES($s,$status);",("$s","interval:"+i.IntervalId),("$status",valid&&active&&delta>0?"projected":"excluded"));
+                if(!valid)r.Execute("INSERT OR IGNORE INTO statistics_coverage VALUES('SUSPENSION_EXCLUDED',$at);",("$at",Utc(DateTimeOffset.UtcNow)));
+                r.Execute("UPDATE statistics_cursors SET last_rowid=$row WHERE source='interval';",("$row",item.Row));
+            }
+        }
+        tx.Commit();
+    }
+    private static StatisticalEvent Read(SQLiteRepository r,SqliteDataReader row,string installation)=>new(row.GetString(0),1,installation,row.GetString(1),row.GetString(2),row.GetString(3),row.IsDBNull(4)?null:row.GetString(4),row.IsDBNull(5)?null:row.GetString(5),row.IsDBNull(6)?null:row.GetInt64(6),row.GetString(7));
+    public bool HasUnprojectedGameplay()
+    {
+        using var c=_db.Open();using var tx=c.BeginTransaction(deferred:true);var r=new SQLiteRepository(c,tx);Verify(r);
+        bool pending=r.Number("SELECT EXISTS(SELECT 1 FROM statistics_intents WHERE projected=0) OR EXISTS(SELECT 1 FROM gameplay_intervals WHERE rowid>(SELECT last_rowid FROM statistics_cursors WHERE source='interval')) OR EXISTS(SELECT 1 FROM gameplay_events WHERE rowid>(SELECT last_rowid FROM statistics_cursors WHERE source='event'));")!=0;tx.Commit();return pending;
+    }
+    public IReadOnlyList<StatisticalDelivery> Reserve(long nowMs,int limit=5)
+    {
+        Require(nowMs>=0&&nowMs<=long.MaxValue-86_400_000&&limit is >=1 and <=5,"INVALID_STATISTICS_BATCH");
+        using var c=_db.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);Verify(r);
+        r.Execute("UPDATE statistics_outbox SET state='retryable_failure',lease_id=NULL,lease_until_ms=NULL WHERE state='in_flight' AND lease_until_ms<=$now;",("$now",nowMs));
+        string installation=Installation(r);var result=new List<StatisticalDelivery>();
+        // Strict FIFO: do not pass an unconfirmed earlier fact, including quota/permanent failures.
+        using(var q=r.Command("SELECT e.event_id,e.session_id,e.event_type,e.occurred_at_utc,e.game_token,e.biome_id,e.duration_ms,e.data,o.state,o.next_attempt_ms,o.attempts FROM statistics_events e JOIN statistics_outbox o USING(event_id) WHERE o.state!='confirmed' ORDER BY e.sequence LIMIT $n;",("$n",limit)))using(var rows=q.ExecuteReader())while(rows.Read()){
+            if(rows.GetString(8) is not ("pending" or "retryable_failure")||rows.GetInt64(9)>nowMs)break;
+            var e=Read(r,rows,installation);result.Add(new(e,Digest(Canonical(e)),Guid.NewGuid().ToString("D"),checked(rows.GetInt64(10)+1)));
+        }
+        foreach(var d in result)r.Execute("UPDATE statistics_outbox SET state='in_flight',attempts=$a,lease_id=$l,lease_until_ms=$until,last_error_code=NULL WHERE event_id=$id;",("$a",d.Attempts),("$l",d.LeaseId),("$until",nowMs+60_000),("$id",d.Event.EventId));
+        tx.Commit();return result.AsReadOnly();
+    }
+    public void Confirm(string eventId,string leaseId,string acknowledgedHash)
+    {
+        SaveValidation.Id(eventId);SaveValidation.Id(leaseId);
+        using var c=_db.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);Verify(r);
+        using var q=r.Command("SELECT e.event_id,e.session_id,e.event_type,e.occurred_at_utc,e.game_token,e.biome_id,e.duration_ms,e.data,o.state,o.lease_id,o.receipt_hash FROM statistics_events e JOIN statistics_outbox o USING(event_id) WHERE e.event_id=$id;",("$id",eventId));using var row=q.ExecuteReader();Require(row.Read(),"UNKNOWN_STATISTICS_EVENT");
+        var e=Read(r,row,Installation(r));Require(Digest(Canonical(e))==acknowledgedHash,"STATISTICS_RECEIPT_MISMATCH");
+        if(row.GetString(8)=="confirmed"){Require(row.GetString(10)==acknowledgedHash);tx.Commit();return;}
+        Require(row.GetString(8)=="in_flight"&&row.GetString(9)==leaseId,"STATISTICS_LEASE_MISMATCH");row.Close();
+        r.Execute("UPDATE statistics_outbox SET state='confirmed',receipt_hash=$h,lease_id=NULL,lease_until_ms=NULL,last_error_code=NULL WHERE event_id=$id;",("$h",acknowledgedHash),("$id",eventId));tx.Commit();
+    }
+    public void Fail(string eventId,string leaseId,long nowMs,string code)
+    {
+        SaveValidation.Id(eventId);SaveValidation.Id(leaseId);Require(nowMs>=0&&nowMs<=long.MaxValue-86_400_000);
+        Require(code is "network_unavailable" or "quota_exceeded" or "invalid_event" or "hash_mismatch" or "unsupported_version" or "invalid_time" or "event_expired" or "event_conflict" or "fact_conflict");
+        using var c=_db.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);Verify(r);
+        Require(r.Number("SELECT count(*) FROM statistics_outbox WHERE event_id=$id AND lease_id=$l AND state='in_flight';",("$id",eventId),("$l",leaseId))==1,"STATISTICS_LEASE_MISMATCH");
+        bool permanent=code is not ("network_unavailable" or "quota_exceeded");
+        r.Execute("UPDATE statistics_outbox SET state=$s,lease_id=NULL,lease_until_ms=NULL,next_attempt_ms=$at,last_error_code=$code WHERE event_id=$id;",("$s",permanent?"permanent_failure":"retryable_failure"),("$at",code=="quota_exceeded"?long.MaxValue:nowMs+30_000),("$code",code),("$id",eventId));tx.Commit();
+    }
+    public void ResumeQuota(long nowMs){Require(nowMs>=0);using var c=_db.Open();using var tx=c.BeginTransaction();var r=new SQLiteRepository(c,tx);Verify(r);r.Execute("UPDATE statistics_outbox SET next_attempt_ms=$now WHERE state='retryable_failure' AND last_error_code='quota_exceeded';",("$now",nowMs));tx.Commit();}
+    // B79 transport scheduling uses the existing state/lease columns: no schema change or historical conversion.
+    public void Defer(string eventId,string leaseId,long nowMs,long retryAtMs,string code)
+    {
+        SaveValidation.Id(eventId);SaveValidation.Id(leaseId);
+        Require(nowMs>=0&&nowMs<=long.MaxValue-172_800_000&&retryAtMs>=nowMs&&retryAtMs<=nowMs+172_800_000);
+        Require(code is "http_transient" or "rate_limited" or "auth_required" or "unconfirmed_receipt");
+        using var c=_db.Open();using var tx=c.BeginTransaction(deferred:false);var r=new SQLiteRepository(c,tx);Verify(r);
+        Require(r.Number("SELECT count(*) FROM statistics_outbox WHERE event_id=$id AND lease_id=$l AND state='in_flight';",("$id",eventId),("$l",leaseId))==1,"STATISTICS_LEASE_MISMATCH");
+        r.Execute("UPDATE statistics_outbox SET state='retryable_failure',lease_id=NULL,lease_until_ms=NULL,next_attempt_ms=$at,last_error_code=$code WHERE event_id=$id;",("$at",retryAtMs),("$code",code),("$id",eventId));tx.Commit();
+    }
+    public void ResumeTransport(long nowMs)
+    {
+        Require(nowMs>=0);using var c=_db.Open();using var tx=c.BeginTransaction();var r=new SQLiteRepository(c,tx);Verify(r);
+        r.Execute("UPDATE statistics_outbox SET next_attempt_ms=$now WHERE state='retryable_failure' AND last_error_code='auth_required';",("$now",nowMs));tx.Commit();
+    }
+}

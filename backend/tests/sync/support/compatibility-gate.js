@@ -1,0 +1,11 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import { validateOperation } from '../../../src/modules/sync/schemas.js';
+const data = JSON.parse(fs.readFileSync(new URL('./csharp-vectors.json', import.meta.url), 'utf8'));
+assert.equal(data.synthetic, true);
+const rows = data.operations.map(validateOperation);
+assert.deepEqual([...new Set(rows.map(o => o.envelope.type))].sort(), ['game.report','gameplay.event','gameplay.interval','session.report'].sort());
+assert(rows.some(o => o.envelope.type === 'gameplay.interval' && o.envelope.payload.endMs === Number.MAX_SAFE_INTEGER));
+assert(rows.some(o => o.envelope.type === 'session.report' && o.envelope.payload.status === 'interrupted' && o.envelope.payload.endedAtUtc === null));
+assert.equal(new Set(rows.filter(o=>o.envelope.type==='gameplay.event').map(o=>o.envelope.payload.kind)).size,6);
+console.log(JSON.stringify({ gate:'CSharp-Node', vectors:rows.length, types:4, compatible:true }));

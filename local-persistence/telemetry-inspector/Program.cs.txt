@@ -1,0 +1,25 @@
+using System;
+using System.IO;
+using System.Text.Json;
+using TwoSides.TelemetryInspection;
+
+internal static class Program
+{
+    public static int Main(string[] args)
+    {
+        try
+        {
+            // B78 deliberately refuses the developer and the previously validated test profile BEFORE any store access.
+            if (Environment.UserName.Equals("luis2",StringComparison.OrdinalIgnoreCase) ||
+                Environment.UserName.Equals("TwoSidesTest",StringComparison.OrdinalIgnoreCase))
+                throw new InspectionRefused("EXISTING_PROFILE_OUT_OF_SCOPE");
+            if(args.Length!=3 || args[0]!="inspect" || args[1]!="--db")throw new InspectionRefused("USAGE");
+            string expected=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"TwoSides","PlayerData","save.sqlite3");
+            var report=Inspector.Inspect(args[2],expected);
+            Console.WriteLine(JsonSerializer.Serialize(report,new JsonSerializerOptions{WriteIndented=true}));
+            return 0;
+        }
+        catch(InspectionRefused e){Console.WriteLine("REFUSED "+e.Code);return 2;}
+        catch { Console.WriteLine("INSPECTION_FAILED no private details shown");return 3; }
+    }
+}

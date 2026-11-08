@@ -1,0 +1,44 @@
+# Caddyfile.template — local TLS proxy for the FIRST controlled Godot -> Express main test (B23). NOT installed, NOT run.
+# Replace @@TLS_DIR@@ with the absolute folder of the local test certificate, using forward slashes (e.g. C:/Users/luis2/AppData/Local/TwoSidesLocalProxy/tls).
+# Validate before running:  caddy validate --config <this file>   (the directive order/syntax below must be confirmed with the installed version).
+{
+	admin off
+	auto_https off
+	skip_install_trust
+	persist_config off
+	default_bind 127.0.0.1
+	log {
+		level ERROR
+	}
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_header 10s
+			read_body 30s
+			write 30s
+			idle 60s
+		}
+	}
+}
+
+# The site label is ":8443" (any Host) ON PURPOSE: with "localhost:8443" Caddy adds a site-level Host matcher and a foreign Host would fall through to an empty 200 instead of the explicit 421 below.
+# The listener is still 127.0.0.1:8443 only (bind), and Godot connects to https://localhost:8443/ (the certificate names localhost only).
+https://:8443 {
+	bind 127.0.0.1
+	tls @@TLS_DIR@@/localhost.crt @@TLS_DIR@@/localhost.key {
+		protocols tls1.2 tls1.3
+	}
+	request_body {
+		max_size 2MB
+	}
+	@wronghost not host localhost
+	respond @wronghost "Misdirected Request" 421
+	@notapi not path /api/*
+	respond @notapi "Not Found" 404
+	reverse_proxy 127.0.0.1:3000 {
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 15s
+		}
+	}
+}

@@ -1,0 +1,9 @@
+using Microsoft.Data.Sqlite;
+
+namespace TwoSides.LocalPersistence;
+
+// An opened, validated capability, never a caller-supplied connection string.
+public interface ISaveDatabase
+{
+    SqliteConnection Open();
+}

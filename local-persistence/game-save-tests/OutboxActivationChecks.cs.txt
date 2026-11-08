@@ -1,0 +1,232 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class OutboxActivationChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok){if(!ok)throw new Exception("Outbox activation assertion failed");}
+    private static readonly DateTimeOffset Time=DateTimeOffset.Parse("2026-10-28T12:00:00Z");
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly string Owner=Id(),Game=Id();
+        internal readonly GameSaveService Save;
+        internal F(bool sync=true,bool profile=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);GameplayEventSchema.MigrateSynthetic(Db);
+            Save=new(Db,RealGameCatalog.InitialState(),()=>Time);
+            if(profile)Save.CreateLocalProfile(Id(),Owner,"Synthetic activation");
+            if(sync)SyncOutboxSchema.MigrateSynthetic(Db);
+        }
+        internal long Number(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+        internal void Sql(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;q.ExecuteNonQuery();}
+        internal string[] Strings(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;using var d=q.ExecuteReader();var rows=new List<string>();while(d.Read())rows.Add(d.GetString(0));return rows.ToArray();}
+        internal LocalOutboxPage Pass(LocalOutboxPump? pump=null)
+        {
+            pump??=new(Db,()=>Time);SyncReconciliationCursor? cursor=null;LocalOutboxPage last;
+            do{last=pump.Step(cursor,5);cursor=last.Page?.Next;if(last.Page is not {Committed:true})break;}while(cursor is not null);
+            return last;
+        }
+        internal async Task<GamePersistenceAdapter> Adapter()
+        {
+            var a=GamePersistenceAdapter.CreateSyntheticOutboxAdapter(Db);
+            Check((await a.OpenAsync("owned-outbox-fixture")).Success);return a;
+        }
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Wait(Func<bool> predicate)
+    {
+        for(int i=0;i<1000;i++){if(predicate())return;await Task.Delay(10);}
+        throw new Exception("Synthetic outbox wait timed out");
+    }
+    private static async Task Case(string label,Func<F,Task> action,bool sync=true,bool profile=true)
+    {using var f=new F(sync,profile);await action(f);_count++;Console.WriteLine("PASS "+label);}
+    public static async Task<int> Run()
+    {
+        await Case("missing sync is diagnosed without migration while local gameplay remains available",async f=>{
+            await using var a=await f.Adapter();await Wait(()=>a.OutboxDiagnostic.Code=="OUTBOX_NOT_ACTIVATED");
+            Check((await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game))).Success);
+            Check(f.Number("SELECT count(*) FROM sqlite_master WHERE name='sync_outbox';")==0);
+        },sync:false);
+        await Case("existing sync initializes one local installation without JWT or remote registration",async f=>{
+            await using var a=await f.Adapter();await Wait(()=>a.OutboxDiagnostic.Passes>0);
+            Check(a.OutboxDiagnostic.Code=="OUTBOX_LOCAL_READY" && f.Number("SELECT count(*) FROM sync_installations;")==1);
+            Check(f.Save.GetLocalProfile()!.RegistrationStatus=="LOCAL_ONLY");
+        });
+        await Case("profile absent waits then confirmed profile creation requests local capture",async f=>{
+            await using var a=await f.Adapter();await Wait(()=>a.OutboxDiagnostic.Code=="OUTBOX_WAITING_PROFILE");
+            Check((await a.CreateLocalProfileAsync(new(Id(),f.Owner,"Synthetic profile"))).Success);
+            await Wait(()=>f.Number("SELECT count(*) FROM sync_installations;")==1 && a.OutboxDiagnostic.Code=="OUTBOX_LOCAL_READY");
+            Check(a.OutboxDiagnostic.Code=="OUTBOX_LOCAL_READY");
+        },profile:false);
+        await Case("initial reconciliation captures existing committed game without new gameplay operation",async f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));long original=f.Number("SELECT count(*) FROM local_operations;");
+            await using var a=await f.Adapter();await Wait(()=>f.Number("SELECT count(*) FROM sync_outbox;")==1);
+            Check(f.Number("SELECT count(*) FROM local_operations;")==original);
+        });
+        await Case("second full pump pass is idempotent with stable operation and hash",f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));Check(f.Pass().Code=="OUTBOX_LOCAL_READY");
+            var before=f.Strings("SELECT operation_id||payload_hash FROM sync_outbox ORDER BY operation_id;");
+            f.Pass();Check(before.SequenceEqual(f.Strings("SELECT operation_id||payload_hash FROM sync_outbox ORDER BY operation_id;")));return Task.CompletedTask;
+        });
+        await Case("adapter captures a newly confirmed game after its own commit",async f=>{
+            await using var a=await f.Adapter();Check((await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game))).Success);
+            await Wait(()=>f.Number("SELECT count(*) FROM sync_outbox;")>=1);
+            Check(f.Save.LoadGame(f.Owner,f.Game).Game.Revision==0);
+        });
+        await Case("adapter captures decision and consequence without changing their existing semantics",async f=>{
+            await using var a=await f.Adapter();Check((await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game))).Success);
+            Check((await a.EnterBiomeAsync(new(Id(),f.Owner,f.Game,0,"ocean","human"))).Success);
+            string decision=Id();Check((await a.RecordDecisionAsync(new(Id(),decision,f.Owner,f.Game,1,"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}"))).Success);
+            await Wait(()=>f.Strings("SELECT canonical_envelope FROM sync_outbox;").Any(s=>s.Contains(decision)));
+            var source=f.Save.LoadGame(f.Owner,f.Game);Check(source.Decisions.Single().DecisionId==decision && source.Environments.Single(e=>e.BiomeId=="ocean").StateKind=="healthy");
+        });
+        await Case("adapter completion is captured without extra CompleteBiome or duplicate source receipt",async f=>{
+            await using var a=await f.Adapter();f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            f.Save.RecordDecision(new(Id(),Id(),f.Owner,f.Game,1,"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}"));
+            string operation=Id();Check((await a.CompleteBiomeAsync(new(operation,f.Owner,f.Game,2,"ocean","good"))).Success);
+            await Wait(()=>f.Strings("SELECT canonical_envelope FROM sync_outbox;").Any(s=>s.Contains("\"status\":\"completed\"")));
+            long revision=f.Save.LoadGame(f.Owner,f.Game).Game.Revision;
+            a.RequestOutboxReconciliation();await Task.Delay(100);
+            Check(f.Save.LoadGame(f.Owner,f.Game).Game.Revision==revision);
+        });
+        await Case("prepared final and global closure remain local and history is preserved",async f=>{
+            await using var a=await f.Adapter();f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));
+            string[] biomes={"ocean","jungle","desert","forest","tundra"};
+            string[] keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+            long Revision()=>f.Save.LoadGame(f.Owner,f.Game).Game.Revision;
+            for(int i=0;i<5;i++){
+                f.Save.EnterBiome(new(Id(),f.Owner,f.Game,Revision(),biomes[i],"human"));
+                f.Save.RecordDecision(new(Id(),Id(),f.Owner,f.Game,Revision(),biomes[i],keys[i],"reject","healthy","{\"stateKind\":\"healthy\"}"));
+                f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,Revision(),biomes[i],"good"));
+            }
+            Check((await a.PrepareFinalAsync(new(Id(),f.Owner,f.Game,Revision()))).Success);
+            Check(f.Save.LoadGame(f.Owner,f.Game).Game.Status=="final_pending");
+            Check((await a.CloseGameAsync(new(Id(),f.Owner,f.Game,Revision(),"good"))).Success);
+            await Wait(()=>f.Strings("SELECT canonical_envelope FROM sync_outbox;").Any(s=>s.Contains("\"status\":\"completed\"") && s.Contains("\"ending\":\"good\"")));
+            Check(f.Save.LoadGame(f.Owner,f.Game).Decisions.Count==5 && f.Save.GetGameHistory(f.Owner).Any(g=>g.GameId==f.Game));
+            Check((await a.CreateNewGameAsync(new(Id(),f.Owner,Id()))).Success);
+        });
+        await Case("four approved types are captured from adapter telemetry and game with no new source facts",async f=>{
+            await using var a=await f.Adapter();await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game));
+            f.Save.EnterBiome(new(Id(),f.Owner,f.Game,0,"ocean","human"));
+            f.Save.RecordDecision(new(Id(),Id(),f.Owner,f.Game,1,"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}"));
+            string session=Id(),run=Id();
+            Check((await a.WriteEventAsync(new(Id(),f.Owner,session,GameplayEventKind.SESSION_STARTED,Time,0))).Success);
+            Check((await a.WriteEventAsync(new(run,f.Owner,session,GameplayEventKind.ANIMAL_SEGMENT_STARTED,Time,0,f.Game,"ocean",run))).Success);
+            Check((await a.WriteIntervalAsync(new(Id(),f.Owner,session,0,10,GameplayTimeState.ActiveAnimal,f.Game,"ocean",run))).Success);
+            await Wait(()=>f.Number("SELECT count(DISTINCT type) FROM sync_outbox;")==4);
+            Check(f.Number("SELECT count(*) FROM gameplay_events;")==2 && f.Number("SELECT count(*) FROM sync_outbox WHERE state!='pending';")==0);
+        });
+        await Case("schema mismatch in sync never becomes an automatic migration or failed gameplay commit",async f=>{
+            f.Sql("UPDATE sync_schema_migrations SET checksum='bad';");
+            await using var a=await f.Adapter();await Wait(()=>a.OutboxDiagnostic.Code=="UNSUPPORTED_SYNC_SCHEMA");
+            Check((await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game))).Success);
+            Check(f.Save.GetActiveGame(f.Owner)!.Game.GameId==f.Game);
+        });
+        await Case("outbox write failure after domain commit cannot roll back a decision or game",async f=>{
+            f.Sql("CREATE TRIGGER fail_sync_insert BEFORE INSERT ON sync_outbox BEGIN SELECT RAISE(ABORT,'synthetic-write-failure');END;");
+            await using var a=await f.Adapter();Check((await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game))).Success);
+            await Wait(()=>a.OutboxDiagnostic.Passes>0 && a.OutboxDiagnostic.Code!="OUTBOX_LOCAL_READY");
+            Check(f.Save.GetActiveGame(f.Owner)!.Game.GameId==f.Game && f.Number("SELECT count(*) FROM sync_outbox;")==0);
+            f.Sql("DROP TRIGGER fail_sync_insert;");a.RequestOutboxReconciliation();
+            await Wait(()=>f.Number("SELECT count(*) FROM sync_outbox;")==1);
+        });
+        await Case("pump transaction fault preserves confirmed source and retry reconstructs missing queue",f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));
+            var broken=new LocalOutboxPump(f.Db,()=>Time,()=>throw new SaveException("TEST_FAIL"));
+            Check(f.Pass(broken).Code=="OUTBOX_STORAGE_FAILURE" && f.Number("SELECT count(*) FROM sync_outbox;")==0);
+            Check(f.Save.GetActiveGame(f.Owner)!.Game.GameId==f.Game && f.Pass().Code=="OUTBOX_LOCAL_READY");return Task.CompletedTask;
+        });
+        await Case("busy SQLite has bounded diagnostic and resumes after lock release",f=>{
+            using(var c=f.Db.Open())using(var tx=c.BeginTransaction(deferred:false))Check(new LocalOutboxPump(f.Db).Step(null).Code=="STORAGE_BUSY");
+            Check(f.Pass().Code=="OUTBOX_LOCAL_READY");return Task.CompletedTask;
+        });
+        await Case("ambiguous local installations are diagnosed without silently adopting a binding",f=>{
+            var queue=new SyncOutboxService(f.Db);queue.RegisterInstallation(new(f.Owner,Id(),1));queue.RegisterInstallation(new(f.Owner,Id(),1));
+            Check(f.Pass().Code=="AMBIGUOUS_SYNC_BINDING" && f.Number("SELECT count(*) FROM sync_installations;")==2);return Task.CompletedTask;
+        });
+        await Case("payload contradiction remains visible and existing queue is never overwritten",f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));f.Pass();var original=f.Strings("SELECT payload_hash FROM sync_outbox;");
+            f.Sql("UPDATE saved_games SET content_version='contradiction';");
+            Check(f.Pass().Code=="OUTBOX_REQUIRES_REVIEW" && original.SequenceEqual(f.Strings("SELECT payload_hash FROM sync_outbox;")));return Task.CompletedTask;
+        });
+        await Case("shared base schema failure is reported as local storage integrity failure",f=>{
+            f.Sql("PRAGMA user_version=99;");var result=new LocalOutboxPump(f.Db).Step(null);
+            Check(result.Code=="UNSUPPORTED_SCHEMA" && result.IntegrityFailure);return Task.CompletedTask;
+        });
+        await Case("invalid foreign-key state is storage integrity failure rather than a sync warning",f=>{
+            using(var c=f.Db.Open())using(var q=c.CreateCommand()){
+                q.CommandText="PRAGMA foreign_keys=OFF;INSERT INTO sync_installations VALUES('invalid-owner','invalid-installation',1,'invalid');";q.ExecuteNonQuery();
+            }
+            var result=new LocalOutboxPump(f.Db).Step(null);Check(result.Code=="CORRUPT_STORAGE" && result.IntegrityFailure);return Task.CompletedTask;
+        });
+        await Case("pump restart reuses same installation and operation identifiers",f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));f.Pass();
+            var before=f.Strings("SELECT operation_id||installation_id||payload_hash FROM sync_outbox;");f.Pass(new LocalOutboxPump(f.Db));
+            Check(before.SequenceEqual(f.Strings("SELECT operation_id||installation_id||payload_hash FROM sync_outbox;")));return Task.CompletedTask;
+        });
+        await Case("statistics keep same values and unknown coverage before and after capture",f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));
+            string Stats()=>JsonSerializer.Serialize(new StatisticsService(f.Db,RealGameCatalog.InitialState()).GetLocalStatistics());
+            string before=Stats();f.Pass();Check(before==Stats());return Task.CompletedTask;
+        });
+        await Case("scheduler coalesces concurrent requests and never runs overlapping pages",async f=>{
+            int active=0,peak=0,calls=0;
+            await using var scheduler=new LocalOutboxScheduler(async (_,ct)=>{
+                int n=Interlocked.Increment(ref active);peak=Math.Max(peak,n);Interlocked.Increment(ref calls);
+                await Task.Delay(5,ct);Interlocked.Decrement(ref active);return new LocalOutboxPage("OUTBOX_WAITING_PROFILE",false);
+            },TimeSpan.FromMilliseconds(1),TimeSpan.FromSeconds(2),TimeSpan.Zero);
+            await Task.WhenAll(Enumerable.Range(0,100).Select(_=>Task.Run(scheduler.Request)));await Wait(()=>scheduler.Diagnostic.Passes>0);
+            Check(peak==1 && calls<=2);
+        });
+        await Case("cancelled scheduler finishes without another database callback",async f=>{
+            int calls=0;
+            var scheduler=new LocalOutboxScheduler((_,_)=>{Interlocked.Increment(ref calls);return Task.FromResult(new LocalOutboxPage("OUTBOX_LOCAL_READY",false));},
+                TimeSpan.FromMilliseconds(1),TimeSpan.FromMilliseconds(20),TimeSpan.Zero);
+            scheduler.Request();await Wait(()=>calls>0);await scheduler.DisposeAsync();int before=calls;
+            scheduler.Request();await Task.Delay(50);Check(calls==before && !scheduler.Diagnostic.Running);
+        });
+        await Case("scheduler resumes after temporary storage error without a tight loop",async f=>{
+            int calls=0;
+            await using var scheduler=new LocalOutboxScheduler((_,_)=>Task.FromResult(new LocalOutboxPage(
+                Interlocked.Increment(ref calls)==1?"STORAGE_BUSY":"OUTBOX_LOCAL_READY",false)),TimeSpan.Zero,TimeSpan.FromMilliseconds(30),TimeSpan.Zero);
+            scheduler.Request();await Wait(()=>scheduler.Diagnostic.Passes>=2);
+            Check(scheduler.Diagnostic.Code=="OUTBOX_LOCAL_READY" && calls<20);
+        });
+        await Case("adapter shutdown waits for worker then rejects further operations",async f=>{
+            var a=await f.Adapter();await a.CreateNewGameAsync(new(Id(),f.Owner,f.Game));await a.DisposeAsync();
+            Check(!(await a.GetLocalProfileAsync()).Success && a.OutboxDiagnostic.Code=="OUTBOX_INACTIVE");
+        });
+        await Case("adapter synthetic opening rejects runtime path before any runtime access",async f=>{
+            await using var a=GamePersistenceAdapter.CreateSyntheticOutboxAdapter(f.Db);
+            Check(!(await a.OpenAsync(GamePersistenceAdapter.RuntimeStoragePath)).Success);
+        });
+        await Case("new local facts retain unknown historical metrics without invented deaths or sessions",f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));f.Pass();
+            var envelopes=f.Strings("SELECT canonical_envelope FROM sync_outbox;");
+            Check(envelopes.Length==1 && envelopes[0].Contains("\"historicalCoverageUnknown\":true") && !envelopes[0].Contains("deaths") &&
+                f.Number("SELECT count(*) FROM gameplay_events;")==0);return Task.CompletedTask;
+        });
+        await Case("new classes contain no HTTP Atlas Godot or JWT assembly reference",f=>{
+            Check(typeof(LocalOutboxScheduler).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "System.Net.Http" and not "GodotSharp" &&
+                !(a.Name??"").Contains("Mongo") && !(a.Name??"").Contains("Jwt")));return Task.CompletedTask;
+        });
+        await Case("schema and source integrity remain valid after successful local capture",f=>{
+            f.Save.CreateNewGame(new(Id(),f.Owner,f.Game));f.Pass();SchemaManager.Verify(f.Db);GameplayEventSchema.Verify(f.Db);SyncOutboxSchema.Verify(f.Db);
+            Check(f.Number("SELECT count(*) FROM pragma_foreign_key_check;")==0 && f.Number("PRAGMA user_version;")==2);return Task.CompletedTask;
+        });
+        Console.WriteLine(_count+" local outbox activation checks passed; synthetic only, no runtime test writes.");return 0;
+    }
+}
+

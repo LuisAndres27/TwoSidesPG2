@@ -1,0 +1,24 @@
+[remap]
+
+importer="wav"
+type="AudioStreamWAV"
+uid="uid://cpotdonrwejgq"
+path="res://.godot/imported/Environmental Tragedy Theme.wav-c15b5df13c1ac9b12926571c9f4fe8f4.sample"
+
+[deps]
+
+source_file="res://assets/sprites/fondos/Music/Menu y finales/Environmental Tragedy Theme.wav"
+dest_files=["res://.godot/imported/Environmental Tragedy Theme.wav-c15b5df13c1ac9b12926571c9f4fe8f4.sample"]
+
+[params]
+
+force/8_bit=false
+force/mono=false
+force/max_rate=false
+force/max_rate_hz=44100
+edit/trim=false
+edit/normalize=false
+edit/loop_mode=0
+edit/loop_begin=0
+edit/loop_end=-1
+compress/mode=2

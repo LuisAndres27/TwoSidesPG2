@@ -1,0 +1,1962 @@
+{
+  "status": "PLAN ONLY. Nothing has been created in Atlas.",
+  "database": "twosides_statistics_demo",
+  "analyticsDatabase": "twosides_statistics_analytics_demo",
+  "metabaseReadsOnly": "twosides_statistics_analytics_demo",
+  "productionDatabaseName": "twosides_statistics",
+  "retentionPolicy": "b82-run-hybrid-v1",
+  "retentionStatus": "EXPERIMENTAL; production retention NOT approved",
+  "schema": "statistics-mongo-b82-run-v1",
+  "collections": {
+    "stats_v1_counters": {
+      "group": "counts",
+      "validator": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "_id",
+              "values"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "_id": {
+                "bsonType": "string",
+                "pattern": "^(all|day:[0-9]{4}-[0-9]{2}-[0-9]{2}|month:[0-9]{4}-[0-9]{2})$"
+              },
+              "values": {
+                "bsonType": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "active_installations": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "installations_registered": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "sessions_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "sessions_closed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "sessions_interrupted": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "games_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "games_completed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "effective_ms": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:installation_registered": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:session_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:session_ended": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:game_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:game_completed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:biome_entered": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:biome_completed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:environmental_decision": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:playtime_interval": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "ending:good": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "ending:medium": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "ending:bad": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:ocean": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:ocean": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:ocean": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:ocean:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:ocean:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:ocean:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:ocean:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:jungle": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:jungle": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:jungle": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:jungle:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:jungle:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:jungle:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:jungle:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:desert": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:desert": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:desert": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:desert:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:desert:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:desert:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:desert:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:forest": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:forest": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:forest": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:forest:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:forest:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:forest:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:forest:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:tundra": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:tundra": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:tundra": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:tundra:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:tundra:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:tundra:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:tundra:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                }
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "indexes": [
+        {
+          "name": "_id_"
+        }
+      ],
+      "visibleToMetabase": false
+    },
+    "stats_v1_receipts": {
+      "group": "receipts",
+      "validator": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "_id",
+              "expiresAt",
+              "hash",
+              "revision"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "_id": {
+                "bsonType": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "expiresAt": {
+                "bsonType": "date"
+              },
+              "hash": {
+                "bsonType": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "revision": {
+                "bsonType": [
+                  "int",
+                  "long",
+                  "double"
+                ],
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "indexes": [
+        {
+          "name": "_id_"
+        },
+        {
+          "name": "expiry_v1",
+          "key": {
+            "expiresAt": 1
+          },
+          "expireAfterSeconds": 0
+        }
+      ],
+      "visibleToMetabase": false
+    },
+    "stats_v1_semantic": {
+      "group": "semantic",
+      "validator": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "_id",
+              "kind"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "_id": {
+                "bsonType": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "kind": {
+                "enum": [
+                  "b82-run-semantic-v1"
+                ]
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "indexes": [
+        {
+          "name": "_id_"
+        }
+      ],
+      "visibleToMetabase": false
+    },
+    "stats_v1_active": {
+      "group": "distinct",
+      "validator": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "_id",
+              "expiresAt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "_id": {
+                "bsonType": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "expiresAt": {
+                "bsonType": "date"
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "indexes": [
+        {
+          "name": "_id_"
+        },
+        {
+          "name": "expiry_v1",
+          "key": {
+            "expiresAt": 1
+          },
+          "expireAfterSeconds": 0
+        }
+      ],
+      "visibleToMetabase": false
+    },
+    "stats_v1_budgets": {
+      "group": "budgets",
+      "validator": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "_id",
+              "expiresAt",
+              "value"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "_id": {
+                "bsonType": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "expiresAt": {
+                "bsonType": "date"
+              },
+              "value": {
+                "bsonType": [
+                  "int",
+                  "long",
+                  "double"
+                ],
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "indexes": [
+        {
+          "name": "_id_"
+        },
+        {
+          "name": "expiry_v1",
+          "key": {
+            "expiresAt": 1
+          },
+          "expireAfterSeconds": 0
+        }
+      ],
+      "visibleToMetabase": false
+    },
+    "stats_v1_meta": {
+      "group": "meta",
+      "validator": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "_id",
+              "schema",
+              "keyCheck",
+              "revision",
+              "retentionPolicy"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "_id": {
+                "enum": [
+                  "statistics-v1"
+                ]
+              },
+              "schema": {
+                "enum": [
+                  "statistics-mongo-b82-run-v1"
+                ]
+              },
+              "keyCheck": {
+                "bsonType": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "revision": {
+                "bsonType": [
+                  "int",
+                  "long",
+                  "double"
+                ],
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "retentionPolicy": {
+                "enum": [
+                  "b82-run-hybrid-v1"
+                ]
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "indexes": [
+        {
+          "name": "_id_"
+        }
+      ],
+      "visibleToMetabase": false
+    }
+  },
+  "analyticsCollections": {
+    "stats_v1_counters": {
+      "purpose": "published copy of the aggregate counters (only _id and numeric values); the ONLY thing Metabase can read",
+      "validator": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "_id",
+              "values"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "_id": {
+                "bsonType": "string",
+                "pattern": "^(all|day:[0-9]{4}-[0-9]{2}-[0-9]{2}|month:[0-9]{4}-[0-9]{2})$"
+              },
+              "values": {
+                "bsonType": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "active_installations": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "installations_registered": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "sessions_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "sessions_closed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "sessions_interrupted": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "games_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "games_completed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "effective_ms": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:installation_registered": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:session_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:session_ended": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:game_started": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:game_completed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:biome_entered": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:biome_completed": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:environmental_decision": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "type:playtime_interval": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "ending:good": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "ending:medium": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "ending:bad": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:ocean": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:ocean": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:ocean": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:ocean:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:ocean:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:ocean:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:ocean:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:jungle": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:jungle": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:jungle": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:jungle:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:jungle:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:jungle:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:jungle:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:desert": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:desert": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:desert": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:desert:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:desert:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:desert:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:desert:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:forest": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:forest": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:forest": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:forest:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:forest:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:forest:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:forest:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "visits:tundra": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "completions:tundra": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "time:tundra": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:tundra:approve": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "decision:tundra:reject": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:tundra:healthy": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "environment:tundra:degraded": {
+                    "bsonType": [
+                      "int",
+                      "long",
+                      "double"
+                    ],
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                }
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "visibleToMetabase": true
+    }
+  },
+  "identities": {
+    "ingest": {
+      "databaseUser": "twosides_statistics_ingest_v1",
+      "role": "two_sides_statistics_ingest_v1",
+      "authentication": "SCRAM-SHA-1",
+      "authenticationNote": "Atlas mode uses SCRAM-SHA-1 explicitly (verified in TwoSidesCluster only; SCRAM-SHA-256 was rejected there). Local test server: SCRAM-SHA-256.",
+      "authSource": "admin",
+      "nativeRole": {
+        "role": "two_sides_statistics_ingest_v1",
+        "privileges": [
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": ""
+            },
+            "actions": [
+              "listCollections"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_counters"
+            },
+            "actions": [
+              "find",
+              "insert",
+              "listIndexes",
+              "update"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_receipts"
+            },
+            "actions": [
+              "find",
+              "insert",
+              "listIndexes",
+              "remove"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_semantic"
+            },
+            "actions": [
+              "find",
+              "insert",
+              "listIndexes"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_active"
+            },
+            "actions": [
+              "find",
+              "insert",
+              "listIndexes",
+              "remove"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_budgets"
+            },
+            "actions": [
+              "find",
+              "insert",
+              "listIndexes",
+              "update"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_meta"
+            },
+            "actions": [
+              "find",
+              "listIndexes",
+              "update"
+            ]
+          }
+        ],
+        "roles": []
+      },
+      "atlasCustomRole": {
+        "roleName": "two_sides_statistics_ingest_v1",
+        "inheritedRoles": [],
+        "actions": [
+          {
+            "action": "FIND",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_semantic"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_meta"
+              }
+            ]
+          },
+          {
+            "action": "INSERT",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_semantic"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              }
+            ]
+          },
+          {
+            "action": "LIST_COLLECTIONS",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": ""
+              }
+            ]
+          },
+          {
+            "action": "LIST_INDEXES",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_semantic"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_meta"
+              }
+            ]
+          },
+          {
+            "action": "REMOVE",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              }
+            ]
+          },
+          {
+            "action": "UPDATE",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_meta"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "schema": {
+      "databaseUser": "twosides_statistics_schema_v1",
+      "role": "two_sides_statistics_schema_v1",
+      "authentication": "SCRAM-SHA-1",
+      "authenticationNote": "Atlas mode uses SCRAM-SHA-1 explicitly (verified in TwoSidesCluster only; SCRAM-SHA-256 was rejected there). Local test server: SCRAM-SHA-256.",
+      "authSource": "admin",
+      "nativeRole": {
+        "role": "two_sides_statistics_schema_v1",
+        "privileges": [
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": ""
+            },
+            "actions": [
+              "listCollections"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_counters"
+            },
+            "actions": [
+              "createCollection",
+              "find",
+              "insert",
+              "listIndexes"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_receipts"
+            },
+            "actions": [
+              "createCollection",
+              "createIndex",
+              "find",
+              "insert",
+              "listIndexes"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_semantic"
+            },
+            "actions": [
+              "createCollection",
+              "find",
+              "insert",
+              "listIndexes"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_active"
+            },
+            "actions": [
+              "createCollection",
+              "createIndex",
+              "find",
+              "insert",
+              "listIndexes"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_budgets"
+            },
+            "actions": [
+              "createCollection",
+              "createIndex",
+              "find",
+              "insert",
+              "listIndexes"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_meta"
+            },
+            "actions": [
+              "createCollection",
+              "find",
+              "insert",
+              "listIndexes"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_analytics_demo",
+              "collection": ""
+            },
+            "actions": [
+              "listCollections"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_analytics_demo",
+              "collection": "stats_v1_counters"
+            },
+            "actions": [
+              "createCollection",
+              "listIndexes"
+            ]
+          }
+        ],
+        "roles": []
+      },
+      "atlasCustomRole": {
+        "roleName": "two_sides_statistics_schema_v1",
+        "inheritedRoles": [],
+        "actions": [
+          {
+            "action": "CREATE_COLLECTION",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_semantic"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_meta"
+              },
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": "stats_v1_counters"
+              }
+            ]
+          },
+          {
+            "action": "CREATE_INDEX",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              }
+            ]
+          },
+          {
+            "action": "FIND",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_semantic"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_meta"
+              }
+            ]
+          },
+          {
+            "action": "INSERT",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_semantic"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_meta"
+              }
+            ]
+          },
+          {
+            "action": "LIST_COLLECTIONS",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": ""
+              },
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": ""
+              }
+            ]
+          },
+          {
+            "action": "LIST_INDEXES",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_receipts"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_semantic"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_active"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_budgets"
+              },
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_meta"
+              },
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": "stats_v1_counters"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "publisher": {
+      "databaseUser": "twosides_statistics_publisher_v1",
+      "role": "two_sides_statistics_publisher_v1",
+      "authentication": "SCRAM-SHA-1",
+      "authenticationNote": "Atlas mode uses SCRAM-SHA-1 explicitly (verified in TwoSidesCluster only; SCRAM-SHA-256 was rejected there). Local test server: SCRAM-SHA-256.",
+      "authSource": "admin",
+      "nativeRole": {
+        "role": "two_sides_statistics_publisher_v1",
+        "privileges": [
+          {
+            "resource": {
+              "db": "twosides_statistics_demo",
+              "collection": "stats_v1_counters"
+            },
+            "actions": [
+              "find"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_analytics_demo",
+              "collection": "stats_v1_counters"
+            },
+            "actions": [
+              "find",
+              "insert",
+              "remove"
+            ]
+          }
+        ],
+        "roles": []
+      },
+      "atlasCustomRole": {
+        "roleName": "two_sides_statistics_publisher_v1",
+        "inheritedRoles": [],
+        "actions": [
+          {
+            "action": "FIND",
+            "resources": [
+              {
+                "db": "twosides_statistics_demo",
+                "collection": "stats_v1_counters"
+              },
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": "stats_v1_counters"
+              }
+            ]
+          },
+          {
+            "action": "INSERT",
+            "resources": [
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": "stats_v1_counters"
+              }
+            ]
+          },
+          {
+            "action": "REMOVE",
+            "resources": [
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": "stats_v1_counters"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "reader": {
+      "databaseUser": "twosides_statistics_reader_v1",
+      "role": "two_sides_statistics_reader_v1",
+      "authentication": "SCRAM-SHA-1",
+      "authenticationNote": "Atlas mode uses SCRAM-SHA-1 explicitly (verified in TwoSidesCluster only; SCRAM-SHA-256 was rejected there). Local test server: SCRAM-SHA-256.",
+      "authSource": "admin",
+      "nativeRole": {
+        "role": "two_sides_statistics_reader_v1",
+        "privileges": [
+          {
+            "resource": {
+              "db": "twosides_statistics_analytics_demo",
+              "collection": ""
+            },
+            "actions": [
+              "dbStats",
+              "listCollections"
+            ]
+          },
+          {
+            "resource": {
+              "db": "twosides_statistics_analytics_demo",
+              "collection": "stats_v1_counters"
+            },
+            "actions": [
+              "find"
+            ]
+          }
+        ],
+        "roles": []
+      },
+      "atlasCustomRole": {
+        "roleName": "two_sides_statistics_reader_v1",
+        "inheritedRoles": [],
+        "actions": [
+          {
+            "action": "DB_STATS",
+            "resources": [
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": ""
+              }
+            ]
+          },
+          {
+            "action": "FIND",
+            "resources": [
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": "stats_v1_counters"
+              }
+            ]
+          },
+          {
+            "action": "LIST_COLLECTIONS",
+            "resources": [
+              {
+                "db": "twosides_statistics_analytics_demo",
+                "collection": ""
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "order": [
+    "1 owner creates the three custom roles and users (no built-in readWrite/atlasAdmin)",
+    "2 owner restricts Network Access to the exact egress IPs (never 0.0.0.0/0)",
+    "3 preflight with each identity (exact-privilege check)",
+    "4 provision with the schema identity (requires NEW empty databases: source and analytics)",
+    "5 seed the synthetic dataset with the ingest identity",
+    "6 publish the aggregate counters with the publisher identity",
+    "7 read with the reader identity (analytics database) and compare with the oracle",
+    "8 owner removes the schema user and any test access when finished"
+  ]
+}

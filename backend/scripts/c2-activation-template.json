@@ -1,0 +1,16 @@
+{
+  "templateOnly": true,
+  "version": 2,
+  "mode": "c2-blocked",
+  "remoteEnabled": false,
+  "releaseId": null,
+  "payloadSha256": null,
+  "activation": {
+    "executionId": null,
+    "runId": "10ef4f6d653f4ee4a1d1b2e6591013c2",
+    "scenarios": ["A", "B", "C"],
+    "createdAtUtc": null,
+    "expiresAtUtc": null
+  },
+  "note": "Incomplete non-activatable specification. Requires separate explicit authorization and a newly verified external digest. Never fill or execute automatically."
+}

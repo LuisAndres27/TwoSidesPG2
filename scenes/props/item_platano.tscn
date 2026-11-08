@@ -1,0 +1,35 @@
+[gd_scene format=3 uid="uid://k03pj44sgqi"]
+
+[ext_resource type="Script" uid="uid://dbq3dewg7l3wm" path="res://scripts/ItemRecurso.cs" id="1_bdiqo"]
+[ext_resource type="Texture2D" uid="uid://1ad0g0yufm0e" path="res://assets/sprites/fondos/selva/BANANO.png" id="2_nkbsq"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_la5y5"]
+size = Vector2(14, 15)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_416yu"]
+size = Vector2(15.5, 17.25)
+
+[node name="ItemPlatano" type="RigidBody2D" unique_id=443744544]
+collision_layer = 9
+lock_rotation = true
+script = ExtResource("1_bdiqo")
+Tipo = 1
+
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=2105128756]
+texture = ExtResource("2_nkbsq")
+centered = false
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="." unique_id=658425766]
+light_mask = 2
+position = Vector2(8, 8.5)
+shape = SubResource("RectangleShape2D_la5y5")
+
+[node name="Deteccion" type="Area2D" parent="." unique_id=246191995]
+position = Vector2(16, 16)
+collision_layer = 0
+collision_mask = 3
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Deteccion" unique_id=1297590243]
+position = Vector2(-8, -8)
+shape = SubResource("RectangleShape2D_416yu")
+debug_color = Color(0.92690593, 0.17427179, 0.5218387, 0.41960785)

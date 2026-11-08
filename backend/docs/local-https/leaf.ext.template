@@ -1,0 +1,8 @@
+# Extensions of the local test server certificate (B23/B25). Valid for localhost and 127.0.0.1 ONLY. Usage:
+#   openssl x509 -req -in localhost.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out localhost.crt -days 14 -sha256 -extfile leaf.ext
+subjectAltName = DNS:localhost,IP:127.0.0.1
+extendedKeyUsage = serverAuth
+keyUsage = critical,digitalSignature,keyEncipherment
+basicConstraints = critical,CA:FALSE
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid

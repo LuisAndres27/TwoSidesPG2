@@ -1,0 +1,176 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using TwoSides.Integration.Sqlite;
+using TwoSides.LocalPersistence;
+
+internal static class DecisionIntegrationChecks
+{
+    private static readonly string[] Biomes={"ocean","jungle","desert","forest","tundra"};
+    private static readonly string[] Keys={"ocean_waste_disposal","jungle_transport_route","desert_cat_abandonment","forest_industrial_pesticides","tundra_fossil_extraction"};
+    private static int _passed;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool value,string message){if(!value)throw new Exception(message);}
+    private sealed class Store:ILocalDecisionStore
+    {
+        internal readonly GameSaveService Service;
+        internal int Writes;
+        internal bool LostResponse,ReadFailure;
+        internal RecordDecisionCommand? Last;
+        internal Store(ISaveDatabase db,RuntimeMenuChecks.Failure failure){Service=new(db,RealGameCatalog.InitialState(),extension:failure);}
+        public Task<LocalSaveResult<GameAggregate>> GetActiveGameAsync(string owner)
+        {
+            try{return Task.FromResult(ReadFailure?new LocalSaveResult<GameAggregate>(false,"IO_ERROR"):new(true,"GAME",Service.GetActiveGame(owner)));}
+            catch(SaveException e){return Task.FromResult(new LocalSaveResult<GameAggregate>(false,e.Code));}
+        }
+        public Task<LocalSaveResult<SaveReceipt>> RecordDecisionAsync(RecordDecisionCommand command)
+        {
+            try
+            {
+                Writes++;Last=command;var receipt=Service.RecordDecision(command);
+                if(LostResponse){LostResponse=false;return Task.FromResult(new LocalSaveResult<SaveReceipt>(false,"IO_ERROR"));}
+                return Task.FromResult(new LocalSaveResult<SaveReceipt>(true,"DECISION",receipt,receipt));
+            }
+            catch(SaveException e){return Task.FromResult(new LocalSaveResult<SaveReceipt>(false,e.Code));}
+        }
+    }
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly RuntimeMenuChecks.Failure Failure=new();
+        internal readonly Store Store;
+        internal readonly string Owner=Id(),Game=Id(),Biome,Key;
+        internal readonly LocalDecisionSession Session;
+        internal int Projections,Navigations;
+        internal string Memory="unchanged";
+        internal F(int index)
+        {
+            Biome=Biomes[index];Key=Keys[index];Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Store=new(Db,Failure);
+            Store.Service.CreateLocalProfile(Id(),Owner,"Decisión sintética");Store.Service.CreateNewGame(new(Id(),Owner,Game));
+            Store.Service.EnterBiome(new(Id(),Owner,Game,0,Biome,"human"));Session=new(Store,Owner,Game,Biome,Key);
+        }
+        internal GameAggregate State()=>Store.Service.LoadGame(Owner,Game);
+        internal void Project(LocalDecisionConfirmation confirmation)
+        {
+            Check(State().Decisions.Any(d=>d.OperationId==confirmation.Decision.OperationId),"projection before SQL commit");
+            Memory=confirmation.Environment.StateKind!;Projections++;
+        }
+        internal Task<bool> Navigate(LocalDecisionConfirmation confirmation)
+        {
+            Check(Session.IsCurrent(confirmation)&&Memory==confirmation.Environment.StateKind,"navigation before state projection");
+            Navigations++;return Task.FromResult(true);
+        }
+        internal Task<bool> Confirm(string option="reject",string environment="healthy")=>Session.ConfirmAsync(option,environment,()=>true,Project,Navigate);
+        public void Dispose(){Session.Invalidate();Sandbox.Dispose();}
+    }
+    private static async Task Case(string name,Func<F,Task> work,int biome=0)
+    {using var f=new F(biome);await work(f);_passed++;Console.WriteLine("PASS "+name);}
+    public static async Task<int> Probe(string path,string owner,string game,string biome)
+    {
+        int index=Array.IndexOf(Biomes,biome);if(index<0)return 10;
+        var store=new Store(new RuntimeMenuChecks.ReadOnlyFixture(path),new());
+        var session=new LocalDecisionSession(store,owner,game,biome,Keys[index]);int projected=0;
+        bool success=await session.ConfirmAsync("reject","healthy",()=>true,_=>projected++,_=>Task.FromResult(true));
+        return success&&store.Writes==0&&projected==1&&session.Confirmed?.Decision.OperationId is not null?0:11;
+    }
+    public static async Task<int> Run()
+    {
+        for(int i=0;i<Biomes.Length;i++)foreach(bool healthy in new[]{true,false})
+        {
+            int index=i;bool chosen=healthy;
+            await Case(Biomes[i]+" "+(healthy?"No/reject":"Sí/approve")+" persists actual absolute environment",async f=>
+            {
+                Check(await f.Confirm(chosen?"reject":"approve",chosen?"healthy":"degraded"),f.Session.Code);
+                var state=f.State();var decision=state.Decisions.Single();
+                Check(decision.GameId==f.Game&&decision.BiomeId==f.Biome&&decision.DecisionKey==Keys[index]&&decision.OptionId==(chosen?"reject":"approve"),"wrong association");
+                Check(f.Memory==(chosen?"healthy":"degraded")&&decision.ConsequencesJson=="{\"stateKind\":\""+f.Memory+"\"}"&&decision.Classification is null,"invented consequence/classification");
+                Check(state.Biomes.Single(b=>b.BiomeId==f.Biome).Status=="animal_pending"&&state.Game.ResumeKind=="decision_info"&&state.Game.Ending is null,"decision completed game");
+                Check(state.Biomes.All(b=>b.Status!="completed")&&f.Projections==1&&f.Navigations==1&&f.Store.Service.GetGameHistory(f.Owner).Count==1,"side effect");
+            },i);
+        }
+        await Case("invalid option cannot mutate memory or SQLite",async f=>
+        {Check(!await f.Confirm("invented")&&f.Store.Writes==0&&f.Projections==0&&f.Memory=="unchanged"&&f.State().Decisions.Count==0,"invalid option accepted");});
+        await Case("unknown decision key rejected by existing catalogue",async f=>
+        {var s=new LocalDecisionSession(f.Store,f.Owner,f.Game,f.Biome,"invented");Check(!await s.ConfirmAsync("reject","healthy",()=>true,f.Project,f.Navigate)&&f.State().Decisions.Count==0&&f.Projections==0,"unknown decision accepted");});
+        await Case("same option returns same confirmation without second projection or transition",async f=>
+        {
+            Check(await f.Confirm(),"first");var original=f.Session.Confirmed!;
+            Check(await f.Confirm()&&f.Store.Writes==1&&f.Projections==1&&f.Navigations==1&&f.Session.Confirmed!.Decision==original.Decision&&f.Session.Confirmed.Receipt==original.Receipt,"duplicated confirmation");
+        });
+        await Case("different option for same logical instance conflicts",async f=>
+        {Check(await f.Confirm(),"first");Check(!await f.Confirm("approve","degraded")&&f.Session.Code=="DECISION_CONFLICT"&&f.State().Decisions.Count==1&&f.Memory=="healthy"&&f.Projections==1,"overwritten choice");});
+        await Case("new session recovers persisted logical IDs without writing or recalculating",async f=>
+        {
+            Check(await f.Confirm(),"first");var original=f.State().Decisions.Single();var s=new LocalDecisionSession(f.Store,f.Owner,f.Game,f.Biome,f.Key);int restored=0;
+            Check(await s.ConfirmAsync("reject","healthy",()=>true,c=>{Check(c.Environment.StateKind=="healthy","wrong restored state");restored++;},_=>Task.FromResult(true))&&f.Store.Writes==1&&s.Confirmed!.Decision==original&&s.Confirmed.Receipt is null&&restored==1,"recovery generated operation");
+        });
+        await Case("double click records one decision and one transition",async f=>
+        {
+            var gate=new TaskCompletionSource<bool>();int nav=0;
+            var first=f.Session.ConfirmAsync("reject","healthy",()=>true,f.Project,_=>{nav++;return gate.Task;});
+            Check(!await f.Confirm(),"duplicate click accepted");gate.SetResult(true);Check(await first&&f.Store.Writes==1&&f.Projections==1&&nav==1,"duplicate operation");
+        });
+        await Case("precommit failure leaves environment unchanged and retry keeps IDs",async f=>
+        {
+            f.Failure.Enabled=true;Check(!await f.Confirm()&&f.Memory=="unchanged"&&f.Projections==0&&f.Navigations==0&&f.State().Decisions.Count==0,"memory changed on rollback");
+            var command=f.Store.Last!;f.Failure.Enabled=false;Check(await f.Confirm()&&f.Store.Last==command&&f.State().Decisions.Count==1,"retry changed UUIDs or revision");
+        });
+        await Case("pending failed intent cannot change option",async f=>
+        {f.Failure.Enabled=true;Check(!await f.Confirm(),"rollback expected");Check(!await f.Confirm("approve","degraded")&&f.Session.Code=="DECISION_CONFLICT"&&f.Memory=="unchanged","pending payload changed");});
+        await Case("lost response recovers committed record before projecting memory",async f=>
+        {
+            f.Store.LostResponse=true;Check(!await f.Confirm()&&f.State().Decisions.Count==1&&f.Memory=="unchanged"&&f.Navigations==0,"uncertain result projected");
+            var command=f.Store.Last!;Check(await f.Confirm()&&f.Store.Writes==1&&f.State().Decisions.Single().OperationId==command.OperationId&&f.Projections==1,"receipt recovery repeated write");
+        });
+        await Case("failed scene transition retries without reapplying consequence",async f=>
+        {
+            Check(!await f.Session.ConfirmAsync("reject","healthy",()=>true,f.Project,_=>Task.FromResult(false))&&f.Session.Code=="NAVIGATION_FAILED","failure expected");
+            var snapshot=f.State().Snapshot;Check(await f.Confirm()&&f.Projections==1&&f.Store.Writes==1&&f.State().Snapshot==snapshot,"navigation retry reapplied effect");
+        });
+        await Case("missing info scene is rejected before commit or memory projection",async f=>
+        {Check(!await f.Session.ConfirmAsync("reject","healthy",()=>false,f.Project,f.Navigate)&&f.Store.Writes==0&&f.Memory=="unchanged"&&f.State().Decisions.Count==0,"missing scene wrote data");});
+        await Case("completed biome cannot receive or reapply a decision",async f=>
+        {
+            Check(await f.Confirm(),"first");f.Store.Service.CompleteBiome(new(Id(),f.Owner,f.Game,f.State().Game.Revision,f.Biome,"good"));
+            var s=new LocalDecisionSession(f.Store,f.Owner,f.Game,f.Biome,f.Key);Check(!await s.ConfirmAsync("reject","healthy",()=>true,f.Project,f.Navigate)&&s.Code=="BIOME_COMPLETED"&&f.Projections==1&&f.Store.Writes==1,"completed biome replayed");
+        });
+        await Case("archived game rejects confirmation without new profile or game",async f=>
+        {
+            using(var c=f.Db.Open())using(var q=c.CreateCommand()){q.CommandText="UPDATE saved_games SET is_current=0,status='archived';";q.ExecuteNonQuery();}
+            Check(!await f.Confirm()&&f.Session.Code=="GAME_NOT_ACTIVE"&&f.Store.Service.GetGameHistory(f.Owner).Count==1&&f.Projections==0,"archive accepted");
+        });
+        await Case("wrong game context cannot follow another active game",async f=>
+        {
+            RuntimeMenuChecks.SeedTerminal(f.Db,f.Game);string next=Id();f.Store.Service.CreateNewGame(new(Id(),f.Owner,next));
+            Check(!await f.Confirm()&&f.Session.Code=="GAME_NOT_ACTIVE"&&f.Projections==0&&f.Store.Service.GetActiveGame(f.Owner)!.Decisions.Count==0,"game context changed silently");
+        });
+        await Case("read failure does not project or navigate",async f=>
+        {f.Store.ReadFailure=true;Check(!await f.Confirm()&&f.Store.Writes==0&&f.Memory=="unchanged"&&f.Navigations==0,"read failure ignored");});
+        await Case("invalidated session performs no write or projection",async f=>
+        {f.Session.Invalidate();Check(!await f.Confirm()&&f.Store.Writes==0&&f.Projections==0,"abandoned session ran");});
+        await Case("new read-only process recognizes decision without replaying RecordDecision",async f=>
+        {
+            Check(await f.Confirm(),"first");var snapshot=f.State().Snapshot;
+            var info=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false,CreateNoWindow=true};foreach(string arg in new[]{"--decision-probe",f.Db.Path,f.Owner,f.Game,f.Biome})info.ArgumentList.Add(arg);
+            using var child=Process.Start(info);child!.WaitForExit();Check(child.ExitCode==0&&f.State().Snapshot==snapshot,"restart mismatch");
+        });
+        await Case("concurrent same-option sessions produce one logical decision",async f=>
+        {
+            var a=new LocalDecisionSession(f.Store,f.Owner,f.Game,f.Biome,f.Key);var b=new LocalDecisionSession(f.Store,f.Owner,f.Game,f.Biome,f.Key);
+            var results=await Task.WhenAll(Task.Run(()=>a.ConfirmAsync("reject","healthy",()=>true,_=>{},_=>Task.FromResult(true))),Task.Run(()=>b.ConfirmAsync("reject","healthy",()=>true,_=>{},_=>Task.FromResult(true))));
+            Check(results.All(x=>x)&&f.State().Decisions.Count==1&&a.Confirmed!.Decision==b.Confirmed!.Decision,"concurrent idempotence failed");
+        });
+        await Case("concurrent different options have one winner and no overwrite",async f=>
+        {
+            var a=new LocalDecisionSession(f.Store,f.Owner,f.Game,f.Biome,f.Key);var b=new LocalDecisionSession(f.Store,f.Owner,f.Game,f.Biome,f.Key);
+            var results=await Task.WhenAll(Task.Run(()=>a.ConfirmAsync("reject","healthy",()=>true,_=>{},_=>Task.FromResult(true))),Task.Run(()=>b.ConfirmAsync("approve","degraded",()=>true,_=>{},_=>Task.FromResult(true))));
+            Check(results.Count(x=>x)==1&&f.State().Decisions.Count==1,"conflicting confirmation overwrote winner");
+        });
+        Check(typeof(LocalDecisionSession).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "GodotSharp" and not "System.Net.Http" && !(a.Name??"").Contains("Mongo")),"remote dependency");
+        _passed++;Console.WriteLine("PASS decision coordinator has no HTTP MongoDB or Godot execution dependency");
+        Console.WriteLine($"Decision integration: {_passed} passed, 0 failed; SQLite fixtures and absolute-state projection callbacks, not Godot runtime.");return 0;
+    }
+}

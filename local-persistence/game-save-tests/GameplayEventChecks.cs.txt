@@ -1,0 +1,151 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+using TwoSides.LocalPersistence;
+using TwoSides.Integration.Sqlite;
+
+internal static class GameplayEventChecks
+{
+    private static int _count;
+    private static string Id()=>Guid.NewGuid().ToString("D");
+    private static void Check(bool ok){if(!ok)throw new Exception("Gameplay storage assertion failed");}
+    private static void Error(string code,Action action)
+    {try{action();throw new Exception("Expected "+code);}catch(SaveException e){if(e.Code!=code)throw new Exception($"Expected {code}, got {e.Code}");}}
+    private sealed class F:IDisposable
+    {
+        internal readonly SyntheticSandbox Sandbox=new(SyntheticSandbox.AuthorizedProjectRoot);
+        internal readonly SyntheticDatabase Db;
+        internal readonly GameSaveService Save;
+        internal readonly string Owner=Id(),Game=Id();
+        internal string Session="",Run="",Biome="ocean";
+        internal GameplayEventService Events=null!;
+        internal F(bool migrate=true)
+        {
+            Db=Sandbox.CreateDatabase();SchemaManager.Initialize(Db);Save=new(Db,RealGameCatalog.InitialState());
+            Save.CreateLocalProfile(Id(),Owner,"Eventos sintéticos");Save.CreateNewGame(new(Id(),Owner,Game));
+            Save.EnterBiome(new(Id(),Owner,Game,0,"ocean","human"));
+            Save.RecordDecision(new(Id(),Id(),Owner,Game,1,"ocean","ocean_waste_disposal","reject","healthy","{\"stateKind\":\"healthy\"}"));
+            if(migrate){GameplayEventSchema.MigrateSynthetic(Db);Events=new(Db);}
+        }
+        internal GameplayEvent SessionEvent(GameplayEventKind kind,long offset,string? eventId=null,GameplaySessionEnd? end=null)
+            =>new(eventId??Id(),Owner,Session,kind,DateTimeOffset.UnixEpoch.AddMilliseconds(offset),offset,SessionEnd:end);
+        internal GameplayEvent AnimalEvent(GameplayEventKind kind,long offset,string? id=null)
+            =>new(id??Id(),Owner,Session,kind,DateTimeOffset.UnixEpoch.AddMilliseconds(offset),offset,Game,Biome,Run);
+        internal GameplayEvent Start()
+        {Session=Id();var e=SessionEvent(GameplayEventKind.SESSION_STARTED,0);Events.RecordEvent(e);return e;}
+        internal GameplayEvent Animal(long offset=0)
+        {if(Session=="")Start();Run=Id();var e=AnimalEvent(GameplayEventKind.ANIMAL_SEGMENT_STARTED,offset,Run);Events.RecordEvent(e);return e;}
+        internal GameplayInterval Interval(long start,long end,GameplayTimeState state=GameplayTimeState.ActiveAnimal)
+            =>new(Id(),Owner,Session,start,end,state,Game,Biome,state==GameplayTimeState.ActiveHuman?null:Run);
+        internal string Hash()=>Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Db.Path)));
+        internal long Number(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;return Convert.ToInt64(q.ExecuteScalar());}
+        internal void Sql(string sql){using var c=Db.Open();using var q=c.CreateCommand();q.CommandText=sql;q.ExecuteNonQuery();}
+        public void Dispose()=>Sandbox.Dispose();
+    }
+    private static async Task Case(string name,Func<F,Task> work,bool migrate=true)
+    {using var f=new F(migrate);await work(f);_count++;Console.WriteLine("PASS "+name);}
+    public static int Probe(string path,string owner,string game)
+    {var service=new GameplayEventService(new RuntimeMenuChecks.ReadOnlyFixture(path));return service.GetEvents(owner,game).Count==2 && service.GetTotals(owner,game).Deaths.Value==1?0:71;}
+    public static async Task<int> Run()
+    {
+        await Case("optional extension creates four tables and preserves base version",f=>
+        {GameplayEventSchema.MigrateSynthetic(f.Db);Check(f.Number("SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'gameplay_%';")==4 && SchemaManager.ReadVersion(f.Db)==2);return Task.CompletedTask;},false);
+        await Case("migration applied twice is byte-idempotent",f=>
+        {string h=f.Hash();GameplayEventSchema.MigrateSynthetic(f.Db);Check(f.Hash()==h);return Task.CompletedTask;});
+        await Case("failed migration rolls back all extension data and schema",f=>
+        {string h=f.Hash();Error("TEST_ROLLBACK",()=>GameplayEventSchema.MigrateSynthetic(f.Db,()=>throw new SaveException("TEST_ROLLBACK")));Check(f.Hash()==h && f.Number("SELECT count(*) FROM sqlite_master WHERE name LIKE 'gameplay_%';")==0);return Task.CompletedTask;},false);
+        await Case("historical profile game decisions consequences and receipts survive migration",f=>
+        {var before=f.Save.LoadGame(f.Owner,f.Game);long ops=f.Number("SELECT count(*) FROM local_operations;");GameplayEventSchema.MigrateSynthetic(f.Db);var after=f.Save.LoadGame(f.Owner,f.Game);Check(before.Game==after.Game && before.Decisions.SequenceEqual(after.Decisions) && before.Environments.SequenceEqual(after.Environments) && before.Biomes.SequenceEqual(after.Biomes) && ops==f.Number("SELECT count(*) FROM local_operations;"));return Task.CompletedTask;},false);
+        await Case("unknown extension version and checksum do not silently initialize",f=>
+        {f.Sql("UPDATE gameplay_schema_migrations SET version=99;");string h=f.Hash();Error("UNSUPPORTED_EVENT_SCHEMA",()=>GameplayEventSchema.MigrateSynthetic(f.Db));Check(f.Hash()==h);return Task.CompletedTask;});
+        await Case("incomplete extension is rejected without overwriting it",f=>
+        {f.Sql("CREATE TABLE gameplay_partial(x INTEGER);");string h=f.Hash();Error("UNSUPPORTED_EVENT_SCHEMA",()=>GameplayEventSchema.MigrateSynthetic(f.Db));Check(f.Hash()==h);return Task.CompletedTask;},false);
+        await Case("changed migration checksum is rejected without repair",f=>
+        {f.Sql("UPDATE gameplay_schema_migrations SET checksum='tampered';");string h=f.Hash();Error("UNSUPPORTED_EVENT_SCHEMA",()=>GameplayEventSchema.MigrateSynthetic(f.Db));Check(f.Hash()==h);return Task.CompletedTask;});
+        await Case("historical base version requiring upgrade is never migrated implicitly",f=>
+        {var old=f.Sandbox.CreateDatabase();SchemaManager.Initialize(old,1);Error("UNSUPPORTED_SCHEMA",()=>GameplayEventSchema.MigrateSynthetic(old));Check(SchemaManager.ReadVersion(old)==1);return Task.CompletedTask;});
+        await Case("new empty synthetic base migrates only after explicit base initialization",f=>
+        {var empty=f.Sandbox.CreateDatabase();Error("UNSUPPORTED_SCHEMA",()=>GameplayEventSchema.MigrateSynthetic(empty));SchemaManager.Initialize(empty);GameplayEventSchema.MigrateSynthetic(empty);GameplayEventSchema.Verify(empty);return Task.CompletedTask;});
+        await Case("session start and normal end persist independently from game state",f=>
+        {f.Start();f.Events.RecordEvent(f.SessionEvent(GameplayEventKind.SESSION_ENDED,100,end:GameplaySessionEnd.Normal));var s=f.Events.GetSessions(f.Owner).Single();Check(s.Status=="closed" && s.EndOffsetMs==100 && s.EndedAtUtc is not null && f.Save.LoadGame(f.Owner,f.Game).Game.Status=="in_progress");return Task.CompletedTask;});
+        await Case("two independent sequential sessions retain their durations",f=>
+        {f.Start();f.Events.RecordEvent(f.SessionEvent(GameplayEventKind.SESSION_ENDED,20,end:GameplaySessionEnd.Normal));f.Start();f.Events.RecordEvent(f.SessionEvent(GameplayEventKind.SESSION_ENDED,30,end:GameplaySessionEnd.Normal));Check(f.Events.GetSessions(f.Owner).Count==2 && f.Events.GetTotals(f.Owner).SessionDurationMs.Value==50);return Task.CompletedTask;});
+        await Case("parallel open sessions are rejected instead of double-counting clocks",f=>
+        {f.Start();string first=f.Session;f.Session=Id();Error("SESSION_ALREADY_OPEN",()=>f.Events.RecordEvent(f.SessionEvent(GameplayEventKind.SESSION_STARTED,0)));Check(f.Events.GetSessions(f.Owner).Single().SessionId==first);return Task.CompletedTask;});
+        await Case("event id repeated with same payload is one durable event",f=>
+        {var e=f.Start();string h=f.Hash();Check(!f.Events.RecordEvent(e).Inserted && f.Events.GetEvents(f.Owner).Count==1 && f.Hash()==h);return Task.CompletedTask;});
+        await Case("contradictory event id is a conflict",f=>
+        {var e=f.Start();Error("EVENT_CONFLICT",()=>f.Events.RecordEvent(e with{OccurredAtUtc=e.OccurredAtUtc.AddSeconds(1)}));return Task.CompletedTask;});
+        await Case("death and repeated signal share one run result",f=>
+        {f.Animal();var e=f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10);f.Events.RecordEvent(e);Check(!f.Events.RecordEvent(e).Inserted);Error("EVENT_CONFLICT",()=>f.Events.RecordEvent(e with{EventId=Id()}));Check(f.Events.GetTotals(f.Owner,f.Game).Deaths.Value==1);return Task.CompletedTask;});
+        await Case("voluntary restart is distinct and double click cannot add another request",f=>
+        {f.Animal();var e=f.AnimalEvent(GameplayEventKind.ANIMAL_RESTART_REQUESTED,10);f.Events.RecordEvent(e);f.Events.RecordEvent(e);Error("EVENT_CONFLICT",()=>f.Events.RecordEvent(e with{EventId=Id()}));var t=f.Events.GetTotals(f.Owner,f.Game);Check(t.Restarts.Value==1 && t.Deaths.Value==0 && t.Retries.Value==0);return Task.CompletedTask;});
+        await Case("retry requires death and does not count death again",f=>
+        {f.Animal();Error("RETRY_REQUIRES_DEATH",()=>f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_RETRY_REQUESTED,10)));f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10));var retry=f.AnimalEvent(GameplayEventKind.ANIMAL_RETRY_REQUESTED,20);f.Events.RecordEvent(retry);f.Events.RecordEvent(retry);var t=f.Events.GetTotals(f.Owner,f.Game);Check(t.Deaths.Value==1 && t.Retries.Value==1 && t.Restarts.Value==0);return Task.CompletedTask;});
+        await Case("completion event needs previously confirmed biome completion",f=>
+        {f.Animal();Error("COMPLETION_NOT_CONFIRMED",()=>f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_SEGMENT_COMPLETED,10)));Check(f.Save.LoadGame(f.Owner,f.Game).Biomes.Single(b=>b.BiomeId=="ocean").Status=="animal_pending");return Task.CompletedTask;});
+        await Case("effective time excludes pause menu and Game Over",f=>
+        {f.Animal();f.Events.RecordInterval(f.Interval(0,100));f.Events.RecordInterval(f.Interval(100,140,GameplayTimeState.Paused));f.Events.RecordInterval(f.Interval(140,160,GameplayTimeState.Menu));f.Events.RecordInterval(f.Interval(160,180,GameplayTimeState.GameOver));var t=f.Events.GetTotals(f.Owner,f.Game);Check(t.EffectiveMs.Value==100 && t.PausedMs.Value==40 && t.RecordedElapsedMs.Value==180);return Task.CompletedTask;});
+        await Case("effective time is scoped to the exact biome",f=>
+        {f.Animal();f.Events.RecordInterval(f.Interval(0,100));Check(f.Events.GetTotals(f.Owner,f.Game,"ocean").EffectiveMs.Value==100 && f.Events.GetTotals(f.Owner,f.Game,"forest").EffectiveMs.Value is null);return Task.CompletedTask;});
+        await Case("same interval adds duration once",f=>
+        {f.Animal();var i=f.Interval(0,100);f.Events.RecordInterval(i);string h=f.Hash();Check(!f.Events.RecordInterval(i).Inserted && f.Events.GetTotals(f.Owner,f.Game).EffectiveMs.Value==100 && f.Hash()==h);return Task.CompletedTask;});
+        await Case("overlap across active and pause classifications is rejected",f=>
+        {f.Animal();f.Events.RecordInterval(f.Interval(0,100));Error("INTERVAL_OVERLAP",()=>f.Events.RecordInterval(f.Interval(50,150,GameplayTimeState.Paused)));Error("INTERVAL_OVERLAP",()=>f.Events.RecordInterval(f.Interval(0,100)));return Task.CompletedTask;});
+        await Case("interval id with changed payload conflicts",f=>
+        {f.Animal();var i=f.Interval(0,100);f.Events.RecordInterval(i);Error("INTERVAL_CONFLICT",()=>f.Events.RecordInterval(i with{EndMs=101}));return Task.CompletedTask;});
+        await Case("measured zero differs from no confirmed interval",f=>
+        {f.Animal();Check(f.Events.GetTotals(f.Owner,f.Game).EffectiveMs.State==StatisticsAvailability.Unknown);f.Events.RecordInterval(f.Interval(0,0));Check(f.Events.GetTotals(f.Owner,f.Game).EffectiveMs.State==StatisticsAvailability.Available && f.Events.GetTotals(f.Owner,f.Game).EffectiveMs.Value==0);return Task.CompletedTask;});
+        await Case("historical game without instrumentation is not fabricated as zero",f=>
+        {var t=f.Events.GetTotals(f.Owner,f.Game);Check(t.Deaths.State==StatisticsAvailability.NotAvailable && t.Deaths.Value is null && t.EffectiveMs.Value is null && t.HistoricalCoverageUnknown);return Task.CompletedTask;});
+        await Case("unexpected close seals only durable boundary with unknown full duration",f=>
+        {f.Animal();f.Events.RecordInterval(f.Interval(0,50));string id=Id();var discovery=DateTimeOffset.UtcNow;f.Events.InterruptSession(f.Owner,f.Session,id,discovery);Check(!f.Events.InterruptSession(f.Owner,f.Session,id,discovery).Inserted);var s=f.Events.GetSessions(f.Owner).Single();var t=f.Events.GetTotals(f.Owner);Check(s.Status=="interrupted" && s.EndOffsetMs==50 && s.EndedAtUtc is null && t.EffectiveMs.Value==50 && t.SessionDurationMs.State==StatisticsAvailability.Unknown && t.Incomplete);return Task.CompletedTask;});
+        await Case("normal close retries never add accumulated time again",f=>
+        {f.Animal();f.Events.RecordInterval(f.Interval(0,80));var e=f.SessionEvent(GameplayEventKind.SESSION_ENDED,100,end:GameplaySessionEnd.Normal);f.Events.RecordEvent(e);f.Events.RecordEvent(e);Check(f.Events.GetTotals(f.Owner).EffectiveMs.Value==80 && f.Events.GetTotals(f.Owner).SessionDurationMs.Value==100);Error("SESSION_CLOSED",()=>f.Events.RecordInterval(f.Interval(80,90)));return Task.CompletedTask;});
+        await Case("failed event and interval commits roll back entirely",f=>
+        {var start=f.Animal();var broken=new GameplayEventService(f.Db,()=>throw new SaveException("TEST_ROLLBACK"));string h=f.Hash();Error("TEST_ROLLBACK",()=>broken.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10)));Error("TEST_ROLLBACK",()=>broken.RecordInterval(f.Interval(0,10)));Check(!broken.RecordEvent(start).Inserted && f.Hash()==h && f.Events.GetTotals(f.Owner,f.Game).Deaths.Value==0);return Task.CompletedTask;});
+        await Case("session creation and closing share event transaction rollback",f=>
+        {var broken=new GameplayEventService(f.Db,()=>throw new SaveException("TEST_ROLLBACK"));f.Session=Id();Error("TEST_ROLLBACK",()=>broken.RecordEvent(f.SessionEvent(GameplayEventKind.SESSION_STARTED,0)));Check(f.Events.GetSessions(f.Owner).Count==0);f.Start();Error("TEST_ROLLBACK",()=>broken.RecordEvent(f.SessionEvent(GameplayEventKind.SESSION_ENDED,10,end:GameplaySessionEnd.Normal)));Check(f.Events.GetSessions(f.Owner).Single().Status=="open");return Task.CompletedTask;});
+        await Case("future completed event only records already committed domain result",f=>
+        {f.Animal();var g=f.Save.LoadGame(f.Owner,f.Game).Game;f.Save.CompleteBiome(new(Id(),f.Owner,f.Game,g.Revision,"ocean","good"));var before=f.Save.LoadGame(f.Owner,f.Game).Game;f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_SEGMENT_COMPLETED,10));Check(f.Save.LoadGame(f.Owner,f.Game).Game==before && f.Events.GetEvents(f.Owner,f.Game).Last().Kind==GameplayEventKind.ANIMAL_SEGMENT_COMPLETED);return Task.CompletedTask;});
+        await Case("events and time stay separate across two biomes",f=>
+        {var g=f.Save.LoadGame(f.Owner,f.Game).Game;f.Save.EnterBiome(new(Id(),f.Owner,f.Game,g.Revision,"jungle","human"));g=f.Save.LoadGame(f.Owner,f.Game).Game;f.Save.RecordDecision(new(Id(),Id(),f.Owner,f.Game,g.Revision,"jungle","jungle_transport_route","approve","degraded","{\"stateKind\":\"degraded\"}"));f.Animal();f.Events.RecordInterval(f.Interval(0,10));f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_SEGMENT_EXITED,10));f.Biome="jungle";f.Animal(10);f.Events.RecordInterval(f.Interval(10,20));f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,20));Check(f.Events.GetEvents(f.Owner,f.Game,"ocean").Count==2 && f.Events.GetEvents(f.Owner,f.Game,"jungle").Count==2 && f.Events.GetTotals(f.Owner,f.Game,"ocean").Deaths.Value==0 && f.Events.GetTotals(f.Owner,f.Game,"jungle").Deaths.Value==1 && f.Events.GetTotals(f.Owner,f.Game,"jungle").EffectiveMs.Value==10);return Task.CompletedTask;});
+        await Case("active intervals cannot extend past confirmed death",f=>
+        {f.Animal();f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10));Error("INTERVAL_AFTER_RUN_END",()=>f.Events.RecordInterval(f.Interval(0,20)));return Task.CompletedTask;});
+        await Case("foreign owner or mismatched run cannot be attached",f=>
+        {f.Animal();Error("NOT_FOUND",()=>f.Events.GetEvents(Id(),f.Game));Error("INVALID_ANIMAL_RUN",()=>f.Events.RecordInterval(f.Interval(0,10) with{AnimalRunId=Id()}));return Task.CompletedTask;});
+        await Case("exit preserves confirmed time and does not duplicate a death",f=>
+        {f.Animal();f.Events.RecordInterval(f.Interval(0,10));f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10));f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_SEGMENT_EXITED,20));Error("ANIMAL_RUN_CLOSED",()=>f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_RETRY_REQUESTED,30)));Check(f.Events.GetTotals(f.Owner,f.Game).Deaths.Value==1 && f.Events.GetTotals(f.Owner,f.Game).EffectiveMs.Value==10);return Task.CompletedTask;});
+        await Case("concurrent repeated event commits once",async f=>
+        {f.Animal();var e=f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10);var writes=await Task.WhenAll(Task.Run(()=>f.Events.RecordEvent(e)),Task.Run(()=>f.Events.RecordEvent(e)));Check(writes.Count(x=>x.Inserted)==1 && f.Events.GetTotals(f.Owner,f.Game).Deaths.Value==1);});
+        await Case("concurrent overlapping intervals cannot both commit",async f=>
+        {f.Animal();string Write(GameplayInterval i){try{f.Events.RecordInterval(i);return "OK";}catch(SaveException e){return e.Code;}}var results=await Task.WhenAll(Task.Run(()=>Write(f.Interval(0,100))),Task.Run(()=>Write(f.Interval(50,150))));Check(results.Count(x=>x=="OK")==1 && results.Count(x=>x=="INTERVAL_OVERLAP")==1 && f.Events.GetTotals(f.Owner,f.Game).EffectiveMs.Value==100);});
+        await Case("monotonic clock measures offsets without relying on UTC",f=>
+        {long tick=100;var clock=new GameplayMonotonicClock(()=>tick,1000);tick=250;Check(clock.ElapsedMilliseconds==150);tick=300;Check(clock.ElapsedMilliseconds==200);tick=200;Error("INVALID_MONOTONIC_CLOCK",()=>_ = clock.ElapsedMilliseconds);return Task.CompletedTask;});
+        await Case("existing statistics API stays NotAvailable after event storage",f=>
+        {f.Animal();f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10));var p=new StatisticsService(f.Db,RealGameCatalog.InitialState()).GetPlayerStatistics(f.Owner);Check(p.AllDecisions.Total==1 && p.Uncollected.Deaths.State==StatisticsAvailability.NotAvailable && p.Uncollected.Deaths.Value is null);return Task.CompletedTask;});
+        await Case("new readonly process recovers durable events",async f=>
+        {f.Animal();f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,10));string h=f.Hash();var start=new ProcessStartInfo(Environment.ProcessPath!){UseShellExecute=false};foreach(string arg in new[]{"--gameplay-events-probe",f.Db.Path,f.Owner,f.Game})start.ArgumentList.Add(arg);using var child=Process.Start(start)!;await child.WaitForExitAsync();Check(child.ExitCode==0 && f.Hash()==h);});
+        await Case("stress returns all sessions events and times without truncation",f=>
+        {
+            string original=SaveValidation.Digest(f.Save.LoadGame(f.Owner,f.Game));long ops=f.Number("SELECT count(*) FROM local_operations;");
+            for(int session=0;session<40;session++)
+            {
+                f.Start();long offset=0;
+                for(int run=0;run<10;run++){f.Animal(offset);f.Events.RecordInterval(f.Interval(offset,offset+10));f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_DIED,offset+10));f.Events.RecordEvent(f.AnimalEvent(GameplayEventKind.ANIMAL_RETRY_REQUESTED,offset+10));offset+=10;}
+                f.Events.RecordEvent(f.SessionEvent(GameplayEventKind.SESSION_ENDED,offset,end:GameplaySessionEnd.Normal));
+            }
+            var t=f.Events.GetTotals(f.Owner,f.Game);Check(f.Events.GetSessions(f.Owner).Count==40 && f.Events.GetEvents(f.Owner).Count==1280 && t.Deaths.Value==400 && t.Retries.Value==400 && t.EffectiveMs.Value==4000);
+            Check(SaveValidation.Digest(f.Save.LoadGame(f.Owner,f.Game))==original && f.Number("SELECT count(*) FROM local_operations;")==ops);
+            return Task.CompletedTask;
+        });
+        Check(typeof(GameplayEvent).GetProperties().All(p=>p.Name is not "DisplayName" and not "Email" and not "CredentialRef"));
+        Check(typeof(GameplayEventService).Assembly.GetReferencedAssemblies().All(a=>a.Name is not "GodotSharp" and not "System.Net.Http" && !(a.Name??"").Contains("Mongo")));
+        Check(typeof(GameplayEventSchema).GetMethod("MigrateSynthetic")!.GetParameters()[0].ParameterType==typeof(SyntheticDatabase));
+        _count++;Console.WriteLine("PASS no personal payload HTTP Godot or protected-store migration capability");
+        Console.WriteLine($"Gameplay events: {_count} passed, 0 failed; synthetic-only migration and durable SQLite, no Godot hooks.");return 0;
+    }
+}
